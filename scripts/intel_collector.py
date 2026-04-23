@@ -367,29 +367,9 @@ def public_apis_readme():
 
 
 def publicapis_dev():
-    """Pull entries from publicapis.dev community API. Returns list of
-    {name, url, description, auth, https, category}."""
-    url = "https://api.publicapis.dev/entries"
-    status, body = http(url)
-    if status >= 400:
-        print(f"WARN publicapis.dev: {status}", file=sys.stderr)
-        return []
-    try:
-        data = json.loads(body)
-    except Exception as e:
-        print(f"WARN publicapis.dev parse: {e}", file=sys.stderr)
-        return []
-    entries = []
-    for e in data.get("entries", []):
-        entries.append({
-            "name":        e.get("API") or e.get("name", ""),
-            "url":         e.get("Link") or e.get("link", ""),
-            "description": e.get("Description") or e.get("description", ""),
-            "auth":        e.get("Auth") or e.get("auth", ""),
-            "https":       "Yes" if e.get("HTTPS") else ("Yes" if e.get("https") else "No"),
-            "category":    e.get("Category") or e.get("category", ""),
-        })
-    return entries
+    """Stub: publicapis.dev is a static site, no public API endpoint.
+    Kept for API compatibility with collect_apis(); always returns []."""
+    return []
 
 
 def gh_readme(repo, token):
@@ -461,7 +441,8 @@ def parse_awesome_list(content):
 
 def hf_trending_models():
     """Pull top trending Hugging Face models. Returns a list of item dicts."""
-    url = f"https://huggingface.co/api/models?sort=trending&direction=-1&limit={HF_TOP_LIMIT}"
+    # HF's sort key is `trendingScore`, not `trending`.
+    url = f"https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit={HF_TOP_LIMIT}"
     status, body = http(url)
     if status >= 400:
         print(f"WARN hf trending: {status}", file=sys.stderr)
@@ -767,9 +748,8 @@ def collect_apis(at_key, today):
     readme_entries = public_apis_readme()
     print(f"public-apis README: {len(readme_entries)} total entries parsed")
 
-    # Source 2: publicapis.dev community API
+    # Source 2: publicapis.dev (no public API; placeholder for future enhancement)
     dev_entries = publicapis_dev()
-    print(f"publicapis.dev: {len(dev_entries)} total entries parsed")
 
     # Merge + dedup by URL (same API appears in both sources under slightly
     # different names sometimes)
