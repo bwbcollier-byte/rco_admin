@@ -954,8 +954,16 @@ def _pre_classify_gemini(items, gemini_keys, model=None):
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 1500,
+                # Headroom for 15 items × ~40 tokens/item + JSON scaffolding.
+                # Bumped from 1500 after truncation at char ~140 was observed.
+                "maxOutputTokens": 4000,
                 "responseMimeType": "application/json",
+                # Disable Gemini 2.5 Flash's default "thinking" phase. Thinking
+                # tokens count against maxOutputTokens and were consuming ~95%
+                # of the budget, leaving only a few tokens for actual JSON
+                # output → "Unterminated string" parse errors. This is a fast
+                # classification task, not reasoning — thinking adds no value.
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }).encode()
 
