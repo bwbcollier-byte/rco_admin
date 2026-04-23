@@ -190,27 +190,15 @@ def collect():
     timeouts = {(r, f): t for r, f, t in WORKFLOWS}
     now = datetime.now(timezone.utc)
 
-    # 1. Repo permissions
-    repo_rows = []
-    for repo in REPOS:
-        try:
-            perms = gh_api(f"/repos/{ORG}/{repo}/actions/permissions", gh_token)
-            enabled = bool(perms.get("enabled"))
-        except Exception as e:
-            print(f"WARN permissions {repo}: {e}", file=sys.stderr)
-            enabled = None
-        repo_rows.append({
-            "repo": repo,
-            "actions_enabled": enabled,
-            "checked_at": now.isoformat(),
-        })
-    sb_upsert("triage_repo_state", repo_rows, "repo", sb_url, sb_key)
-    print(f"repo_state: {len(repo_rows)} rows")
-
-    # 2. Runs in last LOOKBACK_HOURS
+    # 1. Runs in last LOOKBACK_HOURS.
+    # We infer Actions-enabled state from whether the runs endpoint works +
+    # whether it returned any recent activity — avoids needing the
+    # `Administration:read` scope which `actions/permissions` requires.
     since = (now - timedelta(hours=LOOKBACK_HOURS)).isoformat()
     run_rows = []
+    repo_rows = []
     for repo in REPOS:
+        endpoint_ok = True
         try:
             resp = gh_api(
                 f"/repos/{ORG}/{repo}/actions/runs",
@@ -219,6 +207,16 @@ def collect():
             )
         except Exception as e:
             print(f"WARN runs {repo}: {e}", file=sys.stderr)
+            endpoint_ok = False
+            resp = {"workflow_runs": []}
+        repo_rows.append({
+            "repo": repo,
+            # None = unknown (endpoint reachable but can't confirm state),
+            # False = endpoint returned 403/404 (likely disabled or no access)
+            "actions_enabled": None if endpoint_ok else False,
+            "checked_at": now.isoformat(),
+        })
+        if not endpoint_ok:
             continue
         for r in resp.get("workflow_runs", []):
             wf_file = (r.get("path") or "").rsplit("/", 1)[-1]
@@ -253,6 +251,11 @@ def collect():
                 "collected_at": now.isoformat(),
             })
 
+    # Write both tables at the end so a single failed API call doesn't silently
+    # leave one table stale relative to the other.
+    print(f"DEBUG: about to upsert repo_state ({len(repo_rows)}) + workflow_runs ({len(run_rows)})")
+    sb_upsert("triage_repo_state", repo_rows, "repo", sb_url, sb_key)
+    print(f"repo_state: {len(repo_rows)} rows")
     for i in range(0, len(run_rows), 50):
         sb_upsert("triage_workflow_runs", run_rows[i:i + 50], "run_id", sb_url, sb_key)
     print(f"workflow_runs: {len(run_rows)} rows")
