@@ -135,12 +135,22 @@ F_AM_LAST_CHECKED = "fldKPsV3LzTay0uMp"
 F_AM_FIRST_FOUND  = "fldtOn58LpHE9iSIx"
 F_AM_NOTES        = "fldyJklFGPg5tuTyn"
 
-# OpenRouter pre-classifier config
+# Pre-classifier config. Two providers supported:
+#   - Gemini direct (Google AI Studio) — primary when keys are present in
+#     Airtable Logins & Keys (row named "Google AI Studio" or "Gemini").
+#   - OpenRouter — fallback when no Gemini keys are configured.
 # Default model only used if no AI Models row is marked `Currently In Use For` =
-# 'intel pre-classifier'. Qwen 2.5 72B free is the current default.
+# 'intel pre-classifier'.
 OPENROUTER_MODEL = "qwen/qwen-2.5-72b-instruct:free"
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
 PRE_CLASSIFY_BATCH_SIZE = 15
+
+# Gemini direct config. Free tier: 15 req/min per key → 4.2s sleep between calls
+# when using a single key. Multiple keys rotate on 401/403/429 just like the
+# OpenRouter path.
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+GEMINI_SLEEP = 4.2
 
 # Providers worth tracking in AI Models. OpenRouter's catalog has 300+ models
 # across many providers; we only upsert rows for these to keep the table focused.
@@ -795,6 +805,50 @@ def create_collector_action_item_keys_exhausted(at_key, exhausted):
     )
 
 
+def get_gemini_keys_from_airtable(at_key):
+    """Fetch ALL Gemini (Google AI Studio) keys from Airtable Logins & Keys.
+
+    Extracts every line starting with 'AIza' (Google API key prefix) from the
+    Keys field of rows whose Name contains 'Google AI Studio' or 'Gemini'.
+    Supports multiple keys per row (email-prefixed pattern).
+
+    Falls back to GEMINI_API_KEY env var if Airtable lookup yields nothing.
+    Returns a (possibly empty) list. Never logs the values.
+    """
+    keys = []
+    seen = set()
+    try:
+        rows = at_list_all(
+            AIRTABLE_BASE, TABLE_LOGINS_KEYS, [F_LK_NAME, F_LK_KEYS], at_key
+        )
+    except Exception as e:
+        print(f"WARN gemini keys airtable lookup: {e}", file=sys.stderr)
+        rows = []
+    for r in rows:
+        f = r.get("fields", {}) or {}
+        name = (f.get(F_LK_NAME) or "").strip().lower()
+        if "google ai studio" not in name and "gemini" not in name:
+            continue
+        keys_text = f.get(F_LK_KEYS) or ""
+        for line in keys_text.splitlines():
+            line = line.strip()
+            if line.startswith("AIza") and line not in seen:
+                keys.append(line)
+                seen.add(line)
+    if not keys:
+        env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
+        if env_val and env_val not in seen:
+            keys.append(env_val)
+            print(f"gemini keys: loaded 1 from env (suffix=...{env_val[-4:]})")
+            return keys
+        print("gemini keys: none found in Airtable or env — Gemini path disabled",
+              file=sys.stderr)
+        return []
+    print(f"gemini keys: loaded {len(keys)} from Airtable (suffixes: " +
+          ", ".join(f"...{k[-4:]}" for k in keys) + ")")
+    return keys
+
+
 def get_openrouter_keys_from_airtable(at_key):
     """Fetch ALL OpenRouter keys from the Airtable Logins & Keys table.
 
@@ -864,19 +918,156 @@ def get_classifier_model_from_airtable(at_key):
     return OPENROUTER_MODEL
 
 
+def _pre_classify_gemini(items, gemini_keys, model=None):
+    """Gemini direct path for pre-classification. Same I/O shape as pre_classify.
+    Rotates across gemini_keys on 401/403/429."""
+    if not items or not gemini_keys:
+        return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
+
+    model_slug = model or GEMINI_MODEL
+    available_keys = list(gemini_keys)
+    exhausted = []
+    current_key_idx = 0
+
+    results = [None] * len(items)
+    for start in range(0, len(items), PRE_CLASSIFY_BATCH_SIZE):
+        batch = items[start : start + PRE_CLASSIFY_BATCH_SIZE]
+        batch_in = [
+            {"id": i, "title": (it.get("title") or "")[:200],
+             "desc": (it.get("summary") or "")[:300]}
+            for i, it in enumerate(batch)
+        ]
+        prompt = (
+            f"You are filtering items for a strategic intelligence brief.\n\n"
+            f"CONTEXT: {HYPEBASE_CONTEXT_FOR_CLASSIFIER}\n\n"
+            f"For each item below, output one of: 'relevant', 'irrelevant', or 'maybe'. "
+            f"Be strict — mark as 'relevant' only if it clearly helps HypeBase. Mark "
+            f"'irrelevant' only if you're confident it doesn't help. Use 'maybe' when "
+            f"unsure — a human will re-check.\n\n"
+            f"INPUT (JSON): {json.dumps(batch_in)}\n\n"
+            f"OUTPUT: JSON array of the same length, in the same order, each element "
+            f"shaped like: {{\"decision\": \"relevant\"|\"irrelevant\"|\"maybe\", "
+            f"\"reason\": \"<=12 words\"}}\n"
+            f"No preamble, no markdown fences, just the JSON array."
+        )
+        body = json.dumps({
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 1500,
+                "responseMimeType": "application/json",
+            },
+        }).encode()
+
+        RETIRE_STATUSES = {401, 403, 429}
+        status = 0
+        resp_body = b""
+        while current_key_idx < len(available_keys):
+            key = available_keys[current_key_idx]
+            url = GEMINI_URL.format(model=model_slug, key=key)
+            headers = {"Content-Type": "application/json"}
+            status, resp_body = http(url, method="POST", headers=headers, body=body)
+            if status in RETIRE_STATUSES:
+                err_preview = resp_body[:120] if resp_body else b""
+                print(
+                    f"gemini key ...{key[-4:]} retired at batch {start}: "
+                    f"HTTP {status} — trying next key",
+                    file=sys.stderr,
+                )
+                exhausted.append({"suffix": key[-4:], "status": status,
+                                  "error": err_preview.decode('utf-8', errors='replace')})
+                current_key_idx += 1
+                continue
+            break
+
+        if current_key_idx >= len(available_keys):
+            print("WARN pre_classify (gemini): ALL keys exhausted — remaining items -> 'maybe'",
+                  file=sys.stderr)
+            for i in range(start, len(items)):
+                if results[i] is None:
+                    results[i] = {"decision": "maybe", "reason": "all gemini keys exhausted"}
+            break
+
+        if status >= 400:
+            print(f"WARN pre_classify (gemini) batch {start}: {status} {resp_body[:200]!r}",
+                  file=sys.stderr)
+            for i in range(len(batch)):
+                results[start + i] = {"decision": "maybe", "reason": "classifier HTTP error"}
+            time.sleep(GEMINI_SLEEP)
+            continue
+
+        try:
+            resp = json.loads(resp_body)
+            candidates = resp.get("candidates", [])
+            if not candidates:
+                raise ValueError(f"no candidates in response: {resp_body[:200]!r}")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            content = (parts[0].get("text") if parts else "") or ""
+            content = content.strip()
+            if content.startswith("```"):
+                fences = content.split("```")
+                if len(fences) >= 2:
+                    content = fences[1]
+                    if content.lower().startswith("json\n") or content.lower().startswith("json "):
+                        content = content[4:].lstrip()
+                    if content.endswith("\n"):
+                        content = content.rstrip()
+            parsed = json.loads(content)
+            if isinstance(parsed, list) and len(parsed) == len(batch):
+                for i, dec in enumerate(parsed):
+                    if not isinstance(dec, dict):
+                        dec = {"decision": "maybe", "reason": "malformed response item"}
+                    d = (dec.get("decision") or "").strip().lower()
+                    if d not in ("relevant", "irrelevant", "maybe"):
+                        d = "maybe"
+                    results[start + i] = {
+                        "decision": d,
+                        "reason": (dec.get("reason") or "")[:200],
+                    }
+            else:
+                raise ValueError(f"length mismatch: got {len(parsed) if isinstance(parsed, list) else 'non-list'}, want {len(batch)}")
+        except Exception as e:
+            print(f"WARN pre_classify (gemini) batch {start} parse: {e}", file=sys.stderr)
+            for i in range(len(batch)):
+                results[start + i] = {"decision": "maybe", "reason": "classifier parse error"}
+        time.sleep(GEMINI_SLEEP)
+
+    for i, r in enumerate(results):
+        if r is None:
+            results[i] = {"decision": "maybe", "reason": "classifier incomplete"}
+
+    counts = {"relevant": 0, "irrelevant": 0, "maybe": 0}
+    for r in results:
+        counts[r["decision"]] = counts.get(r["decision"], 0) + 1
+    keys_used = min(current_key_idx + 1, len(available_keys)) if available_keys else 0
+    print(f"pre_classify (gemini): relevant={counts['relevant']} "
+          f"irrelevant={counts['irrelevant']} maybe={counts['maybe']} "
+          f"(model={model_slug}, {len(items)} items, keys_used={keys_used}/{len(available_keys)})")
+    return results
+
+
 def pre_classify(items, openrouter_keys, model=None, at_key=None):
-    """Batch-classify items via OpenRouter. Takes a LIST of keys and rotates on
-    rate-limit / quota errors. Returns list of dicts in input order:
-    [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
+    """Batch-classify items. Prefers Gemini direct when keys are in Airtable
+    Logins & Keys; falls back to OpenRouter otherwise. Returns list of dicts in
+    input order: [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
 
     Safe to call with empty keys list or empty items. On any failure, returns
     'maybe' for every item so nothing gets auto-dismissed on classifier errors.
 
-    If ALL keys are exhausted (all hitting 429/402/403), files a 'New' Action
-    Item in Airtable asking the user to provide a new account key, then returns
-    'maybe' for the remaining items.
+    If ALL OpenRouter keys are exhausted (all hitting 429/402/403), files a 'New'
+    Action Item in Airtable asking the user to provide a new account key, then
+    returns 'maybe' for the remaining items.
     """
-    if not items or not openrouter_keys:
+    if not items:
+        return []
+
+    # Prefer Gemini direct when keys are available — no cost, simpler rotation.
+    gemini_keys = get_gemini_keys_from_airtable(at_key) if at_key else []
+    if gemini_keys:
+        gemini_model = model if model and model.startswith("gemini-") else GEMINI_MODEL
+        return _pre_classify_gemini(items, gemini_keys, model=gemini_model)
+
+    if not openrouter_keys:
         return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
 
     # Backward compat: accept a single key string too
