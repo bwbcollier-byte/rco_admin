@@ -105,10 +105,38 @@ F_LK_NAME         = "fldQqf8eF4mT2U0zT"  # primary
 F_LK_KEYS         = "fld4fYgMypJz9Iete"
 F_LK_STATUS       = "fldcZ9nAY8GD2OZW8"
 
+# AI Models catalog
+TABLE_AI_MODELS   = "tblzsfFK5MBZHIpAk"
+F_AM_NAME         = "fld6jUxZU7GxcMXI3"  # primary
+F_AM_SLUG         = "fldizUTyLsnhr78ZV"
+F_AM_PROVIDER     = "fldXvFvoXUaJqLFjF"
+F_AM_VIA          = "fldVxTy5zzxuDRkdg"
+F_AM_TIER         = "fldWO9vh1SpDKBAhZ"
+F_AM_INPUT_PRICE  = "fldMJYdF0Xoq3Zj4j"
+F_AM_OUTPUT_PRICE = "fldlHfoMzTu7a4efE"
+F_AM_CONTEXT      = "fld1WHR1GShSvE1lf"
+F_AM_GOOD_FOR     = "fldn1iqpsvbALL2P7"
+F_AM_QUALITY      = "fldfCssQtvnITdUsu"
+F_AM_STATUS       = "fldS8tdNRrEaKfl1W"
+F_AM_CURRENT_USE  = "fldu8c2337zeAaR3q"
+F_AM_LAST_CHECKED = "fldKPsV3LzTay0uMp"
+F_AM_FIRST_FOUND  = "fldtOn58LpHE9iSIx"
+F_AM_NOTES        = "fldyJklFGPg5tuTyn"
+
 # OpenRouter pre-classifier config
-OPENROUTER_MODEL = "deepseek/deepseek-chat"
+# Default model only used if no AI Models row is marked `Currently In Use For` =
+# 'intel pre-classifier'. Qwen 2.5 72B free is the current default.
+OPENROUTER_MODEL = "qwen/qwen-2.5-72b-instruct:free"
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
 PRE_CLASSIFY_BATCH_SIZE = 15
+
+# Providers worth tracking in AI Models. OpenRouter's catalog has 300+ models
+# across many providers; we only upsert rows for these to keep the table focused.
+INTERESTING_MODEL_PROVIDERS = {
+    "anthropic", "openai", "google", "meta-llama", "qwen", "deepseek",
+    "mistralai", "cohere", "perplexity", "x-ai", "nvidia", "amazon",
+    "microsoft", "nousresearch",
+}
 
 HYPEBASE_CONTEXT_FOR_CLASSIFIER = (
     "HypeBase is a talent/entertainment data platform. Python + TypeScript scrapers "
@@ -588,7 +616,32 @@ def get_openrouter_key_from_airtable(at_key):
     return None
 
 
-def pre_classify(items, openrouter_key):
+def get_classifier_model_from_airtable(at_key):
+    """Find the slug for the intel pre-classifier in AI Models table.
+
+    Matches rows where `Currently In Use For` contains 'intel pre-classifier'
+    (case-insensitive). Returns the Slug value of the first match, or falls
+    back to the OPENROUTER_MODEL constant.
+    """
+    try:
+        rows = at_list_all(AIRTABLE_BASE, TABLE_AI_MODELS,
+                           [F_AM_SLUG, F_AM_CURRENT_USE], at_key)
+    except Exception as e:
+        print(f"WARN classifier model lookup: {e}", file=sys.stderr)
+        return OPENROUTER_MODEL
+    for r in rows:
+        f = r.get("fields", {}) or {}
+        use = (f.get(F_AM_CURRENT_USE) or "").lower()
+        if "intel pre-classifier" in use or "pre-classifier" in use:
+            slug = (f.get(F_AM_SLUG) or "").strip()
+            if slug:
+                print(f"classifier model from Airtable: {slug}")
+                return slug
+    print(f"classifier model (fallback to default constant): {OPENROUTER_MODEL}")
+    return OPENROUTER_MODEL
+
+
+def pre_classify(items, openrouter_key, model=None):
     """Batch-classify items via OpenRouter. Returns list of dicts in input order:
     [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
 
@@ -597,6 +650,8 @@ def pre_classify(items, openrouter_key):
     """
     if not items or not openrouter_key:
         return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
+
+    model_slug = model or OPENROUTER_MODEL
 
     results = [None] * len(items)
     for start in range(0, len(items), PRE_CLASSIFY_BATCH_SIZE):
@@ -626,7 +681,7 @@ def pre_classify(items, openrouter_key):
             "X-Title": "HypeBase Intel Collector",
         }
         body = json.dumps({
-            "model": OPENROUTER_MODEL,
+            "model": model_slug,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1500,
             "temperature": 0,
@@ -675,7 +730,7 @@ def pre_classify(items, openrouter_key):
         counts[r["decision"]] = counts.get(r["decision"], 0) + 1
     print(f"pre_classify: relevant={counts['relevant']} "
           f"irrelevant={counts['irrelevant']} maybe={counts['maybe']} "
-          f"(model={OPENROUTER_MODEL}, {len(items)} items)")
+          f"(model={model_slug}, {len(items)} items)")
     return results
 
 
@@ -722,7 +777,7 @@ def at_update(base, table, updates, key_token):
 
 # ---------- Collectors ----------
 
-def collect_platform_updates(at_key, gh_token, today, openrouter_key=None):
+def collect_platform_updates(at_key, gh_token, today, openrouter_key=None, classifier_model=None):
     """Read Monitored Platforms from Airtable, dispatch to the right fetcher
     based on Check Method, write findings to Platform Updates, and update
     Last Checked / Last Finding Date on each platform row."""
@@ -793,7 +848,7 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_key=None):
     # Pre-classify before upsert. Source_items carry the title/summary used for
     # classification; new_records are the actual Airtable payloads we mutate.
     source_items = [{"title": r[F_P_TITLE], "summary": r.get(F_P_SUMMARY, "")} for r in new_records]
-    decisions = pre_classify(source_items, openrouter_key)
+    decisions = pre_classify(source_items, openrouter_key, classifier_model)
     skipped = apply_pre_classification(
         new_records, source_items, decisions,
         F_P_DECISION, "Ignore",
@@ -806,7 +861,7 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_key=None):
     print(f"monitored_platforms: {len(platform_updates)} Last Checked dates updated")
 
 
-def collect_ai_news(at_key, today, openrouter_key=None):
+def collect_ai_news(at_key, today, openrouter_key=None, classifier_model=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
     records = []
     source_items = []
@@ -829,7 +884,7 @@ def collect_ai_news(at_key, today, openrouter_key=None):
         records.append(fields)
         source_items.append({"title": title, "summary": it.get("summary", "")})
 
-    decisions = pre_classify(source_items, openrouter_key)
+    decisions = pre_classify(source_items, openrouter_key, classifier_model)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_N_DECISION, "Dismiss", F_N_NOTES,
@@ -839,7 +894,7 @@ def collect_ai_news(at_key, today, openrouter_key=None):
     print(f"ai_news: {created} created (of {len(records)} candidates)")
 
 
-def collect_deals(at_key, today, openrouter_key=None):
+def collect_deals(at_key, today, openrouter_key=None, classifier_model=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_DEALS, F_D_NAME, at_key)
     records = []
     source_items = []
@@ -866,7 +921,7 @@ def collect_deals(at_key, today, openrouter_key=None):
     else:
         print(f"WARN producthunt rss: {status}", file=sys.stderr)
 
-    decisions = pre_classify(source_items, openrouter_key)
+    decisions = pre_classify(source_items, openrouter_key, classifier_model)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_D_DECISION, "Skip", F_D_NOTES,
@@ -876,7 +931,7 @@ def collect_deals(at_key, today, openrouter_key=None):
     print(f"deals: {created} created (of {len(records)} candidates)")
 
 
-def collect_skills(at_key, gh_token, today, openrouter_key=None):
+def collect_skills(at_key, gh_token, today, openrouter_key=None, classifier_model=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_SKILLS, F_S_NAME, at_key)
     records = []
     stats = {"topic": 0, "watched": 0, "awesome": 0}
@@ -942,7 +997,7 @@ def collect_skills(at_key, gh_token, today, openrouter_key=None):
     # Skills uses Type (not Decision) as its state field. Pre-classifier irrelevants
     # get Type=Rejected instead of staying Discovered.
     source_items = [{"title": r[F_S_NAME], "summary": r.get(F_S_DESC, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_key)
+    decisions = pre_classify(source_items, openrouter_key, classifier_model)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_S_TYPE, "Rejected", F_S_AUDIT_NOTES,
@@ -956,7 +1011,7 @@ def collect_skills(at_key, gh_token, today, openrouter_key=None):
     )
 
 
-def collect_apis(at_key, today, openrouter_key=None):
+def collect_apis(at_key, today, openrouter_key=None, classifier_model=None):
     """Fetch from public-apis README + publicapis.dev API, filter by relevant
     categories, upsert to APIs table."""
 
@@ -1002,7 +1057,7 @@ def collect_apis(at_key, today, openrouter_key=None):
         })
     # APIs has no Notes field. Pass None for reason_field; just set Decision.
     source_items = [{"title": r[F_A_NAME], "summary": r.get(F_A_DESCRIPTION, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_key)
+    decisions = pre_classify(source_items, openrouter_key, classifier_model)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_A_DECISION, "Skip",
@@ -1012,7 +1067,91 @@ def collect_apis(at_key, today, openrouter_key=None):
     print(f"apis: {created} created (of {len(records)} candidates)")
 
 
-def collect_hf_trending(at_key, today, openrouter_key=None):
+def collect_ai_models(at_key, today):
+    """Refresh AI Models table from OpenRouter's model catalog.
+
+    Only updates technical fields (pricing, context, status) — leaves human-
+    curated fields (Good For, Quality Tier, Currently In Use For, Notes)
+    untouched on existing rows. Filters to known-interesting providers so
+    the table stays focused (~40-60 rows, not 300+).
+    """
+    status, body = http("https://openrouter.ai/api/v1/models")
+    if status >= 400:
+        print(f"WARN openrouter models: {status}", file=sys.stderr)
+        return
+    try:
+        data = json.loads(body)
+    except Exception as e:
+        print(f"WARN openrouter models parse: {e}", file=sys.stderr)
+        return
+    models = data.get("data", [])
+    if not models:
+        print("WARN openrouter models: empty list", file=sys.stderr)
+        return
+
+    # Load existing rows indexed by Slug
+    try:
+        existing = at_list_all(AIRTABLE_BASE, TABLE_AI_MODELS,
+                               [F_AM_SLUG], at_key)
+    except Exception as e:
+        print(f"WARN openrouter models read existing: {e}", file=sys.stderr)
+        existing = []
+    by_slug = {}
+    for r in existing:
+        f = r.get("fields", {}) or {}
+        slug = (f.get(F_AM_SLUG) or "").strip().lower()
+        if slug:
+            by_slug[slug] = r["id"]
+
+    updates, creates = [], []
+    skipped_providers = 0
+    for m in models:
+        slug = (m.get("id") or "").strip()
+        if not slug:
+            continue
+        provider = slug.split("/")[0].lower() if "/" in slug else ""
+        if provider not in INTERESTING_MODEL_PROVIDERS:
+            skipped_providers += 1
+            continue
+        name = m.get("name") or slug
+        pricing = m.get("pricing") or {}
+        try:
+            input_price = float(pricing.get("prompt") or 0) * 1_000_000
+            output_price = float(pricing.get("completion") or 0) * 1_000_000
+        except (ValueError, TypeError):
+            input_price, output_price = 0, 0
+        context = m.get("context_length") or 0
+        is_free = slug.endswith(":free") or (input_price == 0 and output_price == 0)
+
+        fields = {
+            F_AM_NAME:         name[:250],
+            F_AM_SLUG:         slug,
+            F_AM_PROVIDER:     provider,
+            F_AM_VIA:          "OpenRouter",
+            F_AM_TIER:         "Free" if is_free else "Paid",
+            F_AM_INPUT_PRICE:  round(input_price, 4),
+            F_AM_OUTPUT_PRICE: round(output_price, 4),
+            F_AM_CONTEXT:      int(context) if context else 0,
+            F_AM_LAST_CHECKED: today,
+        }
+
+        existing_id = by_slug.get(slug.lower())
+        if existing_id:
+            updates.append({"id": existing_id, "fields": fields})
+        else:
+            fields[F_AM_FIRST_FOUND] = today
+            fields[F_AM_STATUS] = "Active"
+            creates.append(fields)
+
+    created = at_create(AIRTABLE_BASE, TABLE_AI_MODELS, creates, at_key)
+    updated = at_update(AIRTABLE_BASE, TABLE_AI_MODELS, updates, at_key)
+    print(
+        f"ai_models: {created} new, {updated} refreshed "
+        f"(of {len(models)} total; {skipped_providers} skipped as non-core providers)"
+    )
+
+
+def collect_hf_trending(at_key, today, openrouter_key=None, classifier_model=None):
     """Pull HF trending models into AI News as 'HuggingFace Trending' source."""
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
     records = []
@@ -1035,7 +1174,7 @@ def collect_hf_trending(at_key, today, openrouter_key=None):
         records.append(fields)
 
     source_items = [{"title": r[F_N_HEADLINE], "summary": r.get(F_N_SUMMARY, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_key)
+    decisions = pre_classify(source_items, openrouter_key, classifier_model)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_N_DECISION, "Dismiss", F_N_NOTES,
@@ -1056,13 +1195,18 @@ def main():
     print(f"DEBUG: TRIAGE_GH_TOKEN  len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
     openrouter_key = get_openrouter_key_from_airtable(at_key)
+    classifier_model = get_classifier_model_from_airtable(at_key)
 
-    collect_platform_updates(at_key, gh_token, today, openrouter_key)
-    collect_ai_news(at_key, today, openrouter_key)
-    collect_hf_trending(at_key, today, openrouter_key)
-    collect_deals(at_key, today, openrouter_key)
-    collect_skills(at_key, gh_token, today, openrouter_key)
-    collect_apis(at_key, today, openrouter_key)
+    collect_platform_updates(at_key, gh_token, today, openrouter_key, classifier_model)
+    collect_ai_news(at_key, today, openrouter_key, classifier_model)
+    collect_hf_trending(at_key, today, openrouter_key, classifier_model)
+    collect_deals(at_key, today, openrouter_key, classifier_model)
+    collect_skills(at_key, gh_token, today, openrouter_key, classifier_model)
+    collect_apis(at_key, today, openrouter_key, classifier_model)
+
+    # Refresh OpenRouter model catalog (separate table — AI Models). Runs at
+    # the end so the collector's main work isn't delayed by this refresh.
+    collect_ai_models(at_key, today)
 
 
 if __name__ == "__main__":
