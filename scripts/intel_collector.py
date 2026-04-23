@@ -2,10 +2,12 @@
 """
 Intel collector — runs daily via GitHub Actions.
 
-Pulls from free RSS / GitHub / HN sources and upserts new items into Airtable
-tables (Platform Updates, AI News, Deals, Skills) with Decision=Pending.
-The Monday/Thursday strategic-intel-brief Claude routine reviews the Pending
-items, adds HypeBase-specific reasoning, and sets real Decision values.
+Pulls from Monitored Platforms (Airtable-configured), Hacker News, ProductHunt,
+GitHub topic search, and public-apis. Upserts new items into Airtable tables
+(Platform Updates, AI News, Deals, Skills, APIs) with Decision=Pending.
+
+The Mon/Thu strategic-intel-brief Claude routine reviews the Pending items,
+filters by HypeBase relevance, and sets real Decision values.
 
 Stdlib only. No third-party deps.
 
@@ -16,6 +18,7 @@ Env vars required:
 import email.utils as eu
 import json
 import os
+import re
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -27,10 +30,22 @@ from urllib.parse import quote
 
 AIRTABLE_BASE = "app6biS7yjV6XzFVG"
 
-TABLE_PLATFORM = "tblW6XV9X5gBrghOv"
-TABLE_NEWS     = "tbl4IUWP09vzchU5t"
-TABLE_DEALS    = "tbl9a3WVIhW7NddYz"
-TABLE_SKILLS   = "tblRYHxXNItKHXqg7"
+TABLE_MONITORED = "tbldabNFfzcs35YXn"
+TABLE_PLATFORM  = "tblW6XV9X5gBrghOv"
+TABLE_NEWS      = "tbl4IUWP09vzchU5t"
+TABLE_DEALS     = "tbl9a3WVIhW7NddYz"
+TABLE_SKILLS    = "tblRYHxXNItKHXqg7"
+TABLE_APIS      = "tblhsuuFCDKmO1Ho3"
+
+# Monitored Platforms
+F_M_NAME         = "fldweyAemSTkEb3ej"  # primary
+F_M_TIER         = "fldRNBPsWXEwqkeuw"
+F_M_METHOD       = "fldF6kdxfXCFNaR40"
+F_M_SOURCE_URL   = "fldtZLPqZX9BVk2dn"
+F_M_CATEGORY     = "fldMwWlXmDYfoiNhR"
+F_M_ACTIVE       = "fldiYywh64gn9BBl0"
+F_M_LAST_CHECKED = "fld048If9pGGu3aX3"
+F_M_LAST_FINDING = "fldsQ8hr2qcN2b3h3"
 
 # Platform Updates
 F_P_TITLE      = "fld6MygJickboWiDR"  # primary
@@ -67,28 +82,19 @@ F_S_SOURCE_URL = "fldsPZ14Bt4wuWxhH"
 F_S_DESC       = "fld9gzPlHxkvTaYti"
 F_S_DATE_FOUND = "fld1leHJYMR7A3CAD"
 
-# ---------- Source config ----------
+# APIs
+F_A_NAME           = "fldnqYSphdSsFkZMK"  # primary
+F_A_PROVIDER       = "fldSuUFCk3RK4P7Nc"
+F_A_MARKETPLACE    = "fldPaQSygpMD5teaS"
+F_A_MARKETPLACE_URL= "fldm3IQkEnDh5QU4s"
+F_A_DATE_FOUND     = "fldK2elEC2BgiLIMt"
+F_A_CATEGORY       = "fld3DQfFMnh2Pnel3"
+F_A_DESCRIPTION    = "fldwKCO6Wf2fx63Og"
+F_A_FREE_TIER      = "fldiovdOzNOT9JIG5"
+F_A_STATUS         = "fldaz4qu3qbpN7kNI"
+F_A_DECISION       = "fldrcHE03dHImIR2A"
 
-PLATFORM_SOURCES = [
-    # Tier 1 — we actively use these
-    {"name": "GitHub",                "tier": "Tier 1 - Active Use", "kind": "rss",
-     "url":  "https://github.blog/changelog/feed/"},
-    {"name": "Supabase",              "tier": "Tier 1 - Active Use", "kind": "releases",
-     "repo": "supabase/supabase"},
-    {"name": "Anthropic Claude Code", "tier": "Tier 1 - Active Use", "kind": "releases",
-     "repo": "anthropics/claude-code"},
-    {"name": "Anthropic SDK Python",  "tier": "Tier 1 - Active Use", "kind": "releases",
-     "repo": "anthropics/anthropic-sdk-python"},
-    # Tier 3 — we track for opportunity
-    {"name": "Vercel AI SDK",         "tier": "Tier 3 - Tracking", "kind": "releases",
-     "repo": "vercel/ai"},
-    {"name": "OpenAI Python SDK",     "tier": "Tier 3 - Tracking", "kind": "releases",
-     "repo": "openai/openai-python"},
-    {"name": "LangChain",             "tier": "Tier 3 - Tracking", "kind": "releases",
-     "repo": "langchain-ai/langchain"},
-    {"name": "Cloudflare",            "tier": "Tier 3 - Tracking", "kind": "rss",
-     "url":  "https://blog.cloudflare.com/rss/"},
-]
+# ---------- Source config ----------
 
 AI_KEYWORDS = [
     "ai", "claude", "gpt", "llm", "openai", "anthropic", "gemini", "perplexity",
@@ -103,21 +109,50 @@ DEAL_KEYWORDS = [
     "agent", "llm", "enrichment",
 ]
 
-SKILL_TOPICS = ["claude-code-skills", "claude-skills", "anthropic-skills"]
+SKILL_TOPICS = [
+    "claude-code-skills",
+    "claude-skills",
+    "anthropic-skills",
+    "claude-plugins",
+    "claude-subagent",
+    "claude-agent",
+    "claude-code",
+    "mcp-server",
+    "anthropic-mcp",
+    "agent-skills",
+]
 
-LOOKBACK_DAYS  = 3   # platform updates + news: last N days
-SKILL_LOOKBACK = 21  # skill repos: last N days of pushes
-HN_TOP_LIMIT   = 200 # number of top stories to scan
+# public-apis.org categories relevant to HypeBase (talent/entertainment data)
+API_CATEGORIES_RELEVANT = {
+    "Music",
+    "Video",
+    "Movies",
+    "Entertainment",
+    "Sports & Fitness",
+    "Sports",
+    "Social",
+    "News",
+    "Calendar",
+    "Games & Comics",
+    "Games",
+    "Business",
+    "Data Validation",
+    "Open Data",
+    "Jobs",  # for artist booking adjacent signals
+}
+
+LOOKBACK_DAYS  = 3
+SKILL_LOOKBACK = 21
+HN_TOP_LIMIT   = 200
 SUMMARY_CAP    = 1800
-SLEEP_BETWEEN_WRITES = 0.3  # gentle on Airtable's 5-rps base limit
-
-# ---------- HTTP ----------
+SLEEP          = 0.3
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 intel-collector"
 )
 
+# ---------- HTTP ----------
 
 def http(url, method="GET", headers=None, body=None, timeout=30):
     headers = dict(headers or {})
@@ -138,7 +173,7 @@ def http(url, method="GET", headers=None, body=None, timeout=30):
 # ---------- Feed parsers ----------
 
 def parse_feed(xml_bytes):
-    """Best-effort RSS 2.0 + Atom parser. Returns list of {title, link, summary, date}."""
+    """RSS 2.0 + Atom. Returns list of {title, link, summary, date}."""
     out = []
     try:
         root = ET.fromstring(xml_bytes)
@@ -168,20 +203,27 @@ def parse_feed(xml_bytes):
 
 
 def parse_date(s):
-    """Return YYYY-MM-DD string or None. Handles ISO 8601 and RFC 822."""
+    """YYYY-MM-DD or None. Handles ISO 8601 and RFC 822."""
     if not s:
         return None
     s = s.strip()
     try:
-        # ISO 8601: starts with 4-digit year. Do NOT trigger on "Thu, 23 Apr…"
-        # just because it contains the letter T.
         if len(s) >= 10 and s[:4].isdigit() and s[4] == "-":
             return s[:10]
-        # RFC 822 / RFC 2822 (typical RSS): "Thu, 23 Apr 2026 15:04:05 +0000"
         dt = eu.parsedate_to_datetime(s)
         return dt.strftime("%Y-%m-%d") if dt else None
     except Exception:
         return None
+
+
+def extract_gh_repo(url):
+    """https://github.com/foo/bar[/tree/main] → foo/bar"""
+    if not url:
+        return None
+    m = re.match(r"https?://github\.com/([\w.-]+)/([\w.-]+)", url)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
 
 
 # ---------- Source fetchers ----------
@@ -189,8 +231,7 @@ def parse_date(s):
 def gh_releases(repo, token, days=LOOKBACK_DAYS):
     url = f"https://api.github.com/repos/{repo}/releases?per_page=10"
     headers = {"Authorization": f"Bearer {token}",
-               "Accept": "application/vnd.github+json",
-               "User-Agent": "intel-collector"}
+               "Accept": "application/vnd.github+json"}
     status, body = http(url, headers=headers)
     if status >= 400:
         print(f"WARN gh_releases {repo}: {status} {body[:200]!r}", file=sys.stderr)
@@ -208,7 +249,7 @@ def gh_releases(repo, token, days=LOOKBACK_DAYS):
         if pub_dt < cutoff:
             continue
         out.append({
-            "title": r.get("name") or r.get("tag_name") or "(unnamed release)",
+            "title": r.get("name") or r.get("tag_name") or "(unnamed)",
             "link":  r.get("html_url", ""),
             "summary": (r.get("body") or "")[:SUMMARY_CAP],
             "date":  pub,
@@ -221,11 +262,10 @@ def gh_topic_search(topic, token, days=SKILL_LOOKBACK):
     q = f"topic:{topic} pushed:>={since}"
     url = f"https://api.github.com/search/repositories?q={quote(q)}&sort=updated&per_page=20"
     headers = {"Authorization": f"Bearer {token}",
-               "Accept": "application/vnd.github+json",
-               "User-Agent": "intel-collector"}
+               "Accept": "application/vnd.github+json"}
     status, body = http(url, headers=headers)
     if status >= 400:
-        print(f"WARN gh_topic_search {topic}: {status} {body[:200]!r}", file=sys.stderr)
+        print(f"WARN gh_topic {topic}: {status} {body[:200]!r}", file=sys.stderr)
         return []
     out = []
     for item in json.loads(body).get("items", []):
@@ -268,21 +308,57 @@ def hn_top(keywords, days=LOOKBACK_DAYS, limit=HN_TOP_LIMIT):
     return out
 
 
+def public_apis_readme():
+    """Fetch + parse public-apis README into category-tagged entries."""
+    url = "https://raw.githubusercontent.com/public-apis/public-apis/master/README.md"
+    status, body = http(url)
+    if status >= 400:
+        print(f"WARN public-apis README: {status}", file=sys.stderr)
+        return []
+    content = body.decode("utf-8", errors="replace")
+
+    entries = []
+    current_category = None
+    # Regex for a table data row like: | [Name](url) | Description | Auth | HTTPS | CORS |
+    row_re = re.compile(r"^\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|")
+
+    for line in content.splitlines():
+        line_stripped = line.strip()
+        # Section header: "### Music"
+        if line_stripped.startswith("### "):
+            current_category = line_stripped[4:].strip()
+            continue
+        if not current_category:
+            continue
+        # Skip table header and separator rows
+        if line_stripped.startswith("| API ") or line_stripped.startswith("|---"):
+            continue
+        m = row_re.match(line_stripped)
+        if m:
+            name, link, desc, auth, https = (
+                m.group(1).strip(), m.group(2).strip(),
+                m.group(3).strip(), m.group(4).strip(), m.group(5).strip(),
+            )
+            entries.append({
+                "name": name, "url": link, "description": desc,
+                "auth": auth, "https": https, "category": current_category,
+            })
+    return entries
+
+
 # ---------- Airtable ----------
 
 def at_list_all(base, table, field_ids, key_token):
-    headers = {"Authorization": f"Bearer {key_token}", "User-Agent": "intel-collector"}
+    headers = {"Authorization": f"Bearer {key_token}"}
     all_rows = []
     offset = None
     while True:
-        # returnFieldsByFieldId=true is critical: without it Airtable returns
-        # fields keyed by field NAME, and our dedup lookup by field ID returns
-        # None every time (silent dedup bypass, produces duplicates).
-        qs = "pageSize=100&returnFieldsByFieldId=true" + ("&offset=" + offset if offset else "")
+        qs = "pageSize=100&returnFieldsByFieldId=true"
+        if offset:
+            qs += f"&offset={offset}"
         if field_ids:
             qs += "&" + "&".join(f"fields[]={f}" for f in field_ids)
-        url = f"https://api.airtable.com/v0/{base}/{table}?{qs}"
-        status, body = http(url, headers=headers)
+        status, body = http(f"https://api.airtable.com/v0/{base}/{table}?{qs}", headers=headers)
         if status >= 400:
             print(f"WARN airtable list {table}: {status} {body[:300]!r}", file=sys.stderr)
             break
@@ -291,7 +367,7 @@ def at_list_all(base, table, field_ids, key_token):
         offset = data.get("offset")
         if not offset:
             break
-        time.sleep(SLEEP_BETWEEN_WRITES)
+        time.sleep(SLEEP)
     return all_rows
 
 
@@ -309,8 +385,7 @@ def at_create(base, table, records, key_token):
     if not records:
         return 0
     headers = {"Authorization": f"Bearer {key_token}",
-               "Content-Type": "application/json",
-               "User-Agent": "intel-collector"}
+               "Content-Type": "application/json"}
     url = f"https://api.airtable.com/v0/{base}/{table}"
     created = 0
     for i in range(0, len(records), 10):
@@ -321,32 +396,83 @@ def at_create(base, table, records, key_token):
             print(f"WARN airtable create {table}: {status} {body[:500]!r}", file=sys.stderr)
             continue
         created += len(json.loads(body).get("records", []))
-        time.sleep(SLEEP_BETWEEN_WRITES)
+        time.sleep(SLEEP)
     return created
+
+
+def at_update(base, table, updates, key_token):
+    """updates = [{"id": recX, "fields": {...}}]"""
+    if not updates:
+        return 0
+    headers = {"Authorization": f"Bearer {key_token}",
+               "Content-Type": "application/json"}
+    url = f"https://api.airtable.com/v0/{base}/{table}"
+    done = 0
+    for i in range(0, len(updates), 10):
+        payload = {"records": updates[i:i + 10], "typecast": True}
+        status, body = http(url, method="PATCH", headers=headers, body=payload)
+        if status >= 400:
+            print(f"WARN airtable update {table}: {status} {body[:500]!r}", file=sys.stderr)
+            continue
+        done += len(json.loads(body).get("records", []))
+        time.sleep(SLEEP)
+    return done
 
 
 # ---------- Collectors ----------
 
 def collect_platform_updates(at_key, gh_token, today):
+    """Read Monitored Platforms from Airtable, dispatch to the right fetcher
+    based on Check Method, write findings to Platform Updates, and update
+    Last Checked / Last Finding Date on each platform row."""
+
+    platforms = at_list_all(
+        AIRTABLE_BASE, TABLE_MONITORED,
+        [F_M_NAME, F_M_TIER, F_M_METHOD, F_M_SOURCE_URL, F_M_ACTIVE],
+        at_key,
+    )
+    active = [p for p in platforms if (p.get("fields") or {}).get(F_M_ACTIVE)]
+    print(f"platforms: {len(active)} active of {len(platforms)} total")
+
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_PLATFORM, F_P_TITLE, at_key)
-    records = []
-    for src in PLATFORM_SOURCES:
-        if src["kind"] == "rss":
-            status, body = http(src["url"])
-            items = parse_feed(body) if status < 400 else []
-            if status >= 400:
-                print(f"WARN rss {src['name']}: {status}", file=sys.stderr)
-        else:  # releases
-            items = gh_releases(src["repo"], gh_token)
+
+    new_records = []
+    platform_updates = []
+
+    for p in active:
+        f = p.get("fields", {}) or {}
+        name = f.get(F_M_NAME, "")
+        tier = f.get(F_M_TIER, "")
+        method = f.get(F_M_METHOD, "")
+        source_url = f.get(F_M_SOURCE_URL, "")
+
+        items = []
+        if method == "GitHub Releases":
+            repo = extract_gh_repo(source_url)
+            if repo:
+                items = gh_releases(repo, gh_token)
+        elif method == "RSS":
+            if source_url:
+                status, body = http(source_url)
+                if status < 400:
+                    items = parse_feed(body)
+                else:
+                    print(f"WARN rss {name}: {status}", file=sys.stderr)
+        elif method == "Manual":
+            # Tracked in table but we don't auto-fetch. Just bump Last Checked.
+            platform_updates.append({"id": p["id"], "fields": {F_M_LAST_CHECKED: today}})
+            continue
+
+        platform_new = 0
         for it in items:
-            title = f"[{src['name']}] {it['title']}"[:250]
+            title = f"[{name}] {it['title']}"[:250]
             if title.strip().lower() in seen:
                 continue
             seen.add(title.strip().lower())
             fields = {
                 F_P_TITLE:      title,
-                F_P_PLATFORM:   src["name"],
-                F_P_TIER:       src["tier"],
+                F_P_PLATFORM:   name,
+                F_P_TIER:       tier,
                 F_P_DATE_FOUND: today,
                 F_P_SUMMARY:    it.get("summary", ""),
                 F_P_SOURCE_URL: it.get("link", ""),
@@ -355,9 +481,18 @@ def collect_platform_updates(at_key, gh_token, today):
             d = parse_date(it.get("date"))
             if d:
                 fields[F_P_DATE_SHIP] = d
-            records.append(fields)
-    print(f"platform: {at_create(AIRTABLE_BASE, TABLE_PLATFORM, records, at_key)} created "
-          f"(of {len(records)} new candidates; {len(seen)} total now tracked)")
+            new_records.append(fields)
+            platform_new += 1
+
+        update_fields = {F_M_LAST_CHECKED: today}
+        if platform_new > 0:
+            update_fields[F_M_LAST_FINDING] = today
+        platform_updates.append({"id": p["id"], "fields": update_fields})
+
+    created = at_create(AIRTABLE_BASE, TABLE_PLATFORM, new_records, at_key)
+    at_update(AIRTABLE_BASE, TABLE_MONITORED, platform_updates, at_key)
+    print(f"platform: {created} created (of {len(new_records)} candidates)")
+    print(f"monitored_platforms: {len(platform_updates)} Last Checked dates updated")
 
 
 def collect_ai_news(at_key, today):
@@ -380,8 +515,8 @@ def collect_ai_news(at_key, today):
         if d:
             fields[F_N_DATE_PUB] = d
         records.append(fields)
-    print(f"ai_news: {at_create(AIRTABLE_BASE, TABLE_NEWS, records, at_key)} created "
-          f"(of {len(records)} new candidates)")
+    created = at_create(AIRTABLE_BASE, TABLE_NEWS, records, at_key)
+    print(f"ai_news: {created} created (of {len(records)} candidates)")
 
 
 def collect_deals(at_key, today):
@@ -408,8 +543,8 @@ def collect_deals(at_key, today):
             })
     else:
         print(f"WARN producthunt rss: {status}", file=sys.stderr)
-    print(f"deals: {at_create(AIRTABLE_BASE, TABLE_DEALS, records, at_key)} created "
-          f"(of {len(records)} new candidates)")
+    created = at_create(AIRTABLE_BASE, TABLE_DEALS, records, at_key)
+    print(f"deals: {created} created (of {len(records)} candidates)")
 
 
 def collect_skills(at_key, gh_token, today):
@@ -429,9 +564,40 @@ def collect_skills(at_key, gh_token, today):
                 F_S_DESC:       it.get("summary", ""),
                 F_S_DATE_FOUND: today,
             })
-    print(f"skills: {at_create(AIRTABLE_BASE, TABLE_SKILLS, records, at_key)} created "
-          f"(of {len(records)} new candidates)")
+    created = at_create(AIRTABLE_BASE, TABLE_SKILLS, records, at_key)
+    print(f"skills: {created} created (of {len(records)} candidates, {len(SKILL_TOPICS)} topics scanned)")
 
+
+def collect_apis(at_key, today):
+    """Fetch public-apis README, filter by relevant categories, upsert to APIs table."""
+    all_entries = public_apis_readme()
+    print(f"public-apis: {len(all_entries)} total entries parsed")
+    relevant = [e for e in all_entries if e["category"] in API_CATEGORIES_RELEVANT]
+    print(f"public-apis: {len(relevant)} in relevant categories")
+
+    seen = at_existing_titles(AIRTABLE_BASE, TABLE_APIS, F_A_NAME, at_key)
+    records = []
+    for e in relevant:
+        name = e["name"][:250]
+        if name.strip().lower() in seen:
+            continue
+        seen.add(name.strip().lower())
+        records.append({
+            F_A_NAME:           name,
+            F_A_MARKETPLACE:    "public-apis",
+            F_A_MARKETPLACE_URL:e["url"],
+            F_A_DATE_FOUND:     today,
+            F_A_CATEGORY:       e["category"],
+            F_A_DESCRIPTION:    e["description"][:SUMMARY_CAP],
+            F_A_FREE_TIER:      f"Auth: {e.get('auth','?')} | HTTPS: {e.get('https','?')}",
+            F_A_STATUS:         "Discovered",
+            F_A_DECISION:       "Pending",
+        })
+    created = at_create(AIRTABLE_BASE, TABLE_APIS, records, at_key)
+    print(f"apis: {created} created (of {len(records)} candidates)")
+
+
+# ---------- Main ----------
 
 def main():
     at_key = os.environ["AIRTABLE_API_KEY"]
@@ -445,6 +611,7 @@ def main():
     collect_ai_news(at_key, today)
     collect_deals(at_key, today)
     collect_skills(at_key, gh_token, today)
+    collect_apis(at_key, today)
 
 
 if __name__ == "__main__":
