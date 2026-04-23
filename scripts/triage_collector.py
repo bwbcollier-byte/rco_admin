@@ -129,7 +129,21 @@ def gh_logs_tail(repo, run_id, token, n_bytes=LOG_PREVIEW_BYTES):
     status, body = _req(url, headers=headers, timeout=30)
     if status >= 400:
         return None
-    return body[-n_bytes:].decode("utf-8", errors="replace")
+    return sanitize_for_postgres(body[-n_bytes:].decode("utf-8", errors="replace"))
+
+
+def sanitize_for_postgres(text):
+    """Strip characters Postgres text columns can't accept.
+
+    - \\x00 (null) is forbidden in text. Comes up in GH Actions log streams.
+    - Other control chars (besides \\n, \\r, \\t) add no value and bloat storage.
+    """
+    if not text:
+        return text
+    out = text.replace("\x00", "")
+    # Keep newline/carriage-return/tab; drop other C0 controls.
+    out = "".join(c for c in out if c >= " " or c in "\n\r\t")
+    return out
 
 
 def sb_upsert(table, rows, on_conflict, url, key):
@@ -188,6 +202,11 @@ def collect():
     gh_token = os.environ["TRIAGE_GH_TOKEN"]
     sb_url = os.environ["TRIAGE_SUPABASE_URL"].rstrip("/")
     sb_key = os.environ["TRIAGE_SUPABASE_KEY"]
+
+    # Safe token-provenance diagnostic: length + last 4 chars of the token.
+    # Does NOT reveal the secret but lets us confirm which token is in use
+    # when the same PAT exists in multiple places (shell export vs .env vs GH secret).
+    print(f"DEBUG: TRIAGE_GH_TOKEN len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
     timeouts = {(r, f): t for r, f, t in WORKFLOWS}
     now = datetime.now(timezone.utc)
