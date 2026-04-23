@@ -122,6 +122,26 @@ SKILL_TOPICS = [
     "agent-skills",
 ]
 
+# Specific repos we always want in the Skills table (not discovered via topic search).
+WATCHED_SKILL_REPOS = [
+    "anthropics/skills",           # official Anthropic aggregator
+    "obra/superpowers",            # custom agent skills
+    "posit-dev/skills",            # Posit / data science skills
+    "yamadashy/repomix",           # repo-packing utility for LLMs
+]
+
+# Awesome-lists to parse for GitHub repo references. The README of each is
+# fetched; every [name](https://github.com/owner/repo) link becomes a skill entry.
+AWESOME_SKILL_LISTS = [
+    "ComposioHQ/awesome-claude-skills",
+    "VoltAgent/awesome-agent-skills",
+    "travisvn/awesome-claude-skills",
+]
+
+# Hugging Face trending models — pulls top N by recent trending score.
+HF_TOP_LIMIT = 30
+HF_MIN_DOWNLOADS = 1000
+
 # public-apis.org categories relevant to HypeBase (talent/entertainment data)
 API_CATEGORIES_RELEVANT = {
     "Music",
@@ -346,6 +366,127 @@ def public_apis_readme():
     return entries
 
 
+def publicapis_dev():
+    """Pull entries from publicapis.dev community API. Returns list of
+    {name, url, description, auth, https, category}."""
+    url = "https://api.publicapis.dev/entries"
+    status, body = http(url)
+    if status >= 400:
+        print(f"WARN publicapis.dev: {status}", file=sys.stderr)
+        return []
+    try:
+        data = json.loads(body)
+    except Exception as e:
+        print(f"WARN publicapis.dev parse: {e}", file=sys.stderr)
+        return []
+    entries = []
+    for e in data.get("entries", []):
+        entries.append({
+            "name":        e.get("API") or e.get("name", ""),
+            "url":         e.get("Link") or e.get("link", ""),
+            "description": e.get("Description") or e.get("description", ""),
+            "auth":        e.get("Auth") or e.get("auth", ""),
+            "https":       "Yes" if e.get("HTTPS") else ("Yes" if e.get("https") else "No"),
+            "category":    e.get("Category") or e.get("category", ""),
+        })
+    return entries
+
+
+def gh_readme(repo, token):
+    """Fetch raw README content for a GitHub repo. Returns empty string on failure."""
+    url = f"https://api.github.com/repos/{repo}/readme"
+    headers = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github.raw"}
+    status, body = http(url, headers=headers)
+    if status >= 400:
+        print(f"WARN gh_readme {repo}: {status}", file=sys.stderr)
+        return ""
+    return body.decode("utf-8", errors="replace")
+
+
+def gh_repo_info(repo, token):
+    """Get basic info for a repo: title (owner/repo), link, summary, date."""
+    url = f"https://api.github.com/repos/{repo}"
+    headers = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json"}
+    status, body = http(url, headers=headers)
+    if status >= 400:
+        print(f"WARN gh_repo_info {repo}: {status} {body[:200]!r}", file=sys.stderr)
+        return None
+    d = json.loads(body)
+    return {
+        "title": d.get("full_name", repo),
+        "link":  d.get("html_url", f"https://github.com/{repo}"),
+        "summary": (d.get("description") or "")[:1000],
+        "date":  d.get("updated_at", ""),
+    }
+
+
+# Matches: [Name](https://github.com/owner/repo[...]) optional " - desc"
+_AWESOME_RE = re.compile(
+    r"\[([^\]]{1,200})\]\(https?://github\.com/([\w.-]+)/([\w.-]+?)(?:[#?/][^)]*)?\)"
+    r"(?:\s*[-—:·]\s*(.+?))?(?:$|\n)",
+    re.IGNORECASE,
+)
+
+# Repo-name segments we should NOT treat as a real repo (these are common URL paths)
+_SKIP_REPO_NAMES = {"archive", "blob", "tree", "wiki", "issues", "pulls",
+                    "releases", "actions", "pulse", "network", "graphs",
+                    "stargazers", "watchers", "fork", "compare", "commit",
+                    "commits", "settings"}
+
+
+def parse_awesome_list(content):
+    """Extract (full_name, url, description) tuples from markdown pointing to GH repos."""
+    out = []
+    seen = set()
+    for m in _AWESOME_RE.finditer(content):
+        owner = m.group(2).strip()
+        repo = m.group(3).strip().rstrip(".")
+        desc = (m.group(4) or "").strip()
+        if not repo or repo.lower() in _SKIP_REPO_NAMES:
+            continue
+        full = f"{owner}/{repo}"
+        if full in seen:
+            continue
+        seen.add(full)
+        out.append({
+            "title": full,
+            "link":  f"https://github.com/{full}",
+            "summary": desc[:500],
+            "date":  "",
+        })
+    return out
+
+
+def hf_trending_models():
+    """Pull top trending Hugging Face models. Returns a list of item dicts."""
+    url = f"https://huggingface.co/api/models?sort=trending&direction=-1&limit={HF_TOP_LIMIT}"
+    status, body = http(url)
+    if status >= 400:
+        print(f"WARN hf trending: {status}", file=sys.stderr)
+        return []
+    try:
+        models = json.loads(body)
+    except Exception:
+        return []
+    out = []
+    for m in models:
+        downloads = m.get("downloads", 0) or 0
+        if downloads < HF_MIN_DOWNLOADS:
+            continue
+        mid = m.get("id") or m.get("modelId", "")
+        if not mid:
+            continue
+        out.append({
+            "title": f"HF model: {mid}",
+            "link":  f"https://huggingface.co/{mid}",
+            "summary": f"Downloads: {downloads:,} | Likes: {m.get('likes', 0)} | Task: {m.get('pipeline_tag') or 'unknown'}",
+            "date":  m.get("lastModified", ""),
+        })
+    return out
+
+
 # ---------- Airtable ----------
 
 def at_list_all(base, table, field_ids, key_token):
@@ -550,6 +691,9 @@ def collect_deals(at_key, today):
 def collect_skills(at_key, gh_token, today):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_SKILLS, F_S_NAME, at_key)
     records = []
+    stats = {"topic": 0, "watched": 0, "awesome": 0}
+
+    # 1. GitHub topic search
     for topic in SKILL_TOPICS:
         for it in gh_topic_search(topic, gh_token):
             name = it["title"][:250]
@@ -564,37 +708,129 @@ def collect_skills(at_key, gh_token, today):
                 F_S_DESC:       it.get("summary", ""),
                 F_S_DATE_FOUND: today,
             })
+            stats["topic"] += 1
+
+    # 2. Specific watched repos (always add, even if quiet)
+    for repo in WATCHED_SKILL_REPOS:
+        info = gh_repo_info(repo, gh_token)
+        if not info:
+            continue
+        name = info["title"][:250]
+        if name.strip().lower() in seen:
+            continue
+        seen.add(name.strip().lower())
+        records.append({
+            F_S_NAME:       name,
+            F_S_TYPE:       "Discovered",
+            F_S_SOURCE:     "GitHub watched repo",
+            F_S_SOURCE_URL: info["link"],
+            F_S_DESC:       info["summary"],
+            F_S_DATE_FOUND: today,
+        })
+        stats["watched"] += 1
+
+    # 3. Awesome-list aggregators (parse README markdown)
+    for list_repo in AWESOME_SKILL_LISTS:
+        content = gh_readme(list_repo, gh_token)
+        if not content:
+            continue
+        entries = parse_awesome_list(content)
+        print(f"awesome-list {list_repo}: parsed {len(entries)} GH repo links")
+        for entry in entries:
+            name = entry["title"][:250]
+            if name.strip().lower() in seen:
+                continue
+            seen.add(name.strip().lower())
+            records.append({
+                F_S_NAME:       name,
+                F_S_TYPE:       "Discovered",
+                F_S_SOURCE:     f"Awesome list: {list_repo}",
+                F_S_SOURCE_URL: entry["link"],
+                F_S_DESC:       entry.get("summary", ""),
+                F_S_DATE_FOUND: today,
+            })
+            stats["awesome"] += 1
+
     created = at_create(AIRTABLE_BASE, TABLE_SKILLS, records, at_key)
-    print(f"skills: {created} created (of {len(records)} candidates, {len(SKILL_TOPICS)} topics scanned)")
+    print(
+        f"skills: {created} created "
+        f"(of {len(records)} candidates — topic={stats['topic']}, "
+        f"watched={stats['watched']}, awesome={stats['awesome']})"
+    )
 
 
 def collect_apis(at_key, today):
-    """Fetch public-apis README, filter by relevant categories, upsert to APIs table."""
-    all_entries = public_apis_readme()
-    print(f"public-apis: {len(all_entries)} total entries parsed")
-    relevant = [e for e in all_entries if e["category"] in API_CATEGORIES_RELEVANT]
-    print(f"public-apis: {len(relevant)} in relevant categories")
+    """Fetch from public-apis README + publicapis.dev API, filter by relevant
+    categories, upsert to APIs table."""
+
+    # Source 1: public-apis GitHub README
+    readme_entries = public_apis_readme()
+    print(f"public-apis README: {len(readme_entries)} total entries parsed")
+
+    # Source 2: publicapis.dev community API
+    dev_entries = publicapis_dev()
+    print(f"publicapis.dev: {len(dev_entries)} total entries parsed")
+
+    # Merge + dedup by URL (same API appears in both sources under slightly
+    # different names sometimes)
+    by_url = {}
+    for e in readme_entries + dev_entries:
+        url = (e.get("url") or "").strip().rstrip("/")
+        if not url or url in by_url:
+            continue
+        by_url[url] = e
+    all_entries = list(by_url.values())
+
+    # Filter to relevant categories
+    relevant = [e for e in all_entries if e.get("category") in API_CATEGORIES_RELEVANT]
+    print(f"APIs: {len(relevant)} in relevant categories after merge "
+          f"({len(all_entries)} total unique)")
 
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_APIS, F_A_NAME, at_key)
     records = []
     for e in relevant:
-        name = e["name"][:250]
-        if name.strip().lower() in seen:
+        name = (e.get("name") or "")[:250]
+        if not name or name.strip().lower() in seen:
             continue
         seen.add(name.strip().lower())
         records.append({
             F_A_NAME:           name,
             F_A_MARKETPLACE:    "public-apis",
-            F_A_MARKETPLACE_URL:e["url"],
+            F_A_MARKETPLACE_URL:e.get("url", ""),
             F_A_DATE_FOUND:     today,
-            F_A_CATEGORY:       e["category"],
-            F_A_DESCRIPTION:    e["description"][:SUMMARY_CAP],
+            F_A_CATEGORY:       e.get("category", ""),
+            F_A_DESCRIPTION:    (e.get("description") or "")[:SUMMARY_CAP],
             F_A_FREE_TIER:      f"Auth: {e.get('auth','?')} | HTTPS: {e.get('https','?')}",
             F_A_STATUS:         "Discovered",
             F_A_DECISION:       "Pending",
         })
     created = at_create(AIRTABLE_BASE, TABLE_APIS, records, at_key)
     print(f"apis: {created} created (of {len(records)} candidates)")
+
+
+def collect_hf_trending(at_key, today):
+    """Pull HF trending models into AI News as 'HuggingFace Trending' source."""
+    seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
+    records = []
+    for it in hf_trending_models():
+        title = it["title"][:250]
+        if title.strip().lower() in seen:
+            continue
+        seen.add(title.strip().lower())
+        fields = {
+            F_N_HEADLINE:   title,
+            F_N_SOURCE:     "HuggingFace Trending",
+            F_N_SOURCE_URL: it["link"],
+            F_N_DATE_FOUND: today,
+            F_N_SUMMARY:    it.get("summary", ""),
+            F_N_DECISION:   "Pending",
+        }
+        d = parse_date(it.get("date"))
+        if d:
+            fields[F_N_DATE_PUB] = d
+        records.append(fields)
+    created = at_create(AIRTABLE_BASE, TABLE_NEWS, records, at_key)
+    print(f"hf_trending: {created} created (of {len(records)} candidates)")
 
 
 # ---------- Main ----------
@@ -609,6 +845,7 @@ def main():
 
     collect_platform_updates(at_key, gh_token, today)
     collect_ai_news(at_key, today)
+    collect_hf_trending(at_key, today)
     collect_deals(at_key, today)
     collect_skills(at_key, gh_token, today)
     collect_apis(at_key, today)
