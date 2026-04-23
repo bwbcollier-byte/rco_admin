@@ -94,6 +94,35 @@ F_A_FREE_TIER      = "fldiovdOzNOT9JIG5"
 F_A_STATUS         = "fldaz4qu3qbpN7kNI"
 F_A_DECISION       = "fldrcHE03dHImIR2A"
 
+# Notes fields (used for pre-classifier reason strings)
+F_N_NOTES       = "fldIyGfUfsKmjFSnq"  # AI News
+F_D_NOTES       = "fldxRN1xdAfcSFx8c"  # Deals
+F_S_AUDIT_NOTES = "fldswaN5jLkCzogde"  # Skills
+
+# Logins & Keys
+TABLE_LOGINS_KEYS = "tbldJkG11gY1W3jTf"
+F_LK_NAME         = "fldQqf8eF4mT2U0zT"  # primary
+F_LK_KEYS         = "fld4fYgMypJz9Iete"
+F_LK_STATUS       = "fldcZ9nAY8GD2OZW8"
+
+# OpenRouter pre-classifier config
+OPENROUTER_MODEL = "deepseek/deepseek-chat"
+OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
+PRE_CLASSIFY_BATCH_SIZE = 15
+
+HYPEBASE_CONTEXT_FOR_CLASSIFIER = (
+    "HypeBase is a talent/entertainment data platform. Python + TypeScript scrapers "
+    "on GitHub Actions write enriched profiles to Supabase. 17+ scrapers cover music "
+    "(Spotify, Deezer, MusicBrainz, TheAudioDB, AllMusic, SoundCloud), film/TV "
+    "(IMDb, IMDbPro, TMDb), sports (RealGM, Transfermarkt), social (Twitter, "
+    "Instagram, Bandsintown), events (Songkick, Last.fm). Webapps use Next.js + "
+    "Supabase. Ops in Airtable. Claude Code for dev + scheduled routines. Looking "
+    "for: scraping tools, data enrichment APIs, agent/AI skills, dev tooling, cost "
+    "savings on AI/APIs, Claude Code updates, Airtable/Supabase/Slack enhancements. "
+    "NOT relevant: consumer apps, gaming, weather, health, crypto, photography, "
+    "education, currency, generic text tools."
+)
+
 # ---------- Source config ----------
 
 AI_KEYWORDS = [
@@ -522,6 +551,156 @@ def at_create(base, table, records, key_token):
     return created
 
 
+def get_openrouter_key_from_airtable(at_key):
+    """Fetch the OpenRouter key from the Airtable Logins & Keys table.
+
+    Searches for a row whose Name matches 'Open Router' / 'OpenRouter' / 'openrouter'
+    and extracts the first line starting with 'sk-or-' from its Keys field.
+    Falls back to the OPENROUTER_API_KEY env var if Airtable lookup fails.
+    Returns None if neither source has a usable key. Never logs the value.
+    """
+    try:
+        rows = at_list_all(
+            AIRTABLE_BASE, TABLE_LOGINS_KEYS, [F_LK_NAME, F_LK_KEYS], at_key
+        )
+    except Exception as e:
+        print(f"WARN openrouter key airtable lookup: {e}", file=sys.stderr)
+        rows = []
+    for r in rows:
+        f = r.get("fields", {}) or {}
+        name = (f.get(F_LK_NAME) or "").strip().lower().replace(" ", "")
+        if name not in ("openrouter", "open-router", "openrouterapikey"):
+            continue
+        keys_text = f.get(F_LK_KEYS) or ""
+        for line in keys_text.splitlines():
+            line = line.strip()
+            if line.startswith("sk-or-"):
+                print(f"openrouter: key loaded from Airtable row (len={len(line)}, "
+                      f"suffix=...{line[-4:]})")
+                return line
+    env_val = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if env_val:
+        print(f"openrouter: key loaded from OPENROUTER_API_KEY env (len={len(env_val)}, "
+              f"suffix=...{env_val[-4:]})")
+        return env_val
+    print("WARN openrouter: no key found in Airtable or env — pre-classifier disabled",
+          file=sys.stderr)
+    return None
+
+
+def pre_classify(items, openrouter_key):
+    """Batch-classify items via OpenRouter. Returns list of dicts in input order:
+    [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
+
+    Safe to call with None key or empty list. On any failure, returns 'maybe' for
+    every item so nothing gets auto-dismissed on classifier errors.
+    """
+    if not items or not openrouter_key:
+        return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
+
+    results = [None] * len(items)
+    for start in range(0, len(items), PRE_CLASSIFY_BATCH_SIZE):
+        batch = items[start : start + PRE_CLASSIFY_BATCH_SIZE]
+        batch_in = [
+            {"id": i, "title": (it.get("title") or "")[:200],
+             "desc": (it.get("summary") or "")[:300]}
+            for i, it in enumerate(batch)
+        ]
+        prompt = (
+            f"You are filtering items for a strategic intelligence brief.\n\n"
+            f"CONTEXT: {HYPEBASE_CONTEXT_FOR_CLASSIFIER}\n\n"
+            f"For each item below, output one of: 'relevant', 'irrelevant', or 'maybe'. "
+            f"Be strict — mark as 'relevant' only if it clearly helps HypeBase. Mark "
+            f"'irrelevant' only if you're confident it doesn't help. Use 'maybe' when "
+            f"unsure — a human will re-check.\n\n"
+            f"INPUT (JSON): {json.dumps(batch_in)}\n\n"
+            f"OUTPUT: JSON array of the same length, in the same order, each element "
+            f"shaped like: {{\"decision\": \"relevant\"|\"irrelevant\"|\"maybe\", "
+            f"\"reason\": \"<=12 words\"}}\n"
+            f"No preamble, no markdown fences, just the JSON array."
+        )
+        headers = {
+            "Authorization": f"Bearer {openrouter_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/bwbcollier-byte/rco_admin",
+            "X-Title": "HypeBase Intel Collector",
+        }
+        body = json.dumps({
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1500,
+            "temperature": 0,
+        }).encode()
+        status, resp_body = http(OPENROUTER_URL, method="POST", headers=headers, body=body)
+        if status >= 400:
+            print(f"WARN pre_classify batch {start}: {status} {resp_body[:200]!r}",
+                  file=sys.stderr)
+            for i in range(len(batch)):
+                results[start + i] = {"decision": "maybe", "reason": "classifier HTTP error"}
+            continue
+        try:
+            resp = json.loads(resp_body)
+            content = (resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            # Strip markdown fences if model ignored the instruction
+            if content.startswith("```"):
+                fences = content.split("```")
+                if len(fences) >= 2:
+                    content = fences[1]
+                    if content.lower().startswith("json\n") or content.lower().startswith("json "):
+                        content = content[4:].lstrip()
+                    if content.endswith("\n"):
+                        content = content.rstrip()
+            parsed = json.loads(content)
+            if isinstance(parsed, list) and len(parsed) == len(batch):
+                for i, dec in enumerate(parsed):
+                    if not isinstance(dec, dict):
+                        dec = {"decision": "maybe", "reason": "malformed response item"}
+                    d = (dec.get("decision") or "").strip().lower()
+                    if d not in ("relevant", "irrelevant", "maybe"):
+                        d = "maybe"
+                    results[start + i] = {
+                        "decision": d,
+                        "reason": (dec.get("reason") or "")[:200],
+                    }
+            else:
+                raise ValueError(f"length mismatch: got {len(parsed) if isinstance(parsed, list) else 'non-list'}, want {len(batch)}")
+        except Exception as e:
+            print(f"WARN pre_classify batch {start} parse: {e}", file=sys.stderr)
+            for i in range(len(batch)):
+                results[start + i] = {"decision": "maybe", "reason": "classifier parse error"}
+        time.sleep(SLEEP)
+
+    counts = {"relevant": 0, "irrelevant": 0, "maybe": 0}
+    for r in results:
+        counts[r["decision"]] = counts.get(r["decision"], 0) + 1
+    print(f"pre_classify: relevant={counts['relevant']} "
+          f"irrelevant={counts['irrelevant']} maybe={counts['maybe']} "
+          f"(model={OPENROUTER_MODEL}, {len(items)} items)")
+    return results
+
+
+def apply_pre_classification(records, source_items, decisions,
+                             decision_field, irrelevant_value,
+                             reason_field=None):
+    """Mutate records in place: for items the pre-classifier flagged 'irrelevant',
+    set the given decision field to the irrelevant_value and optionally append a
+    reason to the given notes field. records and source_items are parallel lists —
+    source_items is what went INTO pre_classify; records is what goes INTO Airtable."""
+    if not decisions:
+        return 0
+    skipped = 0
+    for rec, dec in zip(records, decisions):
+        if dec.get("decision") != "irrelevant":
+            continue
+        rec[decision_field] = irrelevant_value
+        if reason_field:
+            suffix = f"[Pre-classified {irrelevant_value}: {dec.get('reason', 'irrelevant')}]"
+            existing = rec.get(reason_field, "")
+            rec[reason_field] = f"{existing}\n{suffix}".strip() if existing else suffix
+        skipped += 1
+    return skipped
+
+
 def at_update(base, table, updates, key_token):
     """updates = [{"id": recX, "fields": {...}}]"""
     if not updates:
@@ -543,7 +722,7 @@ def at_update(base, table, updates, key_token):
 
 # ---------- Collectors ----------
 
-def collect_platform_updates(at_key, gh_token, today):
+def collect_platform_updates(at_key, gh_token, today, openrouter_key=None):
     """Read Monitored Platforms from Airtable, dispatch to the right fetcher
     based on Check Method, write findings to Platform Updates, and update
     Last Checked / Last Finding Date on each platform row."""
@@ -611,15 +790,26 @@ def collect_platform_updates(at_key, gh_token, today):
             update_fields[F_M_LAST_FINDING] = today
         platform_updates.append({"id": p["id"], "fields": update_fields})
 
+    # Pre-classify before upsert. Source_items carry the title/summary used for
+    # classification; new_records are the actual Airtable payloads we mutate.
+    source_items = [{"title": r[F_P_TITLE], "summary": r.get(F_P_SUMMARY, "")} for r in new_records]
+    decisions = pre_classify(source_items, openrouter_key)
+    skipped = apply_pre_classification(
+        new_records, source_items, decisions,
+        F_P_DECISION, "Ignore",
+        # Platform Updates has no Notes field; leave reason_field unused
+    )
+    print(f"platform pre-classify: auto-Ignored {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_PLATFORM, new_records, at_key)
     at_update(AIRTABLE_BASE, TABLE_MONITORED, platform_updates, at_key)
     print(f"platform: {created} created (of {len(new_records)} candidates)")
     print(f"monitored_platforms: {len(platform_updates)} Last Checked dates updated")
 
 
-def collect_ai_news(at_key, today):
+def collect_ai_news(at_key, today, openrouter_key=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
     records = []
+    source_items = []
     for it in hn_top(AI_KEYWORDS):
         title = it["title"][:250]
         if title.strip().lower() in seen:
@@ -637,13 +827,22 @@ def collect_ai_news(at_key, today):
         if d:
             fields[F_N_DATE_PUB] = d
         records.append(fields)
+        source_items.append({"title": title, "summary": it.get("summary", "")})
+
+    decisions = pre_classify(source_items, openrouter_key)
+    skipped = apply_pre_classification(
+        records, source_items, decisions,
+        F_N_DECISION, "Dismiss", F_N_NOTES,
+    )
+    print(f"ai_news pre-classify: auto-Dismissed {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_NEWS, records, at_key)
     print(f"ai_news: {created} created (of {len(records)} candidates)")
 
 
-def collect_deals(at_key, today):
+def collect_deals(at_key, today, openrouter_key=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_DEALS, F_D_NAME, at_key)
     records = []
+    source_items = []
     status, body = http("https://www.producthunt.com/feed")
     if status < 400:
         kw_lc = [k.lower() for k in DEAL_KEYWORDS]
@@ -663,13 +862,21 @@ def collect_deals(at_key, today):
                 F_D_DESC:       it.get("summary", ""),
                 F_D_DECISION:   "Pending",
             })
+            source_items.append({"title": title, "summary": it.get("summary", "")})
     else:
         print(f"WARN producthunt rss: {status}", file=sys.stderr)
+
+    decisions = pre_classify(source_items, openrouter_key)
+    skipped = apply_pre_classification(
+        records, source_items, decisions,
+        F_D_DECISION, "Skip", F_D_NOTES,
+    )
+    print(f"deals pre-classify: auto-Skipped {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_DEALS, records, at_key)
     print(f"deals: {created} created (of {len(records)} candidates)")
 
 
-def collect_skills(at_key, gh_token, today):
+def collect_skills(at_key, gh_token, today, openrouter_key=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_SKILLS, F_S_NAME, at_key)
     records = []
     stats = {"topic": 0, "watched": 0, "awesome": 0}
@@ -732,6 +939,15 @@ def collect_skills(at_key, gh_token, today):
             })
             stats["awesome"] += 1
 
+    # Skills uses Type (not Decision) as its state field. Pre-classifier irrelevants
+    # get Type=Rejected instead of staying Discovered.
+    source_items = [{"title": r[F_S_NAME], "summary": r.get(F_S_DESC, "")} for r in records]
+    decisions = pre_classify(source_items, openrouter_key)
+    skipped = apply_pre_classification(
+        records, source_items, decisions,
+        F_S_TYPE, "Rejected", F_S_AUDIT_NOTES,
+    )
+    print(f"skills pre-classify: auto-Rejected {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_SKILLS, records, at_key)
     print(
         f"skills: {created} created "
@@ -740,7 +956,7 @@ def collect_skills(at_key, gh_token, today):
     )
 
 
-def collect_apis(at_key, today):
+def collect_apis(at_key, today, openrouter_key=None):
     """Fetch from public-apis README + publicapis.dev API, filter by relevant
     categories, upsert to APIs table."""
 
@@ -784,11 +1000,19 @@ def collect_apis(at_key, today):
             F_A_STATUS:         "Discovered",
             F_A_DECISION:       "Pending",
         })
+    # APIs has no Notes field. Pass None for reason_field; just set Decision.
+    source_items = [{"title": r[F_A_NAME], "summary": r.get(F_A_DESCRIPTION, "")} for r in records]
+    decisions = pre_classify(source_items, openrouter_key)
+    skipped = apply_pre_classification(
+        records, source_items, decisions,
+        F_A_DECISION, "Skip",
+    )
+    print(f"apis pre-classify: auto-Skipped {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_APIS, records, at_key)
     print(f"apis: {created} created (of {len(records)} candidates)")
 
 
-def collect_hf_trending(at_key, today):
+def collect_hf_trending(at_key, today, openrouter_key=None):
     """Pull HF trending models into AI News as 'HuggingFace Trending' source."""
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
     records = []
@@ -809,6 +1033,14 @@ def collect_hf_trending(at_key, today):
         if d:
             fields[F_N_DATE_PUB] = d
         records.append(fields)
+
+    source_items = [{"title": r[F_N_HEADLINE], "summary": r.get(F_N_SUMMARY, "")} for r in records]
+    decisions = pre_classify(source_items, openrouter_key)
+    skipped = apply_pre_classification(
+        records, source_items, decisions,
+        F_N_DECISION, "Dismiss", F_N_NOTES,
+    )
+    print(f"hf_trending pre-classify: auto-Dismissed {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_NEWS, records, at_key)
     print(f"hf_trending: {created} created (of {len(records)} candidates)")
 
@@ -823,12 +1055,14 @@ def main():
     print(f"DEBUG: AIRTABLE_API_KEY len={len(at_key)} suffix=...{at_key[-4:]}")
     print(f"DEBUG: TRIAGE_GH_TOKEN  len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
-    collect_platform_updates(at_key, gh_token, today)
-    collect_ai_news(at_key, today)
-    collect_hf_trending(at_key, today)
-    collect_deals(at_key, today)
-    collect_skills(at_key, gh_token, today)
-    collect_apis(at_key, today)
+    openrouter_key = get_openrouter_key_from_airtable(at_key)
+
+    collect_platform_updates(at_key, gh_token, today, openrouter_key)
+    collect_ai_news(at_key, today, openrouter_key)
+    collect_hf_trending(at_key, today, openrouter_key)
+    collect_deals(at_key, today, openrouter_key)
+    collect_skills(at_key, gh_token, today, openrouter_key)
+    collect_apis(at_key, today, openrouter_key)
 
 
 if __name__ == "__main__":
