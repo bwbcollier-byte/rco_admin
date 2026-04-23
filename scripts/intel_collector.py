@@ -150,6 +150,34 @@ INTERESTING_MODEL_PROVIDERS = {
     "microsoft", "nousresearch",
 }
 
+# HuggingFace model collection config
+HF_PIPELINE_TAGS = [
+    "text-generation",
+    "text-to-image",
+    "text-to-video",
+    "text-to-speech",
+    "automatic-speech-recognition",
+    "feature-extraction",       # embeddings
+    "image-text-to-text",       # multimodal
+    "image-to-image",
+]
+HF_MODELS_PER_TASK = 25
+
+HF_TAG_TO_GOOD_FOR = {
+    "text-generation":              ["Reasoning"],
+    "text-to-image":                ["Image Generation"],
+    "text-to-video":                ["Video Generation"],
+    "text-to-speech":               ["Voice"],
+    "automatic-speech-recognition": ["Voice"],
+    "feature-extraction":           ["Embeddings"],
+    "image-text-to-text":           ["Multimodal"],
+    "image-to-image":               ["Multimodal"],
+    "image-to-text":                ["Multimodal"],
+    "translation":                  ["Translation"],
+    "summarization":                ["Summarization"],
+    "question-answering":           ["Research"],
+}
+
 HYPEBASE_CONTEXT_FOR_CLASSIFIER = (
     "HypeBase is a talent/entertainment data platform. Python + TypeScript scrapers "
     "on GitHub Actions write enriched profiles to Supabase. 17+ scrapers cover music "
@@ -1236,6 +1264,99 @@ def collect_apis(at_key, today, openrouter_keys=None, classifier_model=None):
     print(f"apis: {created} created (of {len(records)} candidates)")
 
 
+def hf_models_for_task(task, limit=HF_MODELS_PER_TASK):
+    """Fetch top N models for a given HuggingFace pipeline_tag.
+    Returns raw list from HF API. Empty list on failure."""
+    url = (
+        f"https://huggingface.co/api/models"
+        f"?pipeline_tag={task}"
+        f"&sort=downloads&direction=-1&limit={limit}&full=false"
+    )
+    status, body = http(url)
+    if status >= 400:
+        print(f"WARN hf models {task}: {status}", file=sys.stderr)
+        return []
+    try:
+        data = json.loads(body)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"WARN hf models {task} parse: {e}", file=sys.stderr)
+        return []
+
+
+def collect_hf_models(at_key, today):
+    """Pull top HuggingFace models across core pipeline tasks and upsert to
+    AI Models table. Only updates technical fields (downloads/likes go into
+    Notes). Leaves curated fields (Quality Tier, Currently In Use For) alone."""
+    try:
+        existing = at_list_all(AIRTABLE_BASE, TABLE_AI_MODELS,
+                               [F_AM_SLUG], at_key)
+    except Exception as e:
+        print(f"WARN hf models read existing: {e}", file=sys.stderr)
+        existing = []
+    by_slug = {}
+    for r in existing:
+        f = r.get("fields", {}) or {}
+        slug = (f.get(F_AM_SLUG) or "").strip().lower()
+        if slug:
+            by_slug[slug] = r["id"]
+
+    updates, creates = [], []
+    seen_this_run = set()
+    total_fetched = 0
+
+    for task in HF_PIPELINE_TAGS:
+        models = hf_models_for_task(task)
+        total_fetched += len(models)
+        good_for = HF_TAG_TO_GOOD_FOR.get(task, [])
+
+        for m in models:
+            slug = (m.get("id") or m.get("modelId") or "").strip()
+            if not slug or slug.lower() in seen_this_run:
+                continue
+            seen_this_run.add(slug.lower())
+            author = m.get("author") or (slug.split("/")[0] if "/" in slug else "")
+            downloads = m.get("downloads", 0) or 0
+            likes = m.get("likes", 0) or 0
+            is_gated = bool(m.get("gated"))
+            note_parts = [
+                f"HF task: {task}",
+                f"downloads: {downloads:,}",
+                f"likes: {likes}",
+            ]
+            if is_gated:
+                note_parts.append("GATED (requires HF auth + license acceptance)")
+
+            fields = {
+                F_AM_NAME:         slug[:250],
+                F_AM_SLUG:         slug,
+                F_AM_PROVIDER:     author,
+                F_AM_VIA:          "HuggingFace",
+                F_AM_TIER:         "Free",
+                F_AM_INPUT_PRICE:  0,
+                F_AM_OUTPUT_PRICE: 0,
+                F_AM_LAST_CHECKED: today,
+                F_AM_NOTES:        " | ".join(note_parts),
+            }
+
+            existing_id = by_slug.get(slug.lower())
+            if existing_id:
+                updates.append({"id": existing_id, "fields": fields})
+            else:
+                fields[F_AM_FIRST_FOUND] = today
+                fields[F_AM_STATUS] = "Active"
+                if good_for:
+                    fields[F_AM_GOOD_FOR] = good_for
+                creates.append(fields)
+
+    created = at_create(AIRTABLE_BASE, TABLE_AI_MODELS, creates, at_key)
+    updated = at_update(AIRTABLE_BASE, TABLE_AI_MODELS, updates, at_key)
+    print(
+        f"hf_models: {created} new, {updated} refreshed "
+        f"(fetched {total_fetched} across {len(HF_PIPELINE_TAGS)} HF tasks)"
+    )
+
+
 def collect_ai_models(at_key, today):
     """Refresh AI Models table from OpenRouter's model catalog.
 
@@ -1373,9 +1494,9 @@ def main():
     collect_skills(at_key, gh_token, today, openrouter_keys, classifier_model)
     collect_apis(at_key, today, openrouter_keys, classifier_model)
 
-    # Refresh OpenRouter model catalog (separate table — AI Models). Runs at
-    # the end so the collector's main work isn't delayed by this refresh.
-    collect_ai_models(at_key, today)
+    # Refresh AI Models catalog from multiple sources at end of run.
+    collect_ai_models(at_key, today)   # OpenRouter (~40-60 rows refreshed)
+    collect_hf_models(at_key, today)   # HuggingFace (~200 rows across 8 tasks)
 
 
 if __name__ == "__main__":
