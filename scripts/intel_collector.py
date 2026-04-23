@@ -275,7 +275,10 @@ def at_list_all(base, table, field_ids, key_token):
     all_rows = []
     offset = None
     while True:
-        qs = "pageSize=100" + ("&offset=" + offset if offset else "")
+        # returnFieldsByFieldId=true is critical: without it Airtable returns
+        # fields keyed by field NAME, and our dedup lookup by field ID returns
+        # None every time (silent dedup bypass, produces duplicates).
+        qs = "pageSize=100&returnFieldsByFieldId=true" + ("&offset=" + offset if offset else "")
         if field_ids:
             qs += "&" + "&".join(f"fields[]={f}" for f in field_ids)
         url = f"https://api.airtable.com/v0/{base}/{table}?{qs}"
