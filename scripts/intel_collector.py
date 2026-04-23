@@ -317,12 +317,16 @@ def _ascii_safe_url(url):
     """Percent-encode non-ASCII characters in the URL path/query so urllib can
     build an HTTP request without an 'ascii codec can't encode' error.
     Sitemap/scrape URLs can contain accented chars (é, ñ, etc.) in the path.
-    Host is IDNA-encoded; scheme/fragment are left as-is."""
+    Host is IDNA-encoded; scheme/fragment are left as-is.
+
+    Path safe set preserves RFC 3986 reserved chars that are legitimate in
+    paths — specifically ':' and '@', so Google API action endpoints like
+    '/models/gemini-2.5-flash:generateContent' don't get mangled."""
     try:
         sp = urlsplit(url)
         netloc = sp.netloc.encode("idna").decode("ascii") if sp.netloc else ""
-        path = quote(sp.path, safe="/%+")
-        query = quote(sp.query, safe="=&%+")
+        path = quote(sp.path, safe="/%+:@")
+        query = quote(sp.query, safe="=&%+:@")
         return urlunsplit((sp.scheme, netloc, path, query, sp.fragment))
     except Exception:
         return url
