@@ -959,11 +959,17 @@ def _pre_classify_gemini(items, gemini_keys, model=None):
             },
         }).encode()
 
-        RETIRE_STATUSES = {401, 403, 429}
+        # RETIRE: permanent key problem (auth/quota). Key is removed from the
+        # pool for the rest of this run.
+        # TRANSIENT: temporary provider problem (5xx overload). Rotate to next
+        # key for THIS batch only; key stays in the pool for future batches.
+        RETIRE_STATUSES    = {401, 403, 429}
+        TRANSIENT_STATUSES = {500, 502, 503, 504}
         status = 0
         resp_body = b""
-        while current_key_idx < len(available_keys):
-            key = available_keys[current_key_idx]
+        batch_key_idx = current_key_idx  # local cursor for this batch's rotation
+        while batch_key_idx < len(available_keys):
+            key = available_keys[batch_key_idx]
             url = GEMINI_URL.format(model=model_slug, key=key)
             headers = {"Content-Type": "application/json"}
             status, resp_body = http(url, method="POST", headers=headers, body=body)
@@ -977,8 +983,17 @@ def _pre_classify_gemini(items, gemini_keys, model=None):
                 exhausted.append({"suffix": key[-4:], "status": status,
                                   "error": err_preview.decode('utf-8', errors='replace')})
                 current_key_idx += 1
+                batch_key_idx = current_key_idx
                 continue
-            break
+            if status in TRANSIENT_STATUSES:
+                print(
+                    f"gemini key ...{key[-4:]} transient HTTP {status} at batch "
+                    f"{start} — rotating to next key (key retained in pool)",
+                    file=sys.stderr,
+                )
+                batch_key_idx += 1
+                continue
+            break  # success or non-retire non-transient error (400, 404, etc.)
 
         if current_key_idx >= len(available_keys):
             print("WARN pre_classify (gemini): ALL keys exhausted — remaining items -> 'maybe'",
@@ -987,6 +1002,17 @@ def _pre_classify_gemini(items, gemini_keys, model=None):
                 if results[i] is None:
                     results[i] = {"decision": "maybe", "reason": "all gemini keys exhausted"}
             break
+
+        if batch_key_idx >= len(available_keys):
+            # Every remaining key gave a transient 5xx for this batch. Keys are
+            # still in the pool; next batch will retry them.
+            print(f"WARN pre_classify (gemini) batch {start}: all keys returned "
+                  f"transient errors (last status {status}) — falling back to 'maybe' "
+                  f"for this batch only", file=sys.stderr)
+            for i in range(len(batch)):
+                results[start + i] = {"decision": "maybe", "reason": "classifier transient error (all keys)"}
+            time.sleep(GEMINI_SLEEP * 2)  # longer back-off before next batch
+            continue
 
         if status >= 400:
             print(f"WARN pre_classify (gemini) batch {start}: {status} {resp_body[:200]!r}",
