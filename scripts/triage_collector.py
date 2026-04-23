@@ -85,7 +85,9 @@ REPOS = sorted(set(repo for repo, _, _ in WORKFLOWS))
 EARLY_FINISH_PCT = 0.50
 HEALTHY_MIN_PCT = 0.80
 LOG_PREVIEW_BYTES = 4096
-LOOKBACK_HOURS = 48
+# 7 days so flaky-detection queries always have enough history.
+# Rows are upserted, so historical data accumulates further over time.
+LOOKBACK_HOURS = 168
 
 
 def _req(url, method="GET", headers=None, body=None, timeout=30):
