@@ -1,0 +1,31 @@
+name: Triage Collector
+
+on:
+  schedule:
+    - cron: "15 * * * *"   # hourly at :15 UTC
+  workflow_dispatch: {}    # manual trigger for testing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: triage-collector
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run collector
+        env:
+          TRIAGE_GH_TOKEN: ${{ secrets.TRIAGE_GH_TOKEN }}
+          TRIAGE_SUPABASE_URL: ${{ secrets.TRIAGE_SUPABASE_URL }}
+          TRIAGE_SUPABASE_KEY: ${{ secrets.TRIAGE_SUPABASE_KEY }}
+        run: python scripts/triage_collector.py
