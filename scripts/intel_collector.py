@@ -701,6 +701,52 @@ def create_collector_action_item(at_key, action, description, prompt,
     return created
 
 
+def create_collector_action_item_model_not_found(at_key, model_slug, error_excerpt):
+    """Specialized Action Item for 'classifier model slug no longer exists'."""
+    action = (
+        f"OpenRouter: classifier model '{model_slug}' returned 404 — "
+        f"update AI Models row to a currently-available slug"
+    )
+    description = (
+        f"The intel collector's configured classifier model is no longer available "
+        f"on OpenRouter. HTTP 404 response (excerpt): {error_excerpt[:250]}\n\n"
+        f"Effect: pre-classifier is disabled for this run. ALL new items pass through "
+        f"to Claude's brief review on Monday (~4-5x cost increase).\n\n"
+        f"Fix: in Airtable base app6biS7yjV6XzFVG, table 'AI Models', find the row "
+        f"where 'Currently In Use For' contains 'intel pre-classifier'. Update its "
+        f"Slug field to a currently-live model. See OpenRouter's live model list "
+        f"(https://openrouter.ai/api/v1/models — filter for :free if free tier preferred)."
+    )
+    prompt = (
+        "First, read /Users/ben/.claude/hypebase-primer.md for project context. Then:\n\n"
+        "Task: Replace the deprecated classifier model slug in the Airtable AI Models table.\n\n"
+        "Steps:\n"
+        "1. Open Airtable base `app6biS7yjV6XzFVG`, table 'AI Models'\n"
+        "2. Find the row where `Currently In Use For` contains 'intel pre-classifier'\n"
+        f"3. Current slug (no longer live on OpenRouter): {model_slug}\n"
+        "4. Fetch current model list:\n"
+        "   `curl -s https://openrouter.ai/api/v1/models | "
+        "python3 -c \"import json,sys; [print(m['id']) for m in "
+        "json.load(sys.stdin)['data'] if m['id'].endswith(':free')]\"`\n"
+        "5. Pick a suitable replacement. Criteria (in priority order):\n"
+        "   - General instruct model (not code-specific, not vision)\n"
+        "   - 30B+ parameters ideally\n"
+        "   - Stable (avoid ':preview' or ':nightly' variants)\n"
+        "   - Free tier preferred (matches current setup) — otherwise pick cheap paid\n"
+        "6. Update the Slug field on the Airtable row\n"
+        "7. Also update Name, Notes to reflect the new model\n\n"
+        "Done criteria:\n"
+        "- AI Models row updated to a currently-available model slug\n"
+        "- Next intel-collector run completes with no 'No endpoints found' WARN in logs\n"
+        "- This Action Item Status = Done, Outcome = 'Swapped to <new-slug>'"
+    )
+    return create_collector_action_item(
+        at_key, action, description, prompt,
+        priority="High", effort="S",
+        source_section="OpenRouter classifier model deprecated",
+    )
+
+
 def create_collector_action_item_keys_exhausted(at_key, exhausted):
     """Specialized Action Item for 'all OpenRouter keys exhausted' scenario."""
     action = (
@@ -872,7 +918,8 @@ def pre_classify(items, openrouter_keys, model=None, at_key=None):
 
         # Try keys in order. 429 (rate limit), 402 (insufficient credits),
         # 403 (invalid/revoked key), 401 (auth failure) → retire key for this
-        # run, try next.
+        # run, try next. 404 "No endpoints found" is a model-availability
+        # problem, not a key problem — handled separately below.
         RETIRE_STATUSES = {401, 402, 403, 429}
         status = 0
         resp_body = b""
@@ -896,7 +943,25 @@ def pre_classify(items, openrouter_keys, model=None, at_key=None):
                                   "error": err_preview.decode('utf-8', errors='replace')})
                 current_key_idx += 1
                 continue
-            break  # success or non-retirement error
+            break  # success or non-retirement error (incl. 404 model-not-found)
+
+        # 404 'No endpoints found' = configured model slug is gone from OpenRouter.
+        # Every subsequent batch will hit the same wall, so fail fast and file an
+        # Action Item pointing to the Airtable row that needs updating.
+        if status == 404 and b"No endpoints found" in (resp_body or b""):
+            err_text = resp_body.decode("utf-8", errors="replace") if resp_body else ""
+            print(
+                f"WARN pre_classify: model '{model_slug}' returned 404 — bailing out "
+                f"and filing Action Item to update the Airtable AI Models row.",
+                file=sys.stderr,
+            )
+            if at_key:
+                create_collector_action_item_model_not_found(at_key, model_slug, err_text)
+            for i in range(start, len(items)):
+                if results[i] is None:
+                    results[i] = {"decision": "maybe",
+                                  "reason": f"classifier model '{model_slug}' not found"}
+            break
 
         # All keys tried?
         if current_key_idx >= len(available_keys):
