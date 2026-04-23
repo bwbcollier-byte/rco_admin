@@ -105,6 +105,18 @@ F_LK_NAME         = "fldQqf8eF4mT2U0zT"  # primary
 F_LK_KEYS         = "fld4fYgMypJz9Iete"
 F_LK_STATUS       = "fldcZ9nAY8GD2OZW8"
 
+# Action Items (used when the collector needs to self-report a problem)
+TABLE_ACTION_ITEMS = "tblWFVbz8tllvcgIF"
+F_AI_ACTION        = "fldtKkNfE6ZpSuAdd"  # primary
+F_AI_SOURCE        = "fldHQCWDP2EOTxXTJ"
+F_AI_SOURCE_SECTION= "fld0jXPFky2At7LIN"
+F_AI_DATE_CREATED  = "fldqGpqlKzlTXZxPP"
+F_AI_PRIORITY      = "fldpYhte8p5fsPAey"
+F_AI_EFFORT        = "fldebPAeRXgknu9Rj"
+F_AI_STATUS        = "fldvLadckj0xikIlP"
+F_AI_DESCRIPTION   = "fldGdcdsWCj5pbuGG"
+F_AI_PROMPT        = "fld4fQIGmD6JPIQft"
+
 # AI Models catalog
 TABLE_AI_MODELS   = "tblzsfFK5MBZHIpAk"
 F_AM_NAME         = "fld6jUxZU7GxcMXI3"  # primary
@@ -579,20 +591,122 @@ def at_create(base, table, records, key_token):
     return created
 
 
-def get_openrouter_key_from_airtable(at_key):
-    """Fetch the OpenRouter key from the Airtable Logins & Keys table.
+def create_collector_action_item(at_key, action, description, prompt,
+                                 priority="High", effort="S",
+                                 source_section="OpenRouter classifier"):
+    """File a 'New' Action Item about a collector self-reported issue.
 
-    Searches for a row whose Name matches 'Open Router' / 'OpenRouter' / 'openrouter'
-    and extracts the first line starting with 'sk-or-' from its Keys field.
-    Falls back to the OPENROUTER_API_KEY env var if Airtable lookup fails.
-    Returns None if neither source has a usable key. Never logs the value.
+    Dedupes against existing Action Items with the same Action (primary key)
+    and Status ∈ {New, In Progress, Blocked, Carried Forward} — doesn't create
+    a duplicate if the same issue is already open.
     """
+    try:
+        existing = at_list_all(
+            AIRTABLE_BASE, TABLE_ACTION_ITEMS,
+            [F_AI_ACTION, F_AI_STATUS], at_key,
+        )
+    except Exception as e:
+        print(f"WARN collector self-report dedup lookup: {e}", file=sys.stderr)
+        existing = []
+    target_action = action.strip().lower()
+    open_statuses = {"new", "in progress", "blocked", "carried forward"}
+    for r in existing:
+        f = r.get("fields", {}) or {}
+        row_action = (f.get(F_AI_ACTION) or "").strip().lower()
+        status_val = f.get(F_AI_STATUS)
+        if isinstance(status_val, dict):
+            status_name = (status_val.get("name") or "").lower()
+        else:
+            status_name = (status_val or "").lower()
+        if row_action == target_action and status_name in open_statuses:
+            print(f"collector self-report: '{action[:60]}' already open — skipping create",
+                  file=sys.stderr)
+            return None
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    fields = {
+        F_AI_ACTION:        action,
+        F_AI_SOURCE:        "Collector Self-Report",
+        F_AI_SOURCE_SECTION:source_section,
+        F_AI_DATE_CREATED:  today,
+        F_AI_PRIORITY:      priority,
+        F_AI_EFFORT:        effort,
+        F_AI_STATUS:        "New",
+        F_AI_DESCRIPTION:   description,
+        F_AI_PROMPT:        prompt,
+    }
+    created = at_create(AIRTABLE_BASE, TABLE_ACTION_ITEMS, [fields], at_key)
+    if created:
+        print(f"collector self-report: filed Action Item '{action[:60]}'")
+    return created
+
+
+def create_collector_action_item_keys_exhausted(at_key, exhausted):
+    """Specialized Action Item for 'all OpenRouter keys exhausted' scenario."""
+    action = (
+        f"OpenRouter: all {len(exhausted)} account key(s) are rate-limited or "
+        f"exhausted — provide a new account key"
+    )
+    exhaust_lines = "\n".join(
+        f"- key suffix ...{e['suffix']}: HTTP {e['status']}"
+        for e in exhausted
+    )
+    description = (
+        f"The intel collector hit rate-limit / quota / auth errors on every configured "
+        f"OpenRouter key during pre-classification. Without a working key, the Monday "
+        f"intel brief reviews ALL Pending items with Claude Sonnet (expensive) instead "
+        f"of only survivors (~75% cost increase).\n\n"
+        f"Retired keys this run:\n{exhaust_lines}\n\n"
+        f"Fix: create a new OpenRouter account + API key, add the key to the "
+        f"Airtable Logins & Keys 'Open Router' row's Keys field "
+        f"(append a new 'email:\\nsk-or-...' block), save. Next collector run picks it up."
+    )
+    prompt = (
+        "First, read /Users/ben/.claude/hypebase-primer.md for project context. Then:\n\n"
+        "Task: Add a new OpenRouter account key to the Airtable Logins & Keys rotation "
+        "so the intel collector's pre-classifier keeps working.\n\n"
+        "Steps:\n"
+        "1. Go to https://openrouter.ai/ and sign up with a new email (you have previous "
+        "accounts noted in Airtable Logins & Keys 'Open Router' row — use a different one)\n"
+        "2. Visit https://openrouter.ai/keys and create a key named "
+        "'HypeBase intel collector - rotation N' (where N is the next unused index)\n"
+        "3. Copy the key (`sk-or-v1-...`)\n"
+        "4. Open Airtable base app6biS7yjV6XzFVG, table 'Logins & Keys', row 'Open Router'. "
+        "Edit the Keys field and APPEND a new block at the bottom:\n"
+        "   ```\n   <new-email>:\n   sk-or-v1-<pasted-key>\n   ```\n"
+        "5. Save. The collector loads all keys from this field on next run and falls "
+        "through them on rate-limit.\n\n"
+        "Done criteria:\n"
+        "- Airtable Logins & Keys 'Open Router' row has N+1 keys in its Keys field "
+        "(visible as additional sk-or- lines)\n"
+        "- This Action Item Status = Done, Outcome = 'Added rotation key ...XXXX "
+        "(suffix of new key) from <email>'"
+    )
+    return create_collector_action_item(
+        at_key, action, description, prompt,
+        priority="High", effort="S",
+        source_section="OpenRouter key rotation exhausted",
+    )
+
+
+def get_openrouter_keys_from_airtable(at_key):
+    """Fetch ALL OpenRouter keys from the Airtable Logins & Keys table.
+
+    Searches rows whose Name matches any OpenRouter variant and extracts every
+    line starting with 'sk-or-' from the Keys field. Supports multiple keys
+    per row (email-prefixed pattern like Tavily uses) and multiple rows.
+
+    Falls back to OPENROUTER_API_KEY env var if Airtable lookup yields nothing.
+    Returns a (possibly empty) list. Never logs the values.
+    """
+    keys = []
+    seen = set()  # de-dup across rows
     try:
         rows = at_list_all(
             AIRTABLE_BASE, TABLE_LOGINS_KEYS, [F_LK_NAME, F_LK_KEYS], at_key
         )
     except Exception as e:
-        print(f"WARN openrouter key airtable lookup: {e}", file=sys.stderr)
+        print(f"WARN openrouter keys airtable lookup: {e}", file=sys.stderr)
         rows = []
     for r in rows:
         f = r.get("fields", {}) or {}
@@ -602,18 +716,21 @@ def get_openrouter_key_from_airtable(at_key):
         keys_text = f.get(F_LK_KEYS) or ""
         for line in keys_text.splitlines():
             line = line.strip()
-            if line.startswith("sk-or-"):
-                print(f"openrouter: key loaded from Airtable row (len={len(line)}, "
-                      f"suffix=...{line[-4:]})")
-                return line
-    env_val = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
-    if env_val:
-        print(f"openrouter: key loaded from OPENROUTER_API_KEY env (len={len(env_val)}, "
-              f"suffix=...{env_val[-4:]})")
-        return env_val
-    print("WARN openrouter: no key found in Airtable or env — pre-classifier disabled",
-          file=sys.stderr)
-    return None
+            if line.startswith("sk-or-") and line not in seen:
+                keys.append(line)
+                seen.add(line)
+    if not keys:
+        env_val = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+        if env_val and env_val not in seen:
+            keys.append(env_val)
+            print(f"openrouter keys: loaded 1 from env (suffix=...{env_val[-4:]})")
+            return keys
+        print("WARN openrouter: no keys found in Airtable or env — pre-classifier disabled",
+              file=sys.stderr)
+        return []
+    print(f"openrouter keys: loaded {len(keys)} from Airtable (suffixes: " +
+          ", ".join(f"...{k[-4:]}" for k in keys) + ")")
+    return keys
 
 
 def get_classifier_model_from_airtable(at_key):
@@ -641,17 +758,29 @@ def get_classifier_model_from_airtable(at_key):
     return OPENROUTER_MODEL
 
 
-def pre_classify(items, openrouter_key, model=None):
-    """Batch-classify items via OpenRouter. Returns list of dicts in input order:
+def pre_classify(items, openrouter_keys, model=None, at_key=None):
+    """Batch-classify items via OpenRouter. Takes a LIST of keys and rotates on
+    rate-limit / quota errors. Returns list of dicts in input order:
     [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
 
-    Safe to call with None key or empty list. On any failure, returns 'maybe' for
-    every item so nothing gets auto-dismissed on classifier errors.
+    Safe to call with empty keys list or empty items. On any failure, returns
+    'maybe' for every item so nothing gets auto-dismissed on classifier errors.
+
+    If ALL keys are exhausted (all hitting 429/402/403), files a 'New' Action
+    Item in Airtable asking the user to provide a new account key, then returns
+    'maybe' for the remaining items.
     """
-    if not items or not openrouter_key:
+    if not items or not openrouter_keys:
         return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
 
+    # Backward compat: accept a single key string too
+    if isinstance(openrouter_keys, str):
+        openrouter_keys = [openrouter_keys]
+
     model_slug = model or OPENROUTER_MODEL
+    available_keys = list(openrouter_keys)
+    exhausted = []  # track which keys have been retired for this run
+    current_key_idx = 0
 
     results = [None] * len(items)
     for start in range(0, len(items), PRE_CLASSIFY_BATCH_SIZE):
@@ -674,19 +803,53 @@ def pre_classify(items, openrouter_key, model=None):
             f"\"reason\": \"<=12 words\"}}\n"
             f"No preamble, no markdown fences, just the JSON array."
         )
-        headers = {
-            "Authorization": f"Bearer {openrouter_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/bwbcollier-byte/rco_admin",
-            "X-Title": "HypeBase Intel Collector",
-        }
         body = json.dumps({
             "model": model_slug,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1500,
             "temperature": 0,
         }).encode()
-        status, resp_body = http(OPENROUTER_URL, method="POST", headers=headers, body=body)
+
+        # Try keys in order. 429 (rate limit), 402 (insufficient credits),
+        # 403 (invalid/revoked key), 401 (auth failure) → retire key for this
+        # run, try next.
+        RETIRE_STATUSES = {401, 402, 403, 429}
+        status = 0
+        resp_body = b""
+        while current_key_idx < len(available_keys):
+            key = available_keys[current_key_idx]
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/bwbcollier-byte/rco_admin",
+                "X-Title": "HypeBase Intel Collector",
+            }
+            status, resp_body = http(OPENROUTER_URL, method="POST", headers=headers, body=body)
+            if status in RETIRE_STATUSES:
+                err_preview = resp_body[:120] if resp_body else b""
+                print(
+                    f"openrouter key ...{key[-4:]} retired at batch {start}: "
+                    f"HTTP {status} — trying next key",
+                    file=sys.stderr,
+                )
+                exhausted.append({"suffix": key[-4:], "status": status,
+                                  "error": err_preview.decode('utf-8', errors='replace')})
+                current_key_idx += 1
+                continue
+            break  # success or non-retirement error
+
+        # All keys tried?
+        if current_key_idx >= len(available_keys):
+            print("WARN pre_classify: ALL OpenRouter keys exhausted — filing Action Item",
+                  file=sys.stderr)
+            if at_key:
+                create_collector_action_item_keys_exhausted(at_key, exhausted)
+            # Remaining items get 'maybe'
+            for i in range(start, len(items)):
+                if results[i] is None:
+                    results[i] = {"decision": "maybe", "reason": "all classifier keys exhausted"}
+            break  # stop processing further batches
+
         if status >= 400:
             print(f"WARN pre_classify batch {start}: {status} {resp_body[:200]!r}",
                   file=sys.stderr)
@@ -725,12 +888,18 @@ def pre_classify(items, openrouter_key, model=None):
                 results[start + i] = {"decision": "maybe", "reason": "classifier parse error"}
         time.sleep(SLEEP)
 
+    # Fill any stragglers (shouldn't happen, but belt-and-braces)
+    for i, r in enumerate(results):
+        if r is None:
+            results[i] = {"decision": "maybe", "reason": "classifier incomplete"}
+
     counts = {"relevant": 0, "irrelevant": 0, "maybe": 0}
     for r in results:
         counts[r["decision"]] = counts.get(r["decision"], 0) + 1
+    keys_used = min(current_key_idx + 1, len(available_keys)) if available_keys else 0
     print(f"pre_classify: relevant={counts['relevant']} "
           f"irrelevant={counts['irrelevant']} maybe={counts['maybe']} "
-          f"(model={model_slug}, {len(items)} items)")
+          f"(model={model_slug}, {len(items)} items, keys_used={keys_used}/{len(available_keys)})")
     return results
 
 
@@ -777,7 +946,7 @@ def at_update(base, table, updates, key_token):
 
 # ---------- Collectors ----------
 
-def collect_platform_updates(at_key, gh_token, today, openrouter_key=None, classifier_model=None):
+def collect_platform_updates(at_key, gh_token, today, openrouter_keys=None, classifier_model=None):
     """Read Monitored Platforms from Airtable, dispatch to the right fetcher
     based on Check Method, write findings to Platform Updates, and update
     Last Checked / Last Finding Date on each platform row."""
@@ -848,7 +1017,7 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_key=None, class
     # Pre-classify before upsert. Source_items carry the title/summary used for
     # classification; new_records are the actual Airtable payloads we mutate.
     source_items = [{"title": r[F_P_TITLE], "summary": r.get(F_P_SUMMARY, "")} for r in new_records]
-    decisions = pre_classify(source_items, openrouter_key, classifier_model)
+    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         new_records, source_items, decisions,
         F_P_DECISION, "Ignore",
@@ -861,7 +1030,7 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_key=None, class
     print(f"monitored_platforms: {len(platform_updates)} Last Checked dates updated")
 
 
-def collect_ai_news(at_key, today, openrouter_key=None, classifier_model=None):
+def collect_ai_news(at_key, today, openrouter_keys=None, classifier_model=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
     records = []
     source_items = []
@@ -884,7 +1053,7 @@ def collect_ai_news(at_key, today, openrouter_key=None, classifier_model=None):
         records.append(fields)
         source_items.append({"title": title, "summary": it.get("summary", "")})
 
-    decisions = pre_classify(source_items, openrouter_key, classifier_model)
+    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_N_DECISION, "Dismiss", F_N_NOTES,
@@ -894,7 +1063,7 @@ def collect_ai_news(at_key, today, openrouter_key=None, classifier_model=None):
     print(f"ai_news: {created} created (of {len(records)} candidates)")
 
 
-def collect_deals(at_key, today, openrouter_key=None, classifier_model=None):
+def collect_deals(at_key, today, openrouter_keys=None, classifier_model=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_DEALS, F_D_NAME, at_key)
     records = []
     source_items = []
@@ -921,7 +1090,7 @@ def collect_deals(at_key, today, openrouter_key=None, classifier_model=None):
     else:
         print(f"WARN producthunt rss: {status}", file=sys.stderr)
 
-    decisions = pre_classify(source_items, openrouter_key, classifier_model)
+    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_D_DECISION, "Skip", F_D_NOTES,
@@ -931,7 +1100,7 @@ def collect_deals(at_key, today, openrouter_key=None, classifier_model=None):
     print(f"deals: {created} created (of {len(records)} candidates)")
 
 
-def collect_skills(at_key, gh_token, today, openrouter_key=None, classifier_model=None):
+def collect_skills(at_key, gh_token, today, openrouter_keys=None, classifier_model=None):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_SKILLS, F_S_NAME, at_key)
     records = []
     stats = {"topic": 0, "watched": 0, "awesome": 0}
@@ -997,7 +1166,7 @@ def collect_skills(at_key, gh_token, today, openrouter_key=None, classifier_mode
     # Skills uses Type (not Decision) as its state field. Pre-classifier irrelevants
     # get Type=Rejected instead of staying Discovered.
     source_items = [{"title": r[F_S_NAME], "summary": r.get(F_S_DESC, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_key, classifier_model)
+    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_S_TYPE, "Rejected", F_S_AUDIT_NOTES,
@@ -1011,7 +1180,7 @@ def collect_skills(at_key, gh_token, today, openrouter_key=None, classifier_mode
     )
 
 
-def collect_apis(at_key, today, openrouter_key=None, classifier_model=None):
+def collect_apis(at_key, today, openrouter_keys=None, classifier_model=None):
     """Fetch from public-apis README + publicapis.dev API, filter by relevant
     categories, upsert to APIs table."""
 
@@ -1057,7 +1226,7 @@ def collect_apis(at_key, today, openrouter_key=None, classifier_model=None):
         })
     # APIs has no Notes field. Pass None for reason_field; just set Decision.
     source_items = [{"title": r[F_A_NAME], "summary": r.get(F_A_DESCRIPTION, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_key, classifier_model)
+    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_A_DECISION, "Skip",
@@ -1151,7 +1320,7 @@ def collect_ai_models(at_key, today):
     )
 
 
-def collect_hf_trending(at_key, today, openrouter_key=None, classifier_model=None):
+def collect_hf_trending(at_key, today, openrouter_keys=None, classifier_model=None):
     """Pull HF trending models into AI News as 'HuggingFace Trending' source."""
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
     records = []
@@ -1174,7 +1343,7 @@ def collect_hf_trending(at_key, today, openrouter_key=None, classifier_model=Non
         records.append(fields)
 
     source_items = [{"title": r[F_N_HEADLINE], "summary": r.get(F_N_SUMMARY, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_key, classifier_model)
+    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
         F_N_DECISION, "Dismiss", F_N_NOTES,
@@ -1194,15 +1363,15 @@ def main():
     print(f"DEBUG: AIRTABLE_API_KEY len={len(at_key)} suffix=...{at_key[-4:]}")
     print(f"DEBUG: TRIAGE_GH_TOKEN  len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
-    openrouter_key = get_openrouter_key_from_airtable(at_key)
+    openrouter_keys = get_openrouter_keys_from_airtable(at_key)
     classifier_model = get_classifier_model_from_airtable(at_key)
 
-    collect_platform_updates(at_key, gh_token, today, openrouter_key, classifier_model)
-    collect_ai_news(at_key, today, openrouter_key, classifier_model)
-    collect_hf_trending(at_key, today, openrouter_key, classifier_model)
-    collect_deals(at_key, today, openrouter_key, classifier_model)
-    collect_skills(at_key, gh_token, today, openrouter_key, classifier_model)
-    collect_apis(at_key, today, openrouter_key, classifier_model)
+    collect_platform_updates(at_key, gh_token, today, openrouter_keys, classifier_model)
+    collect_ai_news(at_key, today, openrouter_keys, classifier_model)
+    collect_hf_trending(at_key, today, openrouter_keys, classifier_model)
+    collect_deals(at_key, today, openrouter_keys, classifier_model)
+    collect_skills(at_key, gh_token, today, openrouter_keys, classifier_model)
+    collect_apis(at_key, today, openrouter_keys, classifier_model)
 
     # Refresh OpenRouter model catalog (separate table — AI Models). Runs at
     # the end so the collector's main work isn't delayed by this refresh.
