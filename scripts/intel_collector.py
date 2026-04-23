@@ -150,6 +150,38 @@ INTERESTING_MODEL_PROVIDERS = {
     "microsoft", "nousresearch",
 }
 
+# AI Apps catalog
+TABLE_AI_APPS      = "tblEUsS2yfNn7msBB"
+F_APP_NAME         = "fldBhQapkkLZssBwJ"   # primary
+F_APP_CATEGORY     = "fld9tbdXX6ogYPE7k"
+F_APP_SUBCATEGORY  = "fldPLasEpXGHNX04k"
+F_APP_DESCRIPTION  = "fldiEo5zsH7snTCV8"
+F_APP_COMPANY      = "fldEbinfxNOQGwkAw"
+F_APP_URL          = "fldRNXGpPwqoRlkvs"
+F_APP_PRICING_TIER = "fldnSTZC1jxKJASvZ"
+F_APP_STATUS       = "fldw4yXEwE3I5tRBi"
+F_APP_GOOD_FOR     = "fldlUZuWrVYTZtDbN"
+F_APP_DATE_FOUND   = "fld8suP8BipYDENXQ"
+F_APP_LAST_CHECKED = "fldeQ8FaJhQamsVrd"
+F_APP_NOTES        = "flddowUuV49VJBP2O"
+
+# AI Apps discovery: sitemap-driven, per-run cap to avoid flood.
+APP_SITEMAPS = [
+    # (source_label, sitemap_url, title_cleaner_prefix, title_cleaner_suffix_re)
+    ("FutureTools",
+     "https://futuretools.io/sitemap.xml",
+     "Future Tools - ",
+     None,
+     "/tools/"),
+    ("Futurepedia",
+     "https://www.futurepedia.io/sitemap_tools.xml",
+     None,
+     r"\s+AI Reviews.*$",
+     "/tool/"),
+]
+AI_APPS_MAX_NEW_PER_RUN = 40     # cap per site per run — 40 × 2 sites = 80 scrapes max
+AI_APPS_SCRAPE_DELAY    = 0.5    # polite sleep between tool-page fetches
+
 # HuggingFace model collection config
 HF_PIPELINE_TAGS = [
     "text-generation",
@@ -1264,6 +1296,142 @@ def collect_apis(at_key, today, openrouter_keys=None, classifier_model=None):
     print(f"apis: {created} created (of {len(records)} candidates)")
 
 
+def fetch_sitemap_entries(url):
+    """Parse an XML sitemap. Returns list of {url, lastmod}."""
+    status, body = http(url)
+    if status >= 400:
+        print(f"WARN sitemap {url}: {status}", file=sys.stderr)
+        return []
+    content = body.decode("utf-8", errors="replace")
+    # Per-<url> block with optional <lastmod>
+    entries = []
+    for block in re.finditer(r"<url>(.*?)</url>", content, re.DOTALL):
+        inner = block.group(1)
+        loc = re.search(r"<loc>([^<]+)</loc>", inner)
+        lastmod = re.search(r"<lastmod>([^<]+)</lastmod>", inner)
+        if loc:
+            entries.append({
+                "url": loc.group(1).strip(),
+                "lastmod": (lastmod.group(1).strip() if lastmod else ""),
+            })
+    return entries
+
+
+def parse_tool_page(tool_url, prefix_to_strip, suffix_re):
+    """Fetch an SSR'd tool page and extract (name, description).
+
+    prefix_to_strip: literal string to remove from start of title (e.g. 'Future Tools - ').
+    suffix_re: regex whose match is stripped from end of title (e.g. r'\\s+AI Reviews.*$').
+    Returns None on failure.
+    """
+    status, body = http(tool_url, timeout=15)
+    if status >= 400:
+        return None
+    try:
+        content = body.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    title_m = re.search(r"<title>([^<]+)</title>", content)
+    title = (title_m.group(1) if title_m else "").strip()
+    # HTML entity decode for common ones in titles
+    title = title.replace("&amp;", "&").replace("&#x27;", "'").replace("&quot;", '"')
+
+    name = title
+    if prefix_to_strip and name.startswith(prefix_to_strip):
+        name = name[len(prefix_to_strip):]
+    if suffix_re:
+        name = re.sub(suffix_re, "", name)
+    name = name.strip()
+
+    desc_m = re.search(r'<meta\s+name="description"\s+content="([^"]*)"', content)
+    desc = (desc_m.group(1) if desc_m else "").strip()
+    desc = desc.replace("&amp;", "&").replace("&#x27;", "'").replace("&quot;", '"')
+
+    # Skip if name is clearly garbage
+    if not name or len(name) > 200:
+        return None
+
+    return {"name": name, "description": desc}
+
+
+def collect_ai_apps(at_key, today):
+    """Discover new AI tools from FutureTools + Futurepedia sitemaps and upsert
+    to AI Apps table. Scrape cap per site per run prevents flooding; newest
+    URLs (by lastmod) are scraped first so we catch recent additions quickly."""
+    # Load existing AI Apps by name (case-insensitive) + URL for dedup
+    try:
+        existing = at_list_all(
+            AIRTABLE_BASE, TABLE_AI_APPS, [F_APP_NAME, F_APP_URL], at_key
+        )
+    except Exception as e:
+        print(f"WARN ai_apps read existing: {e}", file=sys.stderr)
+        existing = []
+    existing_names = set()
+    existing_urls = set()
+    for r in existing:
+        f = r.get("fields", {}) or {}
+        n = (f.get(F_APP_NAME) or "").strip().lower()
+        u = (f.get(F_APP_URL) or "").strip().rstrip("/").lower()
+        if n:
+            existing_names.add(n)
+        if u:
+            existing_urls.add(u)
+
+    total_created = 0
+    total_scraped = 0
+    for source_label, sitemap_url, prefix, suffix_re, path_filter in APP_SITEMAPS:
+        entries = fetch_sitemap_entries(sitemap_url)
+        entries = [e for e in entries if path_filter in e["url"]]
+        # Sort by lastmod descending (newest first); empty lastmod sorts last
+        entries.sort(key=lambda e: e["lastmod"] or "", reverse=True)
+        print(f"{source_label} sitemap: {len(entries)} tool URLs")
+
+        records = []
+        scraped = 0
+        for entry in entries:
+            if scraped >= AI_APPS_MAX_NEW_PER_RUN:
+                break
+            tool_url = entry["url"].rstrip("/")
+            if tool_url.lower() in existing_urls:
+                continue
+
+            parsed = parse_tool_page(tool_url, prefix, suffix_re)
+            if not parsed:
+                continue
+            name = parsed["name"]
+            name_lc = name.lower()
+            if name_lc in existing_names:
+                # Name match but URL miss — probably already tracked via manual
+                # seed. Skip without counting toward cap. Add URL to memory so
+                # we don't hit it again this run.
+                existing_urls.add(tool_url.lower())
+                continue
+            existing_names.add(name_lc)
+            existing_urls.add(tool_url.lower())
+
+            records.append({
+                F_APP_NAME:        name[:250],
+                F_APP_CATEGORY:    "Other",  # human/Claude categorises later
+                F_APP_DESCRIPTION: parsed["description"][:1000],
+                F_APP_URL:         tool_url,
+                F_APP_STATUS:      "Tracking",
+                F_APP_DATE_FOUND:  today,
+                F_APP_LAST_CHECKED:today,
+                F_APP_NOTES:       f"Auto-discovered via {source_label} sitemap on {today}.",
+            })
+            scraped += 1
+            total_scraped += 1
+            time.sleep(AI_APPS_SCRAPE_DELAY)
+
+        created = at_create(AIRTABLE_BASE, TABLE_AI_APPS, records, at_key)
+        total_created += created
+        print(f"{source_label}: {created} new AI Apps created (scraped {scraped})")
+
+    print(f"ai_apps total: {total_created} new (scraped {total_scraped} across "
+          f"{len(APP_SITEMAPS)} sources; cap {AI_APPS_MAX_NEW_PER_RUN}/site/run)")
+
+
 def hf_models_for_task(task, limit=HF_MODELS_PER_TASK):
     """Fetch top N models for a given HuggingFace pipeline_tag.
     Returns raw list from HF API. Empty list on failure."""
@@ -1497,6 +1665,8 @@ def main():
     # Refresh AI Models catalog from multiple sources at end of run.
     collect_ai_models(at_key, today)   # OpenRouter (~40-60 rows refreshed)
     collect_hf_models(at_key, today)   # HuggingFace (~200 rows across 8 tasks)
+    # Discover new AI Apps from FutureTools + Futurepedia sitemaps.
+    collect_ai_apps(at_key, today)
 
 
 if __name__ == "__main__":
