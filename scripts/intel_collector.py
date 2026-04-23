@@ -24,7 +24,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from urllib import request, error
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 # ---------- Airtable layout ----------
 
@@ -313,7 +313,23 @@ DEFAULT_UA = (
 
 # ---------- HTTP ----------
 
+def _ascii_safe_url(url):
+    """Percent-encode non-ASCII characters in the URL path/query so urllib can
+    build an HTTP request without an 'ascii codec can't encode' error.
+    Sitemap/scrape URLs can contain accented chars (é, ñ, etc.) in the path.
+    Host is IDNA-encoded; scheme/fragment are left as-is."""
+    try:
+        sp = urlsplit(url)
+        netloc = sp.netloc.encode("idna").decode("ascii") if sp.netloc else ""
+        path = quote(sp.path, safe="/%+")
+        query = quote(sp.query, safe="=&%+")
+        return urlunsplit((sp.scheme, netloc, path, query, sp.fragment))
+    except Exception:
+        return url
+
+
 def http(url, method="GET", headers=None, body=None, timeout=30):
+    url = _ascii_safe_url(url)
     headers = dict(headers or {})
     headers.setdefault("User-Agent", DEFAULT_UA)
     if body is not None and not isinstance(body, bytes):
