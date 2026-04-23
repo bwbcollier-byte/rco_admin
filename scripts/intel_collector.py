@@ -113,8 +113,15 @@ SLEEP_BETWEEN_WRITES = 0.3  # gentle on Airtable's 5-rps base limit
 
 # ---------- HTTP ----------
 
+DEFAULT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 intel-collector"
+)
+
+
 def http(url, method="GET", headers=None, body=None, timeout=30):
     headers = dict(headers or {})
+    headers.setdefault("User-Agent", DEFAULT_UA)
     if body is not None and not isinstance(body, bytes):
         body = json.dumps(body).encode()
         headers.setdefault("Content-Type", "application/json")
@@ -161,12 +168,16 @@ def parse_feed(xml_bytes):
 
 
 def parse_date(s):
-    """Return YYYY-MM-DD string or None."""
+    """Return YYYY-MM-DD string or None. Handles ISO 8601 and RFC 822."""
     if not s:
         return None
+    s = s.strip()
     try:
-        if "T" in s:
+        # ISO 8601: starts with 4-digit year. Do NOT trigger on "Thu, 23 Apr…"
+        # just because it contains the letter T.
+        if len(s) >= 10 and s[:4].isdigit() and s[4] == "-":
             return s[:10]
+        # RFC 822 / RFC 2822 (typical RSS): "Thu, 23 Apr 2026 15:04:05 +0000"
         dt = eu.parsedate_to_datetime(s)
         return dt.strftime("%Y-%m-%d") if dt else None
     except Exception:
