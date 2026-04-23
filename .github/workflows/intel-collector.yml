@@ -1,0 +1,30 @@
+name: Intel Collector
+
+on:
+  schedule:
+    - cron: "30 19 * * *"   # daily 19:30 UTC = 05:30 Sydney (AEST)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intel-collector
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run intel collector
+        env:
+          TRIAGE_GH_TOKEN:  ${{ secrets.TRIAGE_GH_TOKEN }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+        run: python scripts/intel_collector.py
