@@ -141,13 +141,16 @@ F_A2_WHAT_ENHANCES = "fld2j32xe7ZLzKbCi"  # What It Enhances (Gemini fills)
 # Used by evaluate_pending_skills() and evaluate_pending_intel_feed().
 # Key is loaded from Airtable Logins & Keys ("Google Gemini" row) or GEMINI_API_KEY env var.
 
-GEMINI_MODEL          = "gemini-2.5-flash-lite"
-GEMINI_URL            = (
+GEMINI_MODEL           = "gemini-2.5-flash-lite"
+GEMINI_URL             = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
 GEMINI_EVAL_BATCH_SIZE = 12   # ~13 RPM — safely inside free-tier 15 RPM limit
-GEMINI_SLEEP           = 4.5  # seconds between batches
+GEMINI_SLEEP           = 5.0  # seconds between batches (slightly conservative)
+GEMINI_EVAL_MAX_ITEMS  = 84   # max items per evaluation pass per run (7 batches × 12)
+                               # keeps daily usage well inside free-tier 1,000 RPD
+GEMINI_MAX_FAILURES    = 3    # abort evaluation pass after this many consecutive failures
 
 # Logins & Keys
 TABLE_LOGINS_KEYS = "tbldJkG11gY1W3jTf"
@@ -1734,11 +1737,14 @@ def collect_hf_trending(at_key, today):
 
 # ---------- Gemini evaluation ----------
 
-def get_gemini_key_from_airtable(at_key):
-    """Fetch Gemini API key from the 'Google Gemini' row in Logins & Keys.
-    Falls back to GEMINI_API_KEY env var. Returns None if nothing found.
-    Never logs the key value.
+def get_gemini_keys_from_airtable(at_key):
+    """Fetch ALL Gemini API keys from 'Google AI Studio' rows in Logins & Keys.
+    Each row's Keys field may contain multiple AIzaSy... keys, one per line.
+    Falls back to GEMINI_API_KEY env var. Returns a list (possibly empty).
+    Never logs key values.
     """
+    keys = []
+    seen = set()
     try:
         rows = at_list_all(AIRTABLE_BASE, TABLE_LOGINS_KEYS,
                            [F_LK_NAME, F_LK_KEYS], at_key)
@@ -1748,37 +1754,54 @@ def get_gemini_key_from_airtable(at_key):
     for r in rows:
         f = r.get("fields", {}) or {}
         name = (f.get(F_LK_NAME) or "").strip().lower().replace(" ", "")
-        if "gemini" in name:
+        if "googleaistudio" in name or "gemini" in name:
             for line in (f.get(F_LK_KEYS) or "").splitlines():
                 line = line.strip()
-                if line.startswith("AIzaSy"):
-                    print(f"gemini key: loaded from Airtable (suffix=...{line[-4:]})")
-                    return line
-    env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if env_val:
-        print(f"gemini key: loaded from env (suffix=...{env_val[-4:]})")
-        return env_val
-    print("WARN gemini: no API key found in Airtable or env — evaluation pass skipped",
-          file=sys.stderr)
-    return None
+                if line.startswith("AIzaSy") and line not in seen:
+                    keys.append(line)
+                    seen.add(line)
+    if not keys:
+        env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
+        if env_val and env_val not in seen:
+            keys.append(env_val)
+    if keys:
+        print(f"gemini keys: loaded {len(keys)} "
+              f"(suffixes: {', '.join('...' + k[-4:] for k in keys)})")
+    else:
+        print("WARN gemini: no API keys found — evaluation pass skipped", file=sys.stderr)
+    return keys
 
 
-def gemini_evaluate(items, api_key, prompt_fn, batch_size=GEMINI_EVAL_BATCH_SIZE):
+def gemini_evaluate(items, api_keys, prompt_fn, batch_size=GEMINI_EVAL_BATCH_SIZE):
     """Batch-evaluate items via Gemini API. Returns a list of result dicts
     (one per item, in input order). Items that fail evaluation return None.
 
+    api_keys: list of Gemini API keys — rotated on 429 (quota exhausted per key).
     prompt_fn(batch) → prompt string. Each batch item has 'id', 'title', 'summary'.
     Uses responseMimeType=application/json to get clean JSON output.
-    Retries once on 429; sleeps GEMINI_SLEEP seconds between batches.
+    Aborts early after GEMINI_MAX_FAILURES consecutive failures across all keys.
     """
-    if not items or not api_key:
+    if not items or not api_keys:
         return [None] * len(items)
 
+    # Accept a single key string for backward compat
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+
+    keys = list(api_keys)
+    key_idx = 0
     results = [None] * len(items)
+    consecutive_failures = 0
+    headers = {"Content-Type": "application/json"}
+
     for start in range(0, len(items), batch_size):
+        if consecutive_failures >= GEMINI_MAX_FAILURES:
+            print(f"WARN gemini: {consecutive_failures} consecutive failures — "
+                  f"aborting evaluation pass (all keys likely quota-exhausted)", file=sys.stderr)
+            break
+
         batch = items[start: start + batch_size]
         prompt = prompt_fn(batch)
-
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -1787,20 +1810,32 @@ def gemini_evaluate(items, api_key, prompt_fn, batch_size=GEMINI_EVAL_BATCH_SIZE
                 "responseMimeType": "application/json",
             },
         }).encode()
-        headers = {"Content-Type": "application/json"}
-        url = f"{GEMINI_URL}?key={api_key}"
 
-        status, resp_body = http(url, method="POST", headers=headers, body=body)
-        if status == 429:
+        # Try current key; on 429 rotate to next key
+        status, resp_body = http(
+            f"{GEMINI_URL}?key={keys[key_idx]}", method="POST", headers=headers, body=body)
+        if status == 429 and len(keys) > 1:
+            exhausted_suffix = keys[key_idx][-4:]
+            key_idx = (key_idx + 1) % len(keys)
+            print(f"gemini key ...{exhausted_suffix} quota hit — rotating to key "
+                  f"...{keys[key_idx][-4:]} at batch {start}")
+            time.sleep(2)
+            status, resp_body = http(
+                f"{GEMINI_URL}?key={keys[key_idx]}", method="POST", headers=headers, body=body)
+        elif status == 429:
             print(f"WARN gemini rate-limit at batch {start} — sleeping 60s", file=sys.stderr)
             time.sleep(60)
-            status, resp_body = http(url, method="POST", headers=headers, body=body)
+            status, resp_body = http(
+                f"{GEMINI_URL}?key={keys[key_idx]}", method="POST", headers=headers, body=body)
 
         if status >= 400:
             print(f"WARN gemini batch {start}: HTTP {status} {resp_body[:200]!r}",
                   file=sys.stderr)
+            consecutive_failures += 1
             time.sleep(GEMINI_SLEEP)
             continue  # leave results[start:...] as None
+
+        consecutive_failures = 0  # reset on success
 
         try:
             resp = json.loads(resp_body)
@@ -1831,7 +1866,7 @@ def gemini_evaluate(items, api_key, prompt_fn, batch_size=GEMINI_EVAL_BATCH_SIZE
     return results
 
 
-def evaluate_pending_skills(at_key, gemini_key, today):
+def evaluate_pending_skills(at_key, gemini_keys, today):
     """Use Gemini to pre-fill Type, Relevance to Us, Effort to Adopt, and Audit Notes
     on Skills rows where Type='Discovered' and Last Audited is blank.
 
@@ -1860,6 +1895,10 @@ def evaluate_pending_skills(at_key, gemini_key, today):
     if not pending:
         print("evaluate_pending_skills: 0 Discovered skills need evaluation")
         return 0
+    if len(pending) > GEMINI_EVAL_MAX_ITEMS:
+        print(f"evaluate_pending_skills: capping {len(pending)} → {GEMINI_EVAL_MAX_ITEMS} "
+              f"(backlog drains over multiple runs)")
+        pending = pending[:GEMINI_EVAL_MAX_ITEMS]
 
     print(f"evaluate_pending_skills: evaluating {len(pending)} skills via Gemini")
 
@@ -1884,7 +1923,7 @@ def evaluate_pending_skills(at_key, gemini_key, today):
             f"Return ONLY the JSON array."
         )
 
-    results = gemini_evaluate(pending, gemini_key, make_prompt)
+    results = gemini_evaluate(pending, gemini_keys, make_prompt)
 
     updates = []
     for item, result in zip(pending, results):
@@ -1914,7 +1953,7 @@ def evaluate_pending_skills(at_key, gemini_key, today):
     return done
 
 
-def evaluate_pending_intel_feed(at_key, gemini_key, today,
+def evaluate_pending_intel_feed(at_key, gemini_keys, today,
                                 feed_types=None):
     """Use Gemini to pre-fill Why It Matters, Use Cases, Effort, Relevance, and Decision
     on Pending Intel Feed rows for the given Feed Types.
@@ -1961,6 +2000,10 @@ def evaluate_pending_intel_feed(at_key, gemini_key, today,
         if not items:
             print(f"evaluate_pending_intel_feed [{feed_type}]: 0 Pending items")
             continue
+        if len(items) > GEMINI_EVAL_MAX_ITEMS:
+            print(f"evaluate_pending_intel_feed [{feed_type}]: capping {len(items)} → "
+                  f"{GEMINI_EVAL_MAX_ITEMS} (backlog drains over multiple runs)")
+            items = items[:GEMINI_EVAL_MAX_ITEMS]
 
         print(f"evaluate_pending_intel_feed [{feed_type}]: "
               f"evaluating {len(items)} items via Gemini")
@@ -1986,7 +2029,7 @@ def evaluate_pending_intel_feed(at_key, gemini_key, today,
                 f"Return ONLY the JSON array."
             )
 
-        results = gemini_evaluate(items, gemini_key, make_prompt)
+        results = gemini_evaluate(items, gemini_keys, make_prompt)
 
         updates = []
         valid_set = set(valid_decisions)
@@ -2032,7 +2075,7 @@ def main():
     print(f"DEBUG: AIRTABLE_API_KEY len={len(at_key)} suffix=...{at_key[-4:]}")
     print(f"DEBUG: TRIAGE_GH_TOKEN  len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
-    gemini_key = get_gemini_key_from_airtable(at_key)
+    gemini_keys = get_gemini_keys_from_airtable(at_key)
 
     # --- Collection pass (Gemini evaluation pass runs after to filter noise) ---
     collect_platform_updates(at_key, gh_token, today)
@@ -2044,12 +2087,12 @@ def main():
     collect_apis(at_key, today)
 
     # --- Gemini evaluation pass (pre-fills fields so intel-brief is review-only) ---
-    if gemini_key:
-        evaluate_pending_skills(at_key, gemini_key, today)
-        evaluate_pending_intel_feed(at_key, gemini_key, today,
+    if gemini_keys:
+        evaluate_pending_skills(at_key, gemini_keys, today)
+        evaluate_pending_intel_feed(at_key, gemini_keys, today,
                                     feed_types=["Platform Update", "AI News"])
     else:
-        print("gemini evaluation: skipped (no key)")
+        print("gemini evaluation: skipped (no keys)")
 
     # Refresh AI Models catalog — wrapped in try/except while field IDs are being resolved
     # (TABLE_AI_MODELS was renamed April 2026; field schema pending audit).
