@@ -2025,7 +2025,7 @@ def evaluate_pending_intel_feed(at_key, gemini_keys, today,
                 f"}}\n\n"
                 f"Be conservative — only top-tier decisions for clear wins. "
                 f"Err toward lower decisions when uncertain.\n\n"
-                f"INPUT: {json.dumps([{{'id': it['id'], 'title': it['title'], 'summary': it['summary']}} for it in batch])}\n\n"
+                f"INPUT: {json.dumps([{'id': it['id'], 'title': it['title'], 'summary': it['summary']} for it in batch])}\n\n"
                 f"Return ONLY the JSON array."
             )
 
