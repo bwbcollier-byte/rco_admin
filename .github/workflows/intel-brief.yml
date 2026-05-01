@@ -1,0 +1,32 @@
+name: Intel Brief
+
+on:
+  schedule:
+    - cron: "0 23 * * 0,3"   # Sun 23:00 UTC + Wed 23:00 UTC = Mon 09:00 + Thu 09:00 AEST
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intel-brief
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run intel brief
+        env:
+          ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}
+          AIRTABLE_API_KEY:      ${{ secrets.AIRTABLE_API_KEY }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          TRIAGE_SLACK_WEBHOOK:  ${{ secrets.TRIAGE_SLACK_WEBHOOK }}
+        run: python scripts/intel_brief.py
