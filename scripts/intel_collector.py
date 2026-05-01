@@ -30,22 +30,23 @@ from urllib.parse import quote
 
 AIRTABLE_BASE = "app6biS7yjV6XzFVG"
 
-TABLE_MONITORED = "tbldabNFfzcs35YXn"
+TABLE_MONITORED = "tblRzDbDhgH4cv0s9"  # April 2026: was tbldabNFfzcs35YXn; now Stack & Platforms
 TABLE_PLATFORM  = "tblW6XV9X5gBrghOv"
 TABLE_NEWS      = "tbl4IUWP09vzchU5t"
 TABLE_DEALS     = "tbl9a3WVIhW7NddYz"
 TABLE_SKILLS    = "tblRYHxXNItKHXqg7"
 TABLE_APIS      = "tblhsuuFCDKmO1Ho3"
 
-# Monitored Platforms
-F_M_NAME         = "fldweyAemSTkEb3ej"  # primary
-F_M_TIER         = "fldRNBPsWXEwqkeuw"
-F_M_METHOD       = "fldF6kdxfXCFNaR40"
-F_M_SOURCE_URL   = "fldtZLPqZX9BVk2dn"
-F_M_CATEGORY     = "fldMwWlXmDYfoiNhR"
-F_M_ACTIVE       = "fldiYywh64gn9BBl0"
-F_M_LAST_CHECKED = "fld048If9pGGu3aX3"
-F_M_LAST_FINDING = "fldsQ8hr2qcN2b3h3"
+# Monitored Platforms — now sourced from Stack & Platforms (April 2026 consolidation)
+# Only rows with Check Method set are treated as monitored platforms.
+F_M_NAME         = "fldFBxTY9K1nBbt4W"  # primary — was fldweyAemSTkEb3ej
+F_M_TIER         = "fldYwsD7XoMII9r9b"  # Tier — was fldRNBPsWXEwqkeuw
+F_M_METHOD       = "fldWSk9Pzp5QcvqYt"  # Check Method — was fldF6kdxfXCFNaR40
+F_M_SOURCE_URL   = "fld8MFuN45W7Gqhpi"  # Source URL — was fldtZLPqZX9BVk2dn
+F_M_CATEGORY     = "fldY8K22GUDevl0RK"  # Category — was fldMwWlXmDYfoiNhR
+F_M_ACTIVE       = "fldBW4YyH9LackB0o"  # Active checkbox — was fldiYywh64gn9BBl0
+F_M_LAST_CHECKED = "fldpBy6Uj6M1LXRes"  # Last Checked — was fld048If9pGGu3aX3
+F_M_LAST_FINDING = "fld80Rg77nYLesKwG"  # Last Finding Date — was fldsQ8hr2qcN2b3h3
 
 # Platform Updates
 F_P_TITLE      = "fld6MygJickboWiDR"  # primary
@@ -167,7 +168,7 @@ F_AI_DESCRIPTION   = "fldGdcdsWCj5pbuGG"
 F_AI_PROMPT        = "fld4fQIGmD6JPIQft"
 
 # AI Models catalog
-TABLE_AI_MODELS   = "tblzsfFK5MBZHIpAk"
+TABLE_AI_MODELS   = "tblzehtQS5H1TKlSP"  # April 2026: was tblzsfFK5MBZHIpAk
 F_AM_NAME         = "fld6jUxZU7GxcMXI3"  # primary
 F_AM_SLUG         = "fldizUTyLsnhr78ZV"
 F_AM_PROVIDER     = "fldXvFvoXUaJqLFjF"
@@ -1130,7 +1131,10 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_keys=None, clas
         [F_M_NAME, F_M_TIER, F_M_METHOD, F_M_SOURCE_URL, F_M_ACTIVE],
         at_key,
     )
-    active = [p for p in platforms if (p.get("fields") or {}).get(F_M_ACTIVE)]
+    # Only rows with Active=true AND Check Method set are monitored platforms
+    active = [p for p in platforms
+              if (p.get("fields") or {}).get(F_M_ACTIVE)
+              and (p.get("fields") or {}).get(F_M_METHOD)]
     print(f"platforms: {len(active)} active of {len(platforms)} total")
 
     # Dedup against Intel Feed (consolidated table — replaces old TABLE_PLATFORM)
