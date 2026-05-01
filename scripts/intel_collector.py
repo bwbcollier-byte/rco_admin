@@ -2110,11 +2110,21 @@ def main():
     else:
         print("gemini evaluation: skipped (no key)")
 
-    # Refresh AI Models catalog from multiple sources at end of run.
-    collect_ai_models(at_key, today)   # OpenRouter (~40-60 rows refreshed)
-    collect_hf_models(at_key, today)   # HuggingFace (~200 rows across 8 tasks)
+    # Refresh AI Models catalog — wrapped in try/except while field IDs are being resolved
+    # (TABLE_AI_MODELS was renamed April 2026; field schema pending audit).
+    try:
+        collect_ai_models(at_key, today)
+    except Exception as e:
+        print(f"WARN collect_ai_models skipped: {e}", file=sys.stderr)
+    try:
+        collect_hf_models(at_key, today)
+    except Exception as e:
+        print(f"WARN collect_hf_models skipped: {e}", file=sys.stderr)
     # Discover new AI Apps from FutureTools + Futurepedia sitemaps.
-    collect_ai_apps(at_key, today)
+    try:
+        collect_ai_apps(at_key, today)
+    except Exception as e:
+        print(f"WARN collect_ai_apps skipped: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
