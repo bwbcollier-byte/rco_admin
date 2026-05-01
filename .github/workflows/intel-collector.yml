@@ -27,4 +27,5 @@ jobs:
         env:
           TRIAGE_GH_TOKEN:  ${{ secrets.TRIAGE_GH_TOKEN }}
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          GEMINI_API_KEY:   ${{ secrets.GEMINI_API_KEY }}
         run: python scripts/intel_collector.py

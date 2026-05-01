@@ -24,7 +24,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from urllib import request, error
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote
 
 # ---------- Airtable layout ----------
 
@@ -99,6 +99,55 @@ F_N_NOTES       = "fldIyGfUfsKmjFSnq"  # AI News
 F_D_NOTES       = "fldxRN1xdAfcSFx8c"  # Deals
 F_S_AUDIT_NOTES = "fldswaN5jLkCzogde"  # Skills
 
+# ---------- Intel Feed (consolidated April 2026) ----------
+# Replaces TABLE_PLATFORM (tblW6XV9X5gBrghOv), TABLE_NEWS (tbl4IUWP09vzchU5t),
+# TABLE_DEALS (tbl9a3WVIhW7NddYz). Discriminate rows by F_IF_FEED_TYPE value.
+
+TABLE_INTEL_FEED   = "tblwX27CIfhUPAm7J"
+F_IF_TITLE         = "fldz126GxHrT2LNvd"  # primary (was Update Title / Headline / Product Name)
+F_IF_FEED_TYPE     = "fldOJjF4CHVFUTDnI"  # singleSelect: Platform Update | AI News | Deal | YouTube
+F_IF_SOURCE        = "fldVDf9XduKHz0cnD"  # platform name / news source / deal source
+F_IF_SOURCE_URL    = "fldbuIajYp1uKV9Fu"
+F_IF_DATE_PUB      = "fldMZ7WODZpKGY54f"  # date the item was published / shipped
+F_IF_DATE_FOUND    = "fldhHCyKchpTnLn5H"  # date collector added it
+F_IF_SUMMARY       = "fldbaO4lSEliQTnAP"  # raw summary from source
+F_IF_DESCRIPTION   = "fldtNIUixmSbBmgUt"  # enriched description (Gemini fills)
+F_IF_WHY           = "flddwIXL5VxOkSLPN"  # Why It Matters (Gemini fills)
+F_IF_USE_CASE_1    = "fldp60fJmcVtZ59gO"  # (Gemini fills)
+F_IF_USE_CASE_2    = "fldtgGmMFPg745cPA"  # (Gemini fills)
+F_IF_PLATFORM_TIER = "fldUvWNsQiHPN8kP6"  # singleSelect (Platform Update rows)
+F_IF_EFFORT        = "fldyjfqlLKJmr50Jr"  # singleSelect S/M/L (Gemini fills)
+F_IF_RELEVANCE     = "fldCv4CQsqJJPRD0a"  # singleSelect High/Medium/Low (Gemini fills)
+F_IF_DECISION      = "fldvbbRANVEpL37MA"  # singleSelect — values vary by Feed Type
+F_IF_NOTES         = "fldM8wNT4PV0OcC9J"  # pre-classifier reasons, misc notes
+
+# ---------- APIs table (rebuilt April 2026 — old tblhsuuFCDKmO1Ho3 is gone) ----------
+
+TABLE_APIS_V2      = "tblMb9HFyKcnQ7aKb"
+F_A2_NAME          = "fldgEt7Po7CBXvA71"  # primary (singleLineText)
+F_A2_DEVELOPER     = "fldtr3JUxQpvkb4us"  # developer / provider name
+F_A2_LINK          = "fld0SuLIJPIGM4UTY"  # API URL / docs link
+F_A2_SOURCE        = "fldpkzrWeLnWVGbIK"  # singleSelect: public-apis | RapidAPI | etc.
+F_A2_ABOUT         = "fld6t5xv5ejuni3pI"  # description (category is embedded as [Cat] prefix)
+F_A2_DATE_FOUND    = "fldstJZi2oybRW4rj"  # date
+F_A2_STATUS        = "fldFSB4dK0bVRbt0R"  # singleSelect
+F_A2_DECISION      = "fldbpVmC9myu1dk0T"  # singleSelect
+F_A2_FREE_TIER     = "fldh0ShjqkmK66aM2"  # free tier details text
+F_A2_INT_POTENTIAL = "fldv71991pgCAkOpc"  # Integration Potential (Gemini fills)
+F_A2_WHAT_ENHANCES = "fld2j32xe7ZLzKbCi"  # What It Enhances (Gemini fills)
+
+# ---------- Gemini AI evaluation config ----------
+# Used by evaluate_pending_skills() and evaluate_pending_intel_feed().
+# Key is loaded from Airtable Logins & Keys ("Google Gemini" row) or GEMINI_API_KEY env var.
+
+GEMINI_MODEL          = "gemini-2.5-flash-lite"
+GEMINI_URL            = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+GEMINI_EVAL_BATCH_SIZE = 12   # ~13 RPM — safely inside free-tier 15 RPM limit
+GEMINI_SLEEP           = 4.5  # seconds between batches
+
 # Logins & Keys
 TABLE_LOGINS_KEYS = "tbldJkG11gY1W3jTf"
 F_LK_NAME         = "fldQqf8eF4mT2U0zT"  # primary
@@ -135,22 +184,12 @@ F_AM_LAST_CHECKED = "fldKPsV3LzTay0uMp"
 F_AM_FIRST_FOUND  = "fldtOn58LpHE9iSIx"
 F_AM_NOTES        = "fldyJklFGPg5tuTyn"
 
-# Pre-classifier config. Two providers supported:
-#   - Gemini direct (Google AI Studio) — primary when keys are present in
-#     Airtable Logins & Keys (row named "Google AI Studio" or "Gemini").
-#   - OpenRouter — fallback when no Gemini keys are configured.
+# OpenRouter pre-classifier config
 # Default model only used if no AI Models row is marked `Currently In Use For` =
-# 'intel pre-classifier'.
+# 'intel pre-classifier'. Qwen 2.5 72B free is the current default.
 OPENROUTER_MODEL = "qwen/qwen-2.5-72b-instruct:free"
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
 PRE_CLASSIFY_BATCH_SIZE = 15
-
-# Gemini direct config. Free tier: 15 req/min per key → 4.2s sleep between calls
-# when using a single key. Multiple keys rotate on 401/403/429 just like the
-# OpenRouter path.
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-GEMINI_SLEEP = 4.2
 
 # Providers worth tracking in AI Models. OpenRouter's catalog has 300+ models
 # across many providers; we only upsert rows for these to keep the table focused.
@@ -313,27 +352,7 @@ DEFAULT_UA = (
 
 # ---------- HTTP ----------
 
-def _ascii_safe_url(url):
-    """Percent-encode non-ASCII characters in the URL path/query so urllib can
-    build an HTTP request without an 'ascii codec can't encode' error.
-    Sitemap/scrape URLs can contain accented chars (é, ñ, etc.) in the path.
-    Host is IDNA-encoded; scheme/fragment are left as-is.
-
-    Path safe set preserves RFC 3986 reserved chars that are legitimate in
-    paths — specifically ':' and '@', so Google API action endpoints like
-    '/models/gemini-2.5-flash:generateContent' don't get mangled."""
-    try:
-        sp = urlsplit(url)
-        netloc = sp.netloc.encode("idna").decode("ascii") if sp.netloc else ""
-        path = quote(sp.path, safe="/%+:@")
-        query = quote(sp.query, safe="=&%+:@")
-        return urlunsplit((sp.scheme, netloc, path, query, sp.fragment))
-    except Exception:
-        return url
-
-
 def http(url, method="GET", headers=None, body=None, timeout=30):
-    url = _ascii_safe_url(url)
     headers = dict(headers or {})
     headers.setdefault("User-Agent", DEFAULT_UA)
     if body is not None and not isinstance(body, bytes):
@@ -748,7 +767,7 @@ def create_collector_action_item_model_not_found(at_key, model_slug, error_excer
         f"(https://openrouter.ai/api/v1/models — filter for :free if free tier preferred)."
     )
     prompt = (
-        "First, read /Users/ben/.claude/hypebase-primer.md for project context. Then:\n\n"
+        "First, read /Users/ben/Documents/Claude OS/Work/Engineering Ops/prompts/hypebase-primer.md for project context. Then:\n\n"
         "Task: Replace the deprecated classifier model slug in the Airtable AI Models table.\n\n"
         "Steps:\n"
         "1. Open Airtable base `app6biS7yjV6XzFVG`, table 'AI Models'\n"
@@ -798,7 +817,7 @@ def create_collector_action_item_keys_exhausted(at_key, exhausted):
         f"(append a new 'email:\\nsk-or-...' block), save. Next collector run picks it up."
     )
     prompt = (
-        "First, read /Users/ben/.claude/hypebase-primer.md for project context. Then:\n\n"
+        "First, read /Users/ben/Documents/Claude OS/Work/Engineering Ops/prompts/hypebase-primer.md for project context. Then:\n\n"
         "Task: Add a new OpenRouter account key to the Airtable Logins & Keys rotation "
         "so the intel collector's pre-classifier keeps working.\n\n"
         "Steps:\n"
@@ -823,50 +842,6 @@ def create_collector_action_item_keys_exhausted(at_key, exhausted):
         priority="High", effort="S",
         source_section="OpenRouter key rotation exhausted",
     )
-
-
-def get_gemini_keys_from_airtable(at_key):
-    """Fetch ALL Gemini (Google AI Studio) keys from Airtable Logins & Keys.
-
-    Extracts every line starting with 'AIza' (Google API key prefix) from the
-    Keys field of rows whose Name contains 'Google AI Studio' or 'Gemini'.
-    Supports multiple keys per row (email-prefixed pattern).
-
-    Falls back to GEMINI_API_KEY env var if Airtable lookup yields nothing.
-    Returns a (possibly empty) list. Never logs the values.
-    """
-    keys = []
-    seen = set()
-    try:
-        rows = at_list_all(
-            AIRTABLE_BASE, TABLE_LOGINS_KEYS, [F_LK_NAME, F_LK_KEYS], at_key
-        )
-    except Exception as e:
-        print(f"WARN gemini keys airtable lookup: {e}", file=sys.stderr)
-        rows = []
-    for r in rows:
-        f = r.get("fields", {}) or {}
-        name = (f.get(F_LK_NAME) or "").strip().lower()
-        if "google ai studio" not in name and "gemini" not in name:
-            continue
-        keys_text = f.get(F_LK_KEYS) or ""
-        for line in keys_text.splitlines():
-            line = line.strip()
-            if line.startswith("AIza") and line not in seen:
-                keys.append(line)
-                seen.add(line)
-    if not keys:
-        env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
-        if env_val and env_val not in seen:
-            keys.append(env_val)
-            print(f"gemini keys: loaded 1 from env (suffix=...{env_val[-4:]})")
-            return keys
-        print("gemini keys: none found in Airtable or env — Gemini path disabled",
-              file=sys.stderr)
-        return []
-    print(f"gemini keys: loaded {len(keys)} from Airtable (suffixes: " +
-          ", ".join(f"...{k[-4:]}" for k in keys) + ")")
-    return keys
 
 
 def get_openrouter_keys_from_airtable(at_key):
@@ -938,190 +913,19 @@ def get_classifier_model_from_airtable(at_key):
     return OPENROUTER_MODEL
 
 
-def _pre_classify_gemini(items, gemini_keys, model=None):
-    """Gemini direct path for pre-classification. Same I/O shape as pre_classify.
-    Rotates across gemini_keys on 401/403/429."""
-    if not items or not gemini_keys:
-        return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
-
-    model_slug = model or GEMINI_MODEL
-    available_keys = list(gemini_keys)
-    exhausted = []
-    current_key_idx = 0
-
-    results = [None] * len(items)
-    for start in range(0, len(items), PRE_CLASSIFY_BATCH_SIZE):
-        batch = items[start : start + PRE_CLASSIFY_BATCH_SIZE]
-        batch_in = [
-            {"id": i, "title": (it.get("title") or "")[:200],
-             "desc": (it.get("summary") or "")[:300]}
-            for i, it in enumerate(batch)
-        ]
-        prompt = (
-            f"You are filtering items for a strategic intelligence brief.\n\n"
-            f"CONTEXT: {HYPEBASE_CONTEXT_FOR_CLASSIFIER}\n\n"
-            f"For each item below, output one of: 'relevant', 'irrelevant', or 'maybe'. "
-            f"Be strict — mark as 'relevant' only if it clearly helps HypeBase. Mark "
-            f"'irrelevant' only if you're confident it doesn't help. Use 'maybe' when "
-            f"unsure — a human will re-check.\n\n"
-            f"INPUT (JSON): {json.dumps(batch_in)}\n\n"
-            f"OUTPUT: JSON array of the same length, in the same order, each element "
-            f"shaped like: {{\"decision\": \"relevant\"|\"irrelevant\"|\"maybe\", "
-            f"\"reason\": \"<=12 words\"}}\n"
-            f"No preamble, no markdown fences, just the JSON array."
-        )
-        body = json.dumps({
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0,
-                # Headroom for 15 items × ~40 tokens/item + JSON scaffolding.
-                # Bumped from 1500 after truncation at char ~140 was observed.
-                "maxOutputTokens": 4000,
-                "responseMimeType": "application/json",
-                # Disable Gemini 2.5 Flash's default "thinking" phase. Thinking
-                # tokens count against maxOutputTokens and were consuming ~95%
-                # of the budget, leaving only a few tokens for actual JSON
-                # output → "Unterminated string" parse errors. This is a fast
-                # classification task, not reasoning — thinking adds no value.
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
-        }).encode()
-
-        # RETIRE: permanent key problem (auth/quota). Key is removed from the
-        # pool for the rest of this run.
-        # TRANSIENT: temporary provider problem (5xx overload). Rotate to next
-        # key for THIS batch only; key stays in the pool for future batches.
-        RETIRE_STATUSES    = {401, 403, 429}
-        TRANSIENT_STATUSES = {500, 502, 503, 504}
-        status = 0
-        resp_body = b""
-        batch_key_idx = current_key_idx  # local cursor for this batch's rotation
-        while batch_key_idx < len(available_keys):
-            key = available_keys[batch_key_idx]
-            url = GEMINI_URL.format(model=model_slug, key=key)
-            headers = {"Content-Type": "application/json"}
-            status, resp_body = http(url, method="POST", headers=headers, body=body)
-            if status in RETIRE_STATUSES:
-                err_preview = resp_body[:120] if resp_body else b""
-                print(
-                    f"gemini key ...{key[-4:]} retired at batch {start}: "
-                    f"HTTP {status} — trying next key",
-                    file=sys.stderr,
-                )
-                exhausted.append({"suffix": key[-4:], "status": status,
-                                  "error": err_preview.decode('utf-8', errors='replace')})
-                current_key_idx += 1
-                batch_key_idx = current_key_idx
-                continue
-            if status in TRANSIENT_STATUSES:
-                print(
-                    f"gemini key ...{key[-4:]} transient HTTP {status} at batch "
-                    f"{start} — rotating to next key (key retained in pool)",
-                    file=sys.stderr,
-                )
-                batch_key_idx += 1
-                continue
-            break  # success or non-retire non-transient error (400, 404, etc.)
-
-        if current_key_idx >= len(available_keys):
-            print("WARN pre_classify (gemini): ALL keys exhausted — remaining items -> 'maybe'",
-                  file=sys.stderr)
-            for i in range(start, len(items)):
-                if results[i] is None:
-                    results[i] = {"decision": "maybe", "reason": "all gemini keys exhausted"}
-            break
-
-        if batch_key_idx >= len(available_keys):
-            # Every remaining key gave a transient 5xx for this batch. Keys are
-            # still in the pool; next batch will retry them.
-            print(f"WARN pre_classify (gemini) batch {start}: all keys returned "
-                  f"transient errors (last status {status}) — falling back to 'maybe' "
-                  f"for this batch only", file=sys.stderr)
-            for i in range(len(batch)):
-                results[start + i] = {"decision": "maybe", "reason": "classifier transient error (all keys)"}
-            time.sleep(GEMINI_SLEEP * 2)  # longer back-off before next batch
-            continue
-
-        if status >= 400:
-            print(f"WARN pre_classify (gemini) batch {start}: {status} {resp_body[:200]!r}",
-                  file=sys.stderr)
-            for i in range(len(batch)):
-                results[start + i] = {"decision": "maybe", "reason": "classifier HTTP error"}
-            time.sleep(GEMINI_SLEEP)
-            continue
-
-        try:
-            resp = json.loads(resp_body)
-            candidates = resp.get("candidates", [])
-            if not candidates:
-                raise ValueError(f"no candidates in response: {resp_body[:200]!r}")
-            parts = candidates[0].get("content", {}).get("parts", [])
-            content = (parts[0].get("text") if parts else "") or ""
-            content = content.strip()
-            if content.startswith("```"):
-                fences = content.split("```")
-                if len(fences) >= 2:
-                    content = fences[1]
-                    if content.lower().startswith("json\n") or content.lower().startswith("json "):
-                        content = content[4:].lstrip()
-                    if content.endswith("\n"):
-                        content = content.rstrip()
-            parsed = json.loads(content)
-            if isinstance(parsed, list) and len(parsed) == len(batch):
-                for i, dec in enumerate(parsed):
-                    if not isinstance(dec, dict):
-                        dec = {"decision": "maybe", "reason": "malformed response item"}
-                    d = (dec.get("decision") or "").strip().lower()
-                    if d not in ("relevant", "irrelevant", "maybe"):
-                        d = "maybe"
-                    results[start + i] = {
-                        "decision": d,
-                        "reason": (dec.get("reason") or "")[:200],
-                    }
-            else:
-                raise ValueError(f"length mismatch: got {len(parsed) if isinstance(parsed, list) else 'non-list'}, want {len(batch)}")
-        except Exception as e:
-            print(f"WARN pre_classify (gemini) batch {start} parse: {e}", file=sys.stderr)
-            for i in range(len(batch)):
-                results[start + i] = {"decision": "maybe", "reason": "classifier parse error"}
-        time.sleep(GEMINI_SLEEP)
-
-    for i, r in enumerate(results):
-        if r is None:
-            results[i] = {"decision": "maybe", "reason": "classifier incomplete"}
-
-    counts = {"relevant": 0, "irrelevant": 0, "maybe": 0}
-    for r in results:
-        counts[r["decision"]] = counts.get(r["decision"], 0) + 1
-    keys_used = min(current_key_idx + 1, len(available_keys)) if available_keys else 0
-    print(f"pre_classify (gemini): relevant={counts['relevant']} "
-          f"irrelevant={counts['irrelevant']} maybe={counts['maybe']} "
-          f"(model={model_slug}, {len(items)} items, keys_used={keys_used}/{len(available_keys)})")
-    return results
-
-
 def pre_classify(items, openrouter_keys, model=None, at_key=None):
-    """Batch-classify items. Prefers Gemini direct when keys are in Airtable
-    Logins & Keys; falls back to OpenRouter otherwise. Returns list of dicts in
-    input order: [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
+    """Batch-classify items via OpenRouter. Takes a LIST of keys and rotates on
+    rate-limit / quota errors. Returns list of dicts in input order:
+    [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
 
     Safe to call with empty keys list or empty items. On any failure, returns
     'maybe' for every item so nothing gets auto-dismissed on classifier errors.
 
-    If ALL OpenRouter keys are exhausted (all hitting 429/402/403), files a 'New'
-    Action Item in Airtable asking the user to provide a new account key, then
-    returns 'maybe' for the remaining items.
+    If ALL keys are exhausted (all hitting 429/402/403), files a 'New' Action
+    Item in Airtable asking the user to provide a new account key, then returns
+    'maybe' for the remaining items.
     """
-    if not items:
-        return []
-
-    # Prefer Gemini direct when keys are available — no cost, simpler rotation.
-    gemini_keys = get_gemini_keys_from_airtable(at_key) if at_key else []
-    if gemini_keys:
-        gemini_model = model if model and model.startswith("gemini-") else GEMINI_MODEL
-        return _pre_classify_gemini(items, gemini_keys, model=gemini_model)
-
-    if not openrouter_keys:
+    if not items or not openrouter_keys:
         return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
 
     # Backward compat: accept a single key string too
@@ -1329,7 +1133,8 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_keys=None, clas
     active = [p for p in platforms if (p.get("fields") or {}).get(F_M_ACTIVE)]
     print(f"platforms: {len(active)} active of {len(platforms)} total")
 
-    seen = at_existing_titles(AIRTABLE_BASE, TABLE_PLATFORM, F_P_TITLE, at_key)
+    # Dedup against Intel Feed (consolidated table — replaces old TABLE_PLATFORM)
+    seen = at_existing_titles(AIRTABLE_BASE, TABLE_INTEL_FEED, F_IF_TITLE, at_key)
 
     new_records = []
     platform_updates = []
@@ -1365,17 +1170,18 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_keys=None, clas
                 continue
             seen.add(title.strip().lower())
             fields = {
-                F_P_TITLE:      title,
-                F_P_PLATFORM:   name,
-                F_P_TIER:       tier,
-                F_P_DATE_FOUND: today,
-                F_P_SUMMARY:    it.get("summary", ""),
-                F_P_SOURCE_URL: it.get("link", ""),
-                F_P_DECISION:   "Pending",
+                F_IF_TITLE:         title,
+                F_IF_FEED_TYPE:     "Platform Update",
+                F_IF_SOURCE:        name,
+                F_IF_PLATFORM_TIER: tier,
+                F_IF_DATE_FOUND:    today,
+                F_IF_SUMMARY:       it.get("summary", ""),
+                F_IF_SOURCE_URL:    it.get("link", ""),
+                F_IF_DECISION:      "Pending",
             }
             d = parse_date(it.get("date"))
             if d:
-                fields[F_P_DATE_SHIP] = d
+                fields[F_IF_DATE_PUB] = d
             new_records.append(fields)
             platform_new += 1
 
@@ -1386,22 +1192,23 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_keys=None, clas
 
     # Pre-classify before upsert. Source_items carry the title/summary used for
     # classification; new_records are the actual Airtable payloads we mutate.
-    source_items = [{"title": r[F_P_TITLE], "summary": r.get(F_P_SUMMARY, "")} for r in new_records]
+    source_items = [{"title": r[F_IF_TITLE], "summary": r.get(F_IF_SUMMARY, "")} for r in new_records]
     decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         new_records, source_items, decisions,
-        F_P_DECISION, "Ignore",
-        # Platform Updates has no Notes field; leave reason_field unused
+        F_IF_DECISION, "Ignore",
+        # No per-item notes field for Platform Updates; reason dropped intentionally
     )
     print(f"platform pre-classify: auto-Ignored {skipped} irrelevant items")
-    created = at_create(AIRTABLE_BASE, TABLE_PLATFORM, new_records, at_key)
+    created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, new_records, at_key)
     at_update(AIRTABLE_BASE, TABLE_MONITORED, platform_updates, at_key)
     print(f"platform: {created} created (of {len(new_records)} candidates)")
     print(f"monitored_platforms: {len(platform_updates)} Last Checked dates updated")
 
 
 def collect_ai_news(at_key, today, openrouter_keys=None, classifier_model=None):
-    seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
+    # Dedup against Intel Feed (replaces old TABLE_NEWS)
+    seen = at_existing_titles(AIRTABLE_BASE, TABLE_INTEL_FEED, F_IF_TITLE, at_key)
     records = []
     source_items = []
     for it in hn_top(AI_KEYWORDS):
@@ -1410,31 +1217,33 @@ def collect_ai_news(at_key, today, openrouter_keys=None, classifier_model=None):
             continue
         seen.add(title.strip().lower())
         fields = {
-            F_N_HEADLINE:   title,
-            F_N_SOURCE:     "Hacker News",
-            F_N_SOURCE_URL: it["link"],
-            F_N_DATE_FOUND: today,
-            F_N_SUMMARY:    it.get("summary", ""),
-            F_N_DECISION:   "Pending",
+            F_IF_TITLE:      title,
+            F_IF_FEED_TYPE:  "AI News",
+            F_IF_SOURCE:     "Hacker News",
+            F_IF_SOURCE_URL: it["link"],
+            F_IF_DATE_FOUND: today,
+            F_IF_SUMMARY:    it.get("summary", ""),
+            F_IF_DECISION:   "Pending",
         }
         d = parse_date(it.get("date"))
         if d:
-            fields[F_N_DATE_PUB] = d
+            fields[F_IF_DATE_PUB] = d
         records.append(fields)
         source_items.append({"title": title, "summary": it.get("summary", "")})
 
     decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
-        F_N_DECISION, "Dismiss", F_N_NOTES,
+        F_IF_DECISION, "Dismiss", F_IF_NOTES,
     )
     print(f"ai_news pre-classify: auto-Dismissed {skipped} irrelevant items")
-    created = at_create(AIRTABLE_BASE, TABLE_NEWS, records, at_key)
+    created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, records, at_key)
     print(f"ai_news: {created} created (of {len(records)} candidates)")
 
 
 def collect_deals(at_key, today, openrouter_keys=None, classifier_model=None):
-    seen = at_existing_titles(AIRTABLE_BASE, TABLE_DEALS, F_D_NAME, at_key)
+    # Dedup against Intel Feed (replaces old TABLE_DEALS)
+    seen = at_existing_titles(AIRTABLE_BASE, TABLE_INTEL_FEED, F_IF_TITLE, at_key)
     records = []
     source_items = []
     status, body = http("https://www.producthunt.com/feed")
@@ -1449,12 +1258,13 @@ def collect_deals(at_key, today, openrouter_keys=None, classifier_model=None):
                 continue
             seen.add(title.strip().lower())
             records.append({
-                F_D_NAME:       title,
-                F_D_SOURCE:     "ProductHunt",
-                F_D_SOURCE_URL: it["link"],
-                F_D_DATE_FOUND: today,
-                F_D_DESC:       it.get("summary", ""),
-                F_D_DECISION:   "Pending",
+                F_IF_TITLE:       title,
+                F_IF_FEED_TYPE:   "Deal",
+                F_IF_SOURCE:      "ProductHunt",
+                F_IF_SOURCE_URL:  it["link"],
+                F_IF_DATE_FOUND:  today,
+                F_IF_DESCRIPTION: it.get("summary", ""),
+                F_IF_DECISION:    "Pending",
             })
             source_items.append({"title": title, "summary": it.get("summary", "")})
     else:
@@ -1463,10 +1273,10 @@ def collect_deals(at_key, today, openrouter_keys=None, classifier_model=None):
     decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
-        F_D_DECISION, "Skip", F_D_NOTES,
+        F_IF_DECISION, "Skip", F_IF_NOTES,
     )
     print(f"deals pre-classify: auto-Skipped {skipped} irrelevant items")
-    created = at_create(AIRTABLE_BASE, TABLE_DEALS, records, at_key)
+    created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, records, at_key)
     print(f"deals: {created} created (of {len(records)} candidates)")
 
 
@@ -1550,6 +1360,22 @@ def collect_skills(at_key, gh_token, today, openrouter_keys=None, classifier_mod
     )
 
 
+def dismiss_irrelevant_pending_apis(at_key):
+    """Legacy cleanup — superseded by the TABLE_APIS_V2 migration (April 2026).
+
+    The old TABLE_APIS (tblhsuuFCDKmO1Ho3) had a Category field we could filter on.
+    TABLE_APIS_V2 (tblMb9HFyKcnQ7aKb) has no Category column — category is embedded
+    as a [Cat] prefix in the About field, and collect_apis() already gates new writes
+    on API_CATEGORIES_RELEVANT at write time, so irrelevant records never enter the
+    new table in the first place.
+
+    This function is kept as a no-op so main() calls don't need to change, but it
+    does nothing. Remove the call from main() once the migration is confirmed stable.
+    """
+    print("dismiss_irrelevant_pending_apis: no-op (TABLE_APIS_V2 uses write-time filtering)")
+    return 0
+
+
 def collect_apis(at_key, today, openrouter_keys=None, classifier_model=None):
     """Fetch from public-apis README + publicapis.dev API, filter by relevant
     categories, upsert to APIs table."""
@@ -1576,33 +1402,38 @@ def collect_apis(at_key, today, openrouter_keys=None, classifier_model=None):
     print(f"APIs: {len(relevant)} in relevant categories after merge "
           f"({len(all_entries)} total unique)")
 
-    seen = at_existing_titles(AIRTABLE_BASE, TABLE_APIS, F_A_NAME, at_key)
+    # Write to rebuilt APIs table (TABLE_APIS_V2 — old tblhsuuFCDKmO1Ho3 is gone)
+    seen = at_existing_titles(AIRTABLE_BASE, TABLE_APIS_V2, F_A2_NAME, at_key)
     records = []
     for e in relevant:
         name = (e.get("name") or "")[:250]
         if not name or name.strip().lower() in seen:
             continue
         seen.add(name.strip().lower())
+        # Embed category as [Cat] prefix in About so it's searchable even though
+        # the new schema has no dedicated Category column.
+        cat = e.get("category", "")
+        desc = (e.get("description") or "")[:SUMMARY_CAP]
+        about = f"[{cat}] {desc}".strip()[:SUMMARY_CAP] if cat else desc
         records.append({
-            F_A_NAME:           name,
-            F_A_MARKETPLACE:    "public-apis",
-            F_A_MARKETPLACE_URL:e.get("url", ""),
-            F_A_DATE_FOUND:     today,
-            F_A_CATEGORY:       e.get("category", ""),
-            F_A_DESCRIPTION:    (e.get("description") or "")[:SUMMARY_CAP],
-            F_A_FREE_TIER:      f"Auth: {e.get('auth','?')} | HTTPS: {e.get('https','?')}",
-            F_A_STATUS:         "Discovered",
-            F_A_DECISION:       "Pending",
+            F_A2_NAME:      name,
+            F_A2_SOURCE:    "public-apis",
+            F_A2_LINK:      e.get("url", ""),
+            F_A2_DATE_FOUND:today,
+            F_A2_ABOUT:     about,
+            F_A2_FREE_TIER: f"Auth: {e.get('auth','?')} | HTTPS: {e.get('https','?')}",
+            F_A2_STATUS:    "Discovered",
+            F_A2_DECISION:  "Pending",
         })
-    # APIs has no Notes field. Pass None for reason_field; just set Decision.
-    source_items = [{"title": r[F_A_NAME], "summary": r.get(F_A_DESCRIPTION, "")} for r in records]
+    # New APIs table has no Notes field; pass None for reason_field.
+    source_items = [{"title": r[F_A2_NAME], "summary": r.get(F_A2_ABOUT, "")} for r in records]
     decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
-        F_A_DECISION, "Skip",
+        F_A2_DECISION, "Skip",
     )
     print(f"apis pre-classify: auto-Skipped {skipped} irrelevant items")
-    created = at_create(AIRTABLE_BASE, TABLE_APIS, records, at_key)
+    created = at_create(AIRTABLE_BASE, TABLE_APIS_V2, records, at_key)
     print(f"apis: {created} created (of {len(records)} candidates)")
 
 
@@ -1920,8 +1751,9 @@ def collect_ai_models(at_key, today):
 
 
 def collect_hf_trending(at_key, today, openrouter_keys=None, classifier_model=None):
-    """Pull HF trending models into AI News as 'HuggingFace Trending' source."""
-    seen = at_existing_titles(AIRTABLE_BASE, TABLE_NEWS, F_N_HEADLINE, at_key)
+    """Pull HF trending models into Intel Feed as Feed Type='AI News'."""
+    # Dedup against Intel Feed (replaces old TABLE_NEWS)
+    seen = at_existing_titles(AIRTABLE_BASE, TABLE_INTEL_FEED, F_IF_TITLE, at_key)
     records = []
     for it in hf_trending_models():
         title = it["title"][:250]
@@ -1929,27 +1761,318 @@ def collect_hf_trending(at_key, today, openrouter_keys=None, classifier_model=No
             continue
         seen.add(title.strip().lower())
         fields = {
-            F_N_HEADLINE:   title,
-            F_N_SOURCE:     "HuggingFace Trending",
-            F_N_SOURCE_URL: it["link"],
-            F_N_DATE_FOUND: today,
-            F_N_SUMMARY:    it.get("summary", ""),
-            F_N_DECISION:   "Pending",
+            F_IF_TITLE:      title,
+            F_IF_FEED_TYPE:  "AI News",
+            F_IF_SOURCE:     "HuggingFace Trending",
+            F_IF_SOURCE_URL: it["link"],
+            F_IF_DATE_FOUND: today,
+            F_IF_SUMMARY:    it.get("summary", ""),
+            F_IF_DECISION:   "Pending",
         }
         d = parse_date(it.get("date"))
         if d:
-            fields[F_N_DATE_PUB] = d
+            fields[F_IF_DATE_PUB] = d
         records.append(fields)
 
-    source_items = [{"title": r[F_N_HEADLINE], "summary": r.get(F_N_SUMMARY, "")} for r in records]
+    source_items = [{"title": r[F_IF_TITLE], "summary": r.get(F_IF_SUMMARY, "")} for r in records]
     decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
     skipped = apply_pre_classification(
         records, source_items, decisions,
-        F_N_DECISION, "Dismiss", F_N_NOTES,
+        F_IF_DECISION, "Dismiss", F_IF_NOTES,
     )
     print(f"hf_trending pre-classify: auto-Dismissed {skipped} irrelevant items")
-    created = at_create(AIRTABLE_BASE, TABLE_NEWS, records, at_key)
+    created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, records, at_key)
     print(f"hf_trending: {created} created (of {len(records)} candidates)")
+
+
+# ---------- Gemini evaluation ----------
+
+def get_gemini_key_from_airtable(at_key):
+    """Fetch Gemini API key from the 'Google Gemini' row in Logins & Keys.
+    Falls back to GEMINI_API_KEY env var. Returns None if nothing found.
+    Never logs the key value.
+    """
+    try:
+        rows = at_list_all(AIRTABLE_BASE, TABLE_LOGINS_KEYS,
+                           [F_LK_NAME, F_LK_KEYS], at_key)
+    except Exception as e:
+        print(f"WARN gemini key lookup: {e}", file=sys.stderr)
+        rows = []
+    for r in rows:
+        f = r.get("fields", {}) or {}
+        name = (f.get(F_LK_NAME) or "").strip().lower().replace(" ", "")
+        if "gemini" in name:
+            for line in (f.get(F_LK_KEYS) or "").splitlines():
+                line = line.strip()
+                if line.startswith("AIzaSy"):
+                    print(f"gemini key: loaded from Airtable (suffix=...{line[-4:]})")
+                    return line
+    env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if env_val:
+        print(f"gemini key: loaded from env (suffix=...{env_val[-4:]})")
+        return env_val
+    print("WARN gemini: no API key found in Airtable or env — evaluation pass skipped",
+          file=sys.stderr)
+    return None
+
+
+def gemini_evaluate(items, api_key, prompt_fn, batch_size=GEMINI_EVAL_BATCH_SIZE):
+    """Batch-evaluate items via Gemini API. Returns a list of result dicts
+    (one per item, in input order). Items that fail evaluation return None.
+
+    prompt_fn(batch) → prompt string. Each batch item has 'id', 'title', 'summary'.
+    Uses responseMimeType=application/json to get clean JSON output.
+    Retries once on 429; sleeps GEMINI_SLEEP seconds between batches.
+    """
+    if not items or not api_key:
+        return [None] * len(items)
+
+    results = [None] * len(items)
+    for start in range(0, len(items), batch_size):
+        batch = items[start: start + batch_size]
+        prompt = prompt_fn(batch)
+
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 4096,
+                "responseMimeType": "application/json",
+            },
+        }).encode()
+        headers = {"Content-Type": "application/json"}
+        url = f"{GEMINI_URL}?key={api_key}"
+
+        status, resp_body = http(url, method="POST", headers=headers, body=body)
+        if status == 429:
+            print(f"WARN gemini rate-limit at batch {start} — sleeping 60s", file=sys.stderr)
+            time.sleep(60)
+            status, resp_body = http(url, method="POST", headers=headers, body=body)
+
+        if status >= 400:
+            print(f"WARN gemini batch {start}: HTTP {status} {resp_body[:200]!r}",
+                  file=sys.stderr)
+            time.sleep(GEMINI_SLEEP)
+            continue  # leave results[start:...] as None
+
+        try:
+            resp = json.loads(resp_body)
+            text = (resp.get("candidates", [{}])[0]
+                       .get("content", {})
+                       .get("parts", [{}])[0]
+                       .get("text", "")).strip()
+            # Strip markdown fences if model ignored responseMimeType
+            if text.startswith("```"):
+                parts = text.split("```")
+                if len(parts) >= 2:
+                    text = parts[1]
+                    if text.lower().startswith("json\n"):
+                        text = text[5:]
+            parsed = json.loads(text)
+            if isinstance(parsed, list) and len(parsed) == len(batch):
+                for i, r in enumerate(parsed):
+                    results[start + i] = r if isinstance(r, dict) else None
+            else:
+                print(f"WARN gemini batch {start}: expected list of {len(batch)}, "
+                      f"got {type(parsed).__name__} len={len(parsed) if isinstance(parsed, list) else '?'}",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"WARN gemini batch {start} parse: {e}", file=sys.stderr)
+
+        time.sleep(GEMINI_SLEEP)
+
+    return results
+
+
+def evaluate_pending_skills(at_key, gemini_key, today):
+    """Use Gemini to pre-fill Type, Relevance to Us, Effort to Adopt, and Audit Notes
+    on Skills rows where Type='Discovered' and Last Audited is blank.
+
+    After this runs, the Mon/Thu intel-brief Step 2 becomes a review-and-Task-create
+    pass rather than a full evaluation — Claude only acts on Gemini's Recommended picks.
+    Returns count of records updated.
+    """
+    rows = at_list_all(
+        AIRTABLE_BASE, TABLE_SKILLS,
+        [F_S_NAME, F_S_TYPE, F_S_DESC, F_S_SOURCE_URL,
+         "fldR60TGsI3N3fxjG"],   # Last Audited
+        at_key,
+    )
+
+    pending = []
+    for r in rows:
+        f = r.get("fields", {}) or {}
+        if ((f.get(F_S_TYPE) or "").strip() == "Discovered"
+                and not f.get("fldR60TGsI3N3fxjG")):
+            pending.append({
+                "id":      r["id"],
+                "title":   (f.get(F_S_NAME) or "")[:200],
+                "summary": (f.get(F_S_DESC) or "")[:400],
+            })
+
+    if not pending:
+        print("evaluate_pending_skills: 0 Discovered skills need evaluation")
+        return 0
+
+    print(f"evaluate_pending_skills: evaluating {len(pending)} skills via Gemini")
+
+    def make_prompt(batch):
+        return (
+            f"You are evaluating GitHub skills/plugins for HypeBase.\n\n"
+            f"CONTEXT: {HYPEBASE_CONTEXT_FOR_CLASSIFIER}\n\n"
+            f"For each skill, return a JSON array (same length, same order). Each element:\n"
+            f'{{\n'
+            f'  "id": "<same id from input>",\n'
+            f'  "type": "Recommended" | "Discovered" | "Rejected",\n'
+            f'  "relevance": "<1-2 sentences: why it helps HypeBase, or why it doesn\'t>",\n'
+            f'  "effort": "S" | "M" | "L",\n'
+            f'  "audit_notes": "<concise: where in our pipeline it fits, or rejection reason>"\n'
+            f"}}\n\n"
+            f"Guidelines:\n"
+            f'- "Recommended": direct, clear value for HypeBase right now\n'
+            f'- "Discovered": might be useful but unclear fit — leave for human review\n'
+            f'- "Rejected": no relevance\n'
+            f"- Effort: S=hours, M=days, L=week+\n\n"
+            f"INPUT: {json.dumps([{'id': it['id'], 'title': it['title'], 'desc': it['summary']} for it in batch])}\n\n"
+            f"Return ONLY the JSON array."
+        )
+
+    results = gemini_evaluate(pending, gemini_key, make_prompt)
+
+    updates = []
+    for item, result in zip(pending, results):
+        if not result:
+            continue
+        fields = {
+            "fldR60TGsI3N3fxjG": today,          # Last Audited
+            "fldRBvfKj9aX80tuP": "Gemini pre-eval",  # Audit Status
+        }
+        skill_type = (result.get("type") or "").strip()
+        if skill_type in ("Recommended", "Rejected"):
+            fields[F_S_TYPE] = skill_type
+        relevance = (result.get("relevance") or "").strip()[:1000]
+        if relevance:
+            fields["fldpHZvluU0FZQpln"] = relevance   # Relevance to Us
+        effort = (result.get("effort") or "").strip()
+        if effort in ("S", "M", "L"):
+            fields["fldnxq8CkjFALhEh7"] = effort      # Effort to Adopt
+        notes = (result.get("audit_notes") or "").strip()[:1000]
+        if notes:
+            fields[F_S_AUDIT_NOTES] = f"[Gemini] {notes}"
+        updates.append({"id": item["id"], "fields": fields})
+
+    done = at_update(AIRTABLE_BASE, TABLE_SKILLS, updates, at_key)
+    rec_count = len(results) - results.count(None)
+    print(f"evaluate_pending_skills: updated {done} of {rec_count} successfully evaluated")
+    return done
+
+
+def evaluate_pending_intel_feed(at_key, gemini_key, today,
+                                feed_types=None):
+    """Use Gemini to pre-fill Why It Matters, Use Cases, Effort, Relevance, and Decision
+    on Pending Intel Feed rows for the given Feed Types.
+
+    Defaults to Platform Update + AI News. Deals are excluded by default because
+    they need a manual cost comparison before a decision is meaningful.
+
+    After this runs, the intel-brief Steps 3 and 4 become review-and-Task-create
+    passes — Claude reads pre-filled fields rather than evaluating from scratch.
+    Returns total count of records updated across all feed types.
+    """
+    if feed_types is None:
+        feed_types = ["Platform Update", "AI News"]
+
+    rows = at_list_all(
+        AIRTABLE_BASE, TABLE_INTEL_FEED,
+        [F_IF_TITLE, F_IF_FEED_TYPE, F_IF_SUMMARY, F_IF_DECISION, F_IF_SOURCE],
+        at_key,
+    )
+
+    # Valid Decision values vary by Feed Type
+    decision_options = {
+        "Platform Update": ["Adopt Now", "Prototype", "Watch", "Ignore"],
+        "AI News":         ["Act On", "Explore", "Reference", "Dismiss"],
+        "Deal":            ["Buy", "Trial", "Watch", "Skip"],
+    }
+
+    # Group Pending rows by feed type
+    by_type: dict = {ft: [] for ft in feed_types}
+    for r in rows:
+        f = r.get("fields", {}) or {}
+        ft = (f.get(F_IF_FEED_TYPE) or "").strip()
+        decision = (f.get(F_IF_DECISION) or "").strip()
+        if ft in by_type and decision in ("Pending", ""):
+            by_type[ft].append({
+                "id":      r["id"],
+                "title":   (f.get(F_IF_TITLE) or "")[:200],
+                "summary": (f.get(F_IF_SUMMARY) or "")[:400],
+                "source":  (f.get(F_IF_SOURCE) or ""),
+            })
+
+    total_updated = 0
+    for feed_type, items in by_type.items():
+        if not items:
+            print(f"evaluate_pending_intel_feed [{feed_type}]: 0 Pending items")
+            continue
+
+        print(f"evaluate_pending_intel_feed [{feed_type}]: "
+              f"evaluating {len(items)} items via Gemini")
+        valid_decisions = decision_options.get(feed_type, ["Watch", "Ignore"])
+
+        def make_prompt(batch, ft=feed_type, vd=valid_decisions):
+            return (
+                f"You are pre-evaluating {ft} items for a HypeBase intelligence brief.\n\n"
+                f"CONTEXT: {HYPEBASE_CONTEXT_FOR_CLASSIFIER}\n\n"
+                f"For each item, return a JSON array (same length, same order). Each element:\n"
+                f'{{\n'
+                f'  "id": "<same id from input>",\n'
+                f'  "decision": "{" | ".join(vd)}",\n'
+                f'  "why_it_matters": "<1-2 sentences specific to HypeBase, or why it doesn\'t>",\n'
+                f'  "use_case_1": "<concrete HypeBase use case, or empty string>",\n'
+                f'  "use_case_2": "<second use case if applicable, else empty string>",\n'
+                f'  "effort": "S" | "M" | "L",\n'
+                f'  "relevance": "High" | "Medium" | "Low"\n'
+                f"}}\n\n"
+                f"Be conservative — only top-tier decisions for clear wins. "
+                f"Err toward lower decisions when uncertain.\n\n"
+                f"INPUT: {json.dumps([{{'id': it['id'], 'title': it['title'], 'summary': it['summary']}} for it in batch])}\n\n"
+                f"Return ONLY the JSON array."
+            )
+
+        results = gemini_evaluate(items, gemini_key, make_prompt)
+
+        updates = []
+        valid_set = set(valid_decisions)
+        for item, result in zip(items, results):
+            if not result:
+                continue
+            fields = {}
+            decision = (result.get("decision") or "").strip()
+            if decision in valid_set:
+                fields[F_IF_DECISION] = decision
+            why = (result.get("why_it_matters") or "").strip()[:1000]
+            if why:
+                fields[F_IF_WHY] = why
+            uc1 = (result.get("use_case_1") or "").strip()[:500]
+            if uc1:
+                fields[F_IF_USE_CASE_1] = uc1
+            uc2 = (result.get("use_case_2") or "").strip()[:500]
+            if uc2:
+                fields[F_IF_USE_CASE_2] = uc2
+            effort = (result.get("effort") or "").strip()
+            if effort in ("S", "M", "L"):
+                fields[F_IF_EFFORT] = effort
+            rel = (result.get("relevance") or "").strip()
+            if rel in ("High", "Medium", "Low"):
+                fields[F_IF_RELEVANCE] = rel
+            if fields:
+                updates.append({"id": item["id"], "fields": fields})
+
+        done = at_update(AIRTABLE_BASE, TABLE_INTEL_FEED, updates, at_key)
+        print(f"evaluate_pending_intel_feed [{feed_type}]: updated {done} records")
+        total_updated += done
+
+    return total_updated
 
 
 # ---------- Main ----------
@@ -1962,15 +2085,26 @@ def main():
     print(f"DEBUG: AIRTABLE_API_KEY len={len(at_key)} suffix=...{at_key[-4:]}")
     print(f"DEBUG: TRIAGE_GH_TOKEN  len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
-    openrouter_keys = get_openrouter_keys_from_airtable(at_key)
+    openrouter_keys  = get_openrouter_keys_from_airtable(at_key)
     classifier_model = get_classifier_model_from_airtable(at_key)
+    gemini_key       = get_gemini_key_from_airtable(at_key)
 
+    # --- Collection pass (Qwen pre-classifier filters noise at write time) ---
     collect_platform_updates(at_key, gh_token, today, openrouter_keys, classifier_model)
     collect_ai_news(at_key, today, openrouter_keys, classifier_model)
     collect_hf_trending(at_key, today, openrouter_keys, classifier_model)
     collect_deals(at_key, today, openrouter_keys, classifier_model)
     collect_skills(at_key, gh_token, today, openrouter_keys, classifier_model)
+    dismiss_irrelevant_pending_apis(at_key)   # no-op on new table; safe to call
     collect_apis(at_key, today, openrouter_keys, classifier_model)
+
+    # --- Gemini evaluation pass (pre-fills fields so intel-brief is review-only) ---
+    if gemini_key:
+        evaluate_pending_skills(at_key, gemini_key, today)
+        evaluate_pending_intel_feed(at_key, gemini_key, today,
+                                    feed_types=["Platform Update", "AI News"])
+    else:
+        print("gemini evaluation: skipped (no key)")
 
     # Refresh AI Models catalog from multiple sources at end of run.
     collect_ai_models(at_key, today)   # OpenRouter (~40-60 rows refreshed)
