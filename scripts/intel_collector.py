@@ -152,11 +152,17 @@ GEMINI_EVAL_MAX_ITEMS  = 84   # max items per evaluation pass per run (7 batches
                                # keeps daily usage well inside free-tier 1,000 RPD
 GEMINI_MAX_FAILURES    = 3    # abort evaluation pass after this many consecutive failures
 
-# Logins & Keys
+# Logins & Keys (login rows only — keys have moved to Credentials table)
 TABLE_LOGINS_KEYS = "tbldJkG11gY1W3jTf"
 F_LK_NAME         = "fldQqf8eF4mT2U0zT"  # primary
-F_LK_KEYS         = "fld4fYgMypJz9Iete"
+F_LK_KEYS         = "fld4fYgMypJz9Iete"  # deprecated — empty, kept for reference
 F_LK_STATUS       = "fldcZ9nAY8GD2OZW8"
+
+# Credentials table (API keys, tokens, secrets — one row per credential)
+TABLE_CREDENTIALS = "tblvBr6RIc7bcGXYJ"
+F_CRED_NAME       = "fld2lJoFqSGAEK5tw"
+F_CRED_VALUE      = "fldGMbEDOCtLXqbLX"
+F_CRED_STATUS     = "fld4tDedZ5uGVy3gP"
 
 # Action Items (used when the collector needs to self-report a problem)
 TABLE_ACTION_ITEMS = "tblWFVbz8tllvcgIF"
@@ -695,405 +701,6 @@ def at_create(base, table, records, key_token):
         created += len(json.loads(body).get("records", []))
         time.sleep(SLEEP)
     return created
-
-
-def create_collector_action_item(at_key, action, description, prompt,
-                                 priority="High", effort="S",
-                                 source_section="OpenRouter classifier"):
-    """File a 'New' Action Item about a collector self-reported issue.
-
-    Dedupes against existing Action Items with the same Action (primary key)
-    and Status ∈ {New, In Progress, Blocked, Carried Forward} — doesn't create
-    a duplicate if the same issue is already open.
-    """
-    try:
-        existing = at_list_all(
-            AIRTABLE_BASE, TABLE_ACTION_ITEMS,
-            [F_AI_ACTION, F_AI_STATUS], at_key,
-        )
-    except Exception as e:
-        print(f"WARN collector self-report dedup lookup: {e}", file=sys.stderr)
-        existing = []
-    target_action = action.strip().lower()
-    open_statuses = {"new", "in progress", "blocked", "carried forward"}
-    for r in existing:
-        f = r.get("fields", {}) or {}
-        row_action = (f.get(F_AI_ACTION) or "").strip().lower()
-        status_val = f.get(F_AI_STATUS)
-        if isinstance(status_val, dict):
-            status_name = (status_val.get("name") or "").lower()
-        else:
-            status_name = (status_val or "").lower()
-        if row_action == target_action and status_name in open_statuses:
-            print(f"collector self-report: '{action[:60]}' already open — skipping create",
-                  file=sys.stderr)
-            return None
-
-    today = datetime.now(timezone.utc).date().isoformat()
-    fields = {
-        F_AI_ACTION:        action,
-        F_AI_SOURCE:        "Collector Self-Report",
-        F_AI_SOURCE_SECTION:source_section,
-        F_AI_DATE_CREATED:  today,
-        F_AI_PRIORITY:      priority,
-        F_AI_EFFORT:        effort,
-        F_AI_STATUS:        "New",
-        F_AI_DESCRIPTION:   description,
-        F_AI_PROMPT:        prompt,
-    }
-    created = at_create(AIRTABLE_BASE, TABLE_ACTION_ITEMS, [fields], at_key)
-    if created:
-        print(f"collector self-report: filed Action Item '{action[:60]}'")
-    return created
-
-
-def create_collector_action_item_model_not_found(at_key, model_slug, error_excerpt):
-    """Specialized Action Item for 'classifier model slug no longer exists'."""
-    action = (
-        f"OpenRouter: classifier model '{model_slug}' returned 404 — "
-        f"update AI Models row to a currently-available slug"
-    )
-    description = (
-        f"The intel collector's configured classifier model is no longer available "
-        f"on OpenRouter. HTTP 404 response (excerpt): {error_excerpt[:250]}\n\n"
-        f"Effect: pre-classifier is disabled for this run. ALL new items pass through "
-        f"to Claude's brief review on Monday (~4-5x cost increase).\n\n"
-        f"Fix: in Airtable base app6biS7yjV6XzFVG, table 'AI Models', find the row "
-        f"where 'Currently In Use For' contains 'intel pre-classifier'. Update its "
-        f"Slug field to a currently-live model. See OpenRouter's live model list "
-        f"(https://openrouter.ai/api/v1/models — filter for :free if free tier preferred)."
-    )
-    prompt = (
-        "First, read /Users/ben/Documents/Claude OS/Work/Engineering Ops/prompts/hypebase-primer.md for project context. Then:\n\n"
-        "Task: Replace the deprecated classifier model slug in the Airtable AI Models table.\n\n"
-        "Steps:\n"
-        "1. Open Airtable base `app6biS7yjV6XzFVG`, table 'AI Models'\n"
-        "2. Find the row where `Currently In Use For` contains 'intel pre-classifier'\n"
-        f"3. Current slug (no longer live on OpenRouter): {model_slug}\n"
-        "4. Fetch current model list:\n"
-        "   `curl -s https://openrouter.ai/api/v1/models | "
-        "python3 -c \"import json,sys; [print(m['id']) for m in "
-        "json.load(sys.stdin)['data'] if m['id'].endswith(':free')]\"`\n"
-        "5. Pick a suitable replacement. Criteria (in priority order):\n"
-        "   - General instruct model (not code-specific, not vision)\n"
-        "   - 30B+ parameters ideally\n"
-        "   - Stable (avoid ':preview' or ':nightly' variants)\n"
-        "   - Free tier preferred (matches current setup) — otherwise pick cheap paid\n"
-        "6. Update the Slug field on the Airtable row\n"
-        "7. Also update Name, Notes to reflect the new model\n\n"
-        "Done criteria:\n"
-        "- AI Models row updated to a currently-available model slug\n"
-        "- Next intel-collector run completes with no 'No endpoints found' WARN in logs\n"
-        "- This Action Item Status = Done, Outcome = 'Swapped to <new-slug>'"
-    )
-    return create_collector_action_item(
-        at_key, action, description, prompt,
-        priority="High", effort="S",
-        source_section="OpenRouter classifier model deprecated",
-    )
-
-
-def create_collector_action_item_keys_exhausted(at_key, exhausted):
-    """Specialized Action Item for 'all OpenRouter keys exhausted' scenario."""
-    action = (
-        f"OpenRouter: all {len(exhausted)} account key(s) are rate-limited or "
-        f"exhausted — provide a new account key"
-    )
-    exhaust_lines = "\n".join(
-        f"- key suffix ...{e['suffix']}: HTTP {e['status']}"
-        for e in exhausted
-    )
-    description = (
-        f"The intel collector hit rate-limit / quota / auth errors on every configured "
-        f"OpenRouter key during pre-classification. Without a working key, the Monday "
-        f"intel brief reviews ALL Pending items with Claude Sonnet (expensive) instead "
-        f"of only survivors (~75% cost increase).\n\n"
-        f"Retired keys this run:\n{exhaust_lines}\n\n"
-        f"Fix: create a new OpenRouter account + API key, add the key to the "
-        f"Airtable Logins & Keys 'Open Router' row's Keys field "
-        f"(append a new 'email:\\nsk-or-...' block), save. Next collector run picks it up."
-    )
-    prompt = (
-        "First, read /Users/ben/Documents/Claude OS/Work/Engineering Ops/prompts/hypebase-primer.md for project context. Then:\n\n"
-        "Task: Add a new OpenRouter account key to the Airtable Logins & Keys rotation "
-        "so the intel collector's pre-classifier keeps working.\n\n"
-        "Steps:\n"
-        "1. Go to https://openrouter.ai/ and sign up with a new email (you have previous "
-        "accounts noted in Airtable Logins & Keys 'Open Router' row — use a different one)\n"
-        "2. Visit https://openrouter.ai/keys and create a key named "
-        "'HypeBase intel collector - rotation N' (where N is the next unused index)\n"
-        "3. Copy the key (`sk-or-v1-...`)\n"
-        "4. Open Airtable base app6biS7yjV6XzFVG, table 'Logins & Keys', row 'Open Router'. "
-        "Edit the Keys field and APPEND a new block at the bottom:\n"
-        "   ```\n   <new-email>:\n   sk-or-v1-<pasted-key>\n   ```\n"
-        "5. Save. The collector loads all keys from this field on next run and falls "
-        "through them on rate-limit.\n\n"
-        "Done criteria:\n"
-        "- Airtable Logins & Keys 'Open Router' row has N+1 keys in its Keys field "
-        "(visible as additional sk-or- lines)\n"
-        "- This Action Item Status = Done, Outcome = 'Added rotation key ...XXXX "
-        "(suffix of new key) from <email>'"
-    )
-    return create_collector_action_item(
-        at_key, action, description, prompt,
-        priority="High", effort="S",
-        source_section="OpenRouter key rotation exhausted",
-    )
-
-
-def get_openrouter_keys_from_airtable(at_key):
-    """Fetch ALL OpenRouter keys from the Airtable Logins & Keys table.
-
-    Searches rows whose Name matches any OpenRouter variant and extracts every
-    line starting with 'sk-or-' from the Keys field. Supports multiple keys
-    per row (email-prefixed pattern like Tavily uses) and multiple rows.
-
-    Falls back to OPENROUTER_API_KEY env var if Airtable lookup yields nothing.
-    Returns a (possibly empty) list. Never logs the values.
-    """
-    keys = []
-    seen = set()  # de-dup across rows
-    try:
-        rows = at_list_all(
-            AIRTABLE_BASE, TABLE_LOGINS_KEYS, [F_LK_NAME, F_LK_KEYS], at_key
-        )
-    except Exception as e:
-        print(f"WARN openrouter keys airtable lookup: {e}", file=sys.stderr)
-        rows = []
-    for r in rows:
-        f = r.get("fields", {}) or {}
-        name = (f.get(F_LK_NAME) or "").strip().lower().replace(" ", "")
-        if name not in ("openrouter", "open-router", "openrouterapikey"):
-            continue
-        keys_text = f.get(F_LK_KEYS) or ""
-        for line in keys_text.splitlines():
-            line = line.strip()
-            if line.startswith("sk-or-") and line not in seen:
-                keys.append(line)
-                seen.add(line)
-    if not keys:
-        env_val = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
-        if env_val and env_val not in seen:
-            keys.append(env_val)
-            print(f"openrouter keys: loaded 1 from env (suffix=...{env_val[-4:]})")
-            return keys
-        print("WARN openrouter: no keys found in Airtable or env — pre-classifier disabled",
-              file=sys.stderr)
-        return []
-    print(f"openrouter keys: loaded {len(keys)} from Airtable (suffixes: " +
-          ", ".join(f"...{k[-4:]}" for k in keys) + ")")
-    return keys
-
-
-def get_classifier_model_from_airtable(at_key):
-    """Find the slug for the intel pre-classifier in AI Models table.
-
-    Matches rows where `Currently In Use For` contains 'intel pre-classifier'
-    (case-insensitive). Returns the Slug value of the first match, or falls
-    back to the OPENROUTER_MODEL constant.
-    """
-    try:
-        rows = at_list_all(AIRTABLE_BASE, TABLE_AI_MODELS,
-                           [F_AM_SLUG, F_AM_CURRENT_USE], at_key)
-    except Exception as e:
-        print(f"WARN classifier model lookup: {e}", file=sys.stderr)
-        return OPENROUTER_MODEL
-    for r in rows:
-        f = r.get("fields", {}) or {}
-        use = (f.get(F_AM_CURRENT_USE) or "").lower()
-        if "intel pre-classifier" in use or "pre-classifier" in use:
-            slug = (f.get(F_AM_SLUG) or "").strip()
-            if slug:
-                print(f"classifier model from Airtable: {slug}")
-                return slug
-    print(f"classifier model (fallback to default constant): {OPENROUTER_MODEL}")
-    return OPENROUTER_MODEL
-
-
-def pre_classify(items, openrouter_keys, model=None, at_key=None):
-    """Batch-classify items via OpenRouter. Takes a LIST of keys and rotates on
-    rate-limit / quota errors. Returns list of dicts in input order:
-    [{'decision': 'relevant'|'irrelevant'|'maybe', 'reason': str}, ...].
-
-    Safe to call with empty keys list or empty items. On any failure, returns
-    'maybe' for every item so nothing gets auto-dismissed on classifier errors.
-
-    If ALL keys are exhausted (all hitting 429/402/403), files a 'New' Action
-    Item in Airtable asking the user to provide a new account key, then returns
-    'maybe' for the remaining items.
-    """
-    if not items or not openrouter_keys:
-        return [{"decision": "maybe", "reason": "classifier disabled"} for _ in items]
-
-    # Backward compat: accept a single key string too
-    if isinstance(openrouter_keys, str):
-        openrouter_keys = [openrouter_keys]
-
-    model_slug = model or OPENROUTER_MODEL
-    available_keys = list(openrouter_keys)
-    exhausted = []  # track which keys have been retired for this run
-    current_key_idx = 0
-
-    results = [None] * len(items)
-    for start in range(0, len(items), PRE_CLASSIFY_BATCH_SIZE):
-        batch = items[start : start + PRE_CLASSIFY_BATCH_SIZE]
-        batch_in = [
-            {"id": i, "title": (it.get("title") or "")[:200],
-             "desc": (it.get("summary") or "")[:300]}
-            for i, it in enumerate(batch)
-        ]
-        prompt = (
-            f"You are filtering items for a strategic intelligence brief.\n\n"
-            f"CONTEXT: {HYPEBASE_CONTEXT_FOR_CLASSIFIER}\n\n"
-            f"For each item below, output one of: 'relevant', 'irrelevant', or 'maybe'. "
-            f"Be strict — mark as 'relevant' only if it clearly helps HypeBase. Mark "
-            f"'irrelevant' only if you're confident it doesn't help. Use 'maybe' when "
-            f"unsure — a human will re-check.\n\n"
-            f"INPUT (JSON): {json.dumps(batch_in)}\n\n"
-            f"OUTPUT: JSON array of the same length, in the same order, each element "
-            f"shaped like: {{\"decision\": \"relevant\"|\"irrelevant\"|\"maybe\", "
-            f"\"reason\": \"<=12 words\"}}\n"
-            f"No preamble, no markdown fences, just the JSON array."
-        )
-        body = json.dumps({
-            "model": model_slug,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1500,
-            "temperature": 0,
-        }).encode()
-
-        # Try keys in order. 429 (rate limit), 402 (insufficient credits),
-        # 403 (invalid/revoked key), 401 (auth failure) → retire key for this
-        # run, try next. 404 "No endpoints found" is a model-availability
-        # problem, not a key problem — handled separately below.
-        RETIRE_STATUSES = {401, 402, 403, 429}
-        status = 0
-        resp_body = b""
-        while current_key_idx < len(available_keys):
-            key = available_keys[current_key_idx]
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/bwbcollier-byte/rco_admin",
-                "X-Title": "HypeBase Intel Collector",
-            }
-            status, resp_body = http(OPENROUTER_URL, method="POST", headers=headers, body=body)
-            if status in RETIRE_STATUSES:
-                err_preview = resp_body[:120] if resp_body else b""
-                print(
-                    f"openrouter key ...{key[-4:]} retired at batch {start}: "
-                    f"HTTP {status} — trying next key",
-                    file=sys.stderr,
-                )
-                exhausted.append({"suffix": key[-4:], "status": status,
-                                  "error": err_preview.decode('utf-8', errors='replace')})
-                current_key_idx += 1
-                continue
-            break  # success or non-retirement error (incl. 404 model-not-found)
-
-        # 404 'No endpoints found' = configured model slug is gone from OpenRouter.
-        # Every subsequent batch will hit the same wall, so fail fast and file an
-        # Action Item pointing to the Airtable row that needs updating.
-        if status == 404 and b"No endpoints found" in (resp_body or b""):
-            err_text = resp_body.decode("utf-8", errors="replace") if resp_body else ""
-            print(
-                f"WARN pre_classify: model '{model_slug}' returned 404 — bailing out "
-                f"and filing Action Item to update the Airtable AI Models row.",
-                file=sys.stderr,
-            )
-            if at_key:
-                create_collector_action_item_model_not_found(at_key, model_slug, err_text)
-            for i in range(start, len(items)):
-                if results[i] is None:
-                    results[i] = {"decision": "maybe",
-                                  "reason": f"classifier model '{model_slug}' not found"}
-            break
-
-        # All keys tried?
-        if current_key_idx >= len(available_keys):
-            print("WARN pre_classify: ALL OpenRouter keys exhausted — filing Action Item",
-                  file=sys.stderr)
-            if at_key:
-                create_collector_action_item_keys_exhausted(at_key, exhausted)
-            # Remaining items get 'maybe'
-            for i in range(start, len(items)):
-                if results[i] is None:
-                    results[i] = {"decision": "maybe", "reason": "all classifier keys exhausted"}
-            break  # stop processing further batches
-
-        if status >= 400:
-            print(f"WARN pre_classify batch {start}: {status} {resp_body[:200]!r}",
-                  file=sys.stderr)
-            for i in range(len(batch)):
-                results[start + i] = {"decision": "maybe", "reason": "classifier HTTP error"}
-            continue
-        try:
-            resp = json.loads(resp_body)
-            content = (resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-            # Strip markdown fences if model ignored the instruction
-            if content.startswith("```"):
-                fences = content.split("```")
-                if len(fences) >= 2:
-                    content = fences[1]
-                    if content.lower().startswith("json\n") or content.lower().startswith("json "):
-                        content = content[4:].lstrip()
-                    if content.endswith("\n"):
-                        content = content.rstrip()
-            parsed = json.loads(content)
-            if isinstance(parsed, list) and len(parsed) == len(batch):
-                for i, dec in enumerate(parsed):
-                    if not isinstance(dec, dict):
-                        dec = {"decision": "maybe", "reason": "malformed response item"}
-                    d = (dec.get("decision") or "").strip().lower()
-                    if d not in ("relevant", "irrelevant", "maybe"):
-                        d = "maybe"
-                    results[start + i] = {
-                        "decision": d,
-                        "reason": (dec.get("reason") or "")[:200],
-                    }
-            else:
-                raise ValueError(f"length mismatch: got {len(parsed) if isinstance(parsed, list) else 'non-list'}, want {len(batch)}")
-        except Exception as e:
-            print(f"WARN pre_classify batch {start} parse: {e}", file=sys.stderr)
-            for i in range(len(batch)):
-                results[start + i] = {"decision": "maybe", "reason": "classifier parse error"}
-        time.sleep(SLEEP)
-
-    # Fill any stragglers (shouldn't happen, but belt-and-braces)
-    for i, r in enumerate(results):
-        if r is None:
-            results[i] = {"decision": "maybe", "reason": "classifier incomplete"}
-
-    counts = {"relevant": 0, "irrelevant": 0, "maybe": 0}
-    for r in results:
-        counts[r["decision"]] = counts.get(r["decision"], 0) + 1
-    keys_used = min(current_key_idx + 1, len(available_keys)) if available_keys else 0
-    print(f"pre_classify: relevant={counts['relevant']} "
-          f"irrelevant={counts['irrelevant']} maybe={counts['maybe']} "
-          f"(model={model_slug}, {len(items)} items, keys_used={keys_used}/{len(available_keys)})")
-    return results
-
-
-def apply_pre_classification(records, source_items, decisions,
-                             decision_field, irrelevant_value,
-                             reason_field=None):
-    """Mutate records in place: for items the pre-classifier flagged 'irrelevant',
-    set the given decision field to the irrelevant_value and optionally append a
-    reason to the given notes field. records and source_items are parallel lists —
-    source_items is what went INTO pre_classify; records is what goes INTO Airtable."""
-    if not decisions:
-        return 0
-    skipped = 0
-    for rec, dec in zip(records, decisions):
-        if dec.get("decision") != "irrelevant":
-            continue
-        rec[decision_field] = irrelevant_value
-        if reason_field:
-            suffix = f"[Pre-classified {irrelevant_value}: {dec.get('reason', 'irrelevant')}]"
-            existing = rec.get(reason_field, "")
-            rec[reason_field] = f"{existing}\n{suffix}".strip() if existing else suffix
-        skipped += 1
-    return skipped
 
 
 def at_update(base, table, updates, key_token):
@@ -1738,44 +1345,29 @@ def collect_hf_trending(at_key, today):
 # ---------- Gemini evaluation ----------
 
 def get_gemini_keys_from_airtable(at_key):
-    """Fetch ALL Gemini API keys from 'Google AI Studio' rows in Logins & Keys.
-    Each row's Keys field may contain multiple AIzaSy... keys, one per line.
-    Falls back to GEMINI_API_KEY env var. Returns a list (possibly empty).
+    """Fetch ALL Gemini API keys from the Credentials table.
+    Looks for rows whose Value field starts with 'AIzaSy'.
+    Falls back to GEMINI_API_KEY env var if none found.
     Never logs key values.
     """
     keys = []
     seen = set()
     try:
-        rows = at_list_all(AIRTABLE_BASE, TABLE_LOGINS_KEYS,
-                           [F_LK_NAME, F_LK_KEYS], at_key)
+        rows = at_list_all(AIRTABLE_BASE, TABLE_CREDENTIALS,
+                           [F_CRED_NAME, F_CRED_VALUE, F_CRED_STATUS], at_key)
     except Exception as e:
         print(f"WARN gemini key lookup: {e}", file=sys.stderr)
         rows = []
-    print(f"DEBUG gemini key lookup: {len(rows)} total rows in Logins & Keys")
     for r in rows:
         f = r.get("fields", {}) or {}
-        name = (f.get(F_LK_NAME) or "").strip().lower().replace(" ", "")
-        raw_name = (f.get(F_LK_NAME) or "").strip()
-        if "googleaistudio" in name or "gemini" in name:
-            raw_val = f.get(F_LK_KEYS) or ""
-            lines = raw_val.splitlines()
-            print(f"DEBUG gemini row '{raw_name}': {len(lines)} lines, "
-                  f"repr={repr(raw_val[:80])}")
-            for line in lines:
-                line = line.strip()
-                # Handle "Key: AIzaSy..." or bare "AIzaSy..." formats
-                key_val = line
-                if ":" in line:
-                    candidate = line.split(":", 1)[1].strip()
-                    if candidate.startswith("AIzaSy"):
-                        key_val = candidate
-                if key_val.startswith("AIzaSy") and key_val not in seen:
-                    keys.append(key_val)
-                    seen.add(key_val)
-    if not keys:
-        env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
-        if env_val and env_val not in seen:
-            keys.append(env_val)
+        val = (f.get(F_CRED_VALUE) or "").strip()
+        if val.startswith("AIzaSy") and val not in seen:
+            keys.append(val)
+            seen.add(val)
+    env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if env_val and env_val not in seen:
+        keys.append(env_val)
+        seen.add(env_val)
     if keys:
         print(f"gemini keys: loaded {len(keys)} "
               f"(suffixes: {', '.join('...' + k[-4:] for k in keys)})")
