@@ -1757,9 +1757,15 @@ def get_gemini_keys_from_airtable(at_key):
         if "googleaistudio" in name or "gemini" in name:
             for line in (f.get(F_LK_KEYS) or "").splitlines():
                 line = line.strip()
-                if line.startswith("AIzaSy") and line not in seen:
-                    keys.append(line)
-                    seen.add(line)
+                # Handle "Key: AIzaSy..." or bare "AIzaSy..." formats
+                key_val = line
+                if ":" in line:
+                    candidate = line.split(":", 1)[1].strip()
+                    if candidate.startswith("AIzaSy"):
+                        key_val = candidate
+                if key_val.startswith("AIzaSy") and key_val not in seen:
+                    keys.append(key_val)
+                    seen.add(key_val)
     if not keys:
         env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
         if env_val and env_val not in seen:
