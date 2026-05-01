@@ -1,0 +1,32 @@
+name: PK Review
+
+on:
+  schedule:
+    - cron: "0 23 * * *"   # Daily 23:00 UTC = 09:00 AEST
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pk-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run PK review
+        env:
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          AIRTABLE_API_KEY:     ${{ secrets.AIRTABLE_API_KEY }}
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          TRIAGE_SLACK_WEBHOOK: ${{ secrets.TRIAGE_SLACK_WEBHOOK }}
+        run: python scripts/pk_review.py
