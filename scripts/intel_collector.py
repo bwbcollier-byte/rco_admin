@@ -185,13 +185,6 @@ F_AM_LAST_CHECKED = "fldKPsV3LzTay0uMp"
 F_AM_FIRST_FOUND  = "fldtOn58LpHE9iSIx"
 F_AM_NOTES        = "fldyJklFGPg5tuTyn"
 
-# OpenRouter pre-classifier config
-# Default model only used if no AI Models row is marked `Currently In Use For` =
-# 'intel pre-classifier'. Qwen 2.5 72B free is the current default.
-OPENROUTER_MODEL = "qwen/qwen-2.5-72b-instruct:free"
-OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
-PRE_CLASSIFY_BATCH_SIZE = 15
-
 # Providers worth tracking in AI Models. OpenRouter's catalog has 300+ models
 # across many providers; we only upsert rows for these to keep the table focused.
 INTERESTING_MODEL_PROVIDERS = {
@@ -1121,7 +1114,7 @@ def at_update(base, table, updates, key_token):
 
 # ---------- Collectors ----------
 
-def collect_platform_updates(at_key, gh_token, today, openrouter_keys=None, classifier_model=None):
+def collect_platform_updates(at_key, gh_token, today):
     """Read Monitored Platforms from Airtable, dispatch to the right fetcher
     based on Check Method, write findings to Platform Updates, and update
     Last Checked / Last Finding Date on each platform row."""
@@ -1194,27 +1187,16 @@ def collect_platform_updates(at_key, gh_token, today, openrouter_keys=None, clas
             update_fields[F_M_LAST_FINDING] = today
         platform_updates.append({"id": p["id"], "fields": update_fields})
 
-    # Pre-classify before upsert. Source_items carry the title/summary used for
-    # classification; new_records are the actual Airtable payloads we mutate.
-    source_items = [{"title": r[F_IF_TITLE], "summary": r.get(F_IF_SUMMARY, "")} for r in new_records]
-    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
-    skipped = apply_pre_classification(
-        new_records, source_items, decisions,
-        F_IF_DECISION, "Ignore",
-        # No per-item notes field for Platform Updates; reason dropped intentionally
-    )
-    print(f"platform pre-classify: auto-Ignored {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, new_records, at_key)
     at_update(AIRTABLE_BASE, TABLE_MONITORED, platform_updates, at_key)
     print(f"platform: {created} created (of {len(new_records)} candidates)")
     print(f"monitored_platforms: {len(platform_updates)} Last Checked dates updated")
 
 
-def collect_ai_news(at_key, today, openrouter_keys=None, classifier_model=None):
+def collect_ai_news(at_key, today):
     # Dedup against Intel Feed (replaces old TABLE_NEWS)
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_INTEL_FEED, F_IF_TITLE, at_key)
     records = []
-    source_items = []
     for it in hn_top(AI_KEYWORDS):
         title = it["title"][:250]
         if title.strip().lower() in seen:
@@ -1233,23 +1215,15 @@ def collect_ai_news(at_key, today, openrouter_keys=None, classifier_model=None):
         if d:
             fields[F_IF_DATE_PUB] = d
         records.append(fields)
-        source_items.append({"title": title, "summary": it.get("summary", "")})
 
-    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
-    skipped = apply_pre_classification(
-        records, source_items, decisions,
-        F_IF_DECISION, "Dismiss", F_IF_NOTES,
-    )
-    print(f"ai_news pre-classify: auto-Dismissed {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, records, at_key)
     print(f"ai_news: {created} created (of {len(records)} candidates)")
 
 
-def collect_deals(at_key, today, openrouter_keys=None, classifier_model=None):
+def collect_deals(at_key, today):
     # Dedup against Intel Feed (replaces old TABLE_DEALS)
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_INTEL_FEED, F_IF_TITLE, at_key)
     records = []
-    source_items = []
     status, body = http("https://www.producthunt.com/feed")
     if status < 400:
         kw_lc = [k.lower() for k in DEAL_KEYWORDS]
@@ -1270,21 +1244,14 @@ def collect_deals(at_key, today, openrouter_keys=None, classifier_model=None):
                 F_IF_DESCRIPTION: it.get("summary", ""),
                 F_IF_DECISION:    "Pending",
             })
-            source_items.append({"title": title, "summary": it.get("summary", "")})
     else:
         print(f"WARN producthunt rss: {status}", file=sys.stderr)
 
-    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
-    skipped = apply_pre_classification(
-        records, source_items, decisions,
-        F_IF_DECISION, "Skip", F_IF_NOTES,
-    )
-    print(f"deals pre-classify: auto-Skipped {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, records, at_key)
     print(f"deals: {created} created (of {len(records)} candidates)")
 
 
-def collect_skills(at_key, gh_token, today, openrouter_keys=None, classifier_model=None):
+def collect_skills(at_key, gh_token, today):
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_SKILLS, F_S_NAME, at_key)
     records = []
     stats = {"topic": 0, "watched": 0, "awesome": 0}
@@ -1347,15 +1314,6 @@ def collect_skills(at_key, gh_token, today, openrouter_keys=None, classifier_mod
             })
             stats["awesome"] += 1
 
-    # Skills uses Type (not Decision) as its state field. Pre-classifier irrelevants
-    # get Type=Rejected instead of staying Discovered.
-    source_items = [{"title": r[F_S_NAME], "summary": r.get(F_S_DESC, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
-    skipped = apply_pre_classification(
-        records, source_items, decisions,
-        F_S_TYPE, "Rejected", F_S_AUDIT_NOTES,
-    )
-    print(f"skills pre-classify: auto-Rejected {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_SKILLS, records, at_key)
     print(
         f"skills: {created} created "
@@ -1380,7 +1338,7 @@ def dismiss_irrelevant_pending_apis(at_key):
     return 0
 
 
-def collect_apis(at_key, today, openrouter_keys=None, classifier_model=None):
+def collect_apis(at_key, today):
     """Fetch from public-apis README + publicapis.dev API, filter by relevant
     categories, upsert to APIs table."""
 
@@ -1429,14 +1387,6 @@ def collect_apis(at_key, today, openrouter_keys=None, classifier_model=None):
             F_A2_STATUS:    "Discovered",
             F_A2_DECISION:  "Pending",
         })
-    # New APIs table has no Notes field; pass None for reason_field.
-    source_items = [{"title": r[F_A2_NAME], "summary": r.get(F_A2_ABOUT, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
-    skipped = apply_pre_classification(
-        records, source_items, decisions,
-        F_A2_DECISION, "Skip",
-    )
-    print(f"apis pre-classify: auto-Skipped {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_APIS_V2, records, at_key)
     print(f"apis: {created} created (of {len(records)} candidates)")
 
@@ -1754,7 +1704,7 @@ def collect_ai_models(at_key, today):
     )
 
 
-def collect_hf_trending(at_key, today, openrouter_keys=None, classifier_model=None):
+def collect_hf_trending(at_key, today):
     """Pull HF trending models into Intel Feed as Feed Type='AI News'."""
     # Dedup against Intel Feed (replaces old TABLE_NEWS)
     seen = at_existing_titles(AIRTABLE_BASE, TABLE_INTEL_FEED, F_IF_TITLE, at_key)
@@ -1778,13 +1728,6 @@ def collect_hf_trending(at_key, today, openrouter_keys=None, classifier_model=No
             fields[F_IF_DATE_PUB] = d
         records.append(fields)
 
-    source_items = [{"title": r[F_IF_TITLE], "summary": r.get(F_IF_SUMMARY, "")} for r in records]
-    decisions = pre_classify(source_items, openrouter_keys, classifier_model, at_key=at_key)
-    skipped = apply_pre_classification(
-        records, source_items, decisions,
-        F_IF_DECISION, "Dismiss", F_IF_NOTES,
-    )
-    print(f"hf_trending pre-classify: auto-Dismissed {skipped} irrelevant items")
     created = at_create(AIRTABLE_BASE, TABLE_INTEL_FEED, records, at_key)
     print(f"hf_trending: {created} created (of {len(records)} candidates)")
 
@@ -2089,18 +2032,16 @@ def main():
     print(f"DEBUG: AIRTABLE_API_KEY len={len(at_key)} suffix=...{at_key[-4:]}")
     print(f"DEBUG: TRIAGE_GH_TOKEN  len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
-    openrouter_keys  = get_openrouter_keys_from_airtable(at_key)
-    classifier_model = get_classifier_model_from_airtable(at_key) if openrouter_keys else None
-    gemini_key       = get_gemini_key_from_airtable(at_key)
+    gemini_key = get_gemini_key_from_airtable(at_key)
 
-    # --- Collection pass (Qwen pre-classifier filters noise at write time) ---
-    collect_platform_updates(at_key, gh_token, today, openrouter_keys, classifier_model)
-    collect_ai_news(at_key, today, openrouter_keys, classifier_model)
-    collect_hf_trending(at_key, today, openrouter_keys, classifier_model)
-    collect_deals(at_key, today, openrouter_keys, classifier_model)
-    collect_skills(at_key, gh_token, today, openrouter_keys, classifier_model)
+    # --- Collection pass (Gemini evaluation pass runs after to filter noise) ---
+    collect_platform_updates(at_key, gh_token, today)
+    collect_ai_news(at_key, today)
+    collect_hf_trending(at_key, today)
+    collect_deals(at_key, today)
+    collect_skills(at_key, gh_token, today)
     dismiss_irrelevant_pending_apis(at_key)   # no-op on new table; safe to call
-    collect_apis(at_key, today, openrouter_keys, classifier_model)
+    collect_apis(at_key, today)
 
     # --- Gemini evaluation pass (pre-fills fields so intel-brief is review-only) ---
     if gemini_key:
