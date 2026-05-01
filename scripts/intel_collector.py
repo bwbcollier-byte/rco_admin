@@ -2090,7 +2090,7 @@ def main():
     print(f"DEBUG: TRIAGE_GH_TOKEN  len={len(gh_token)} suffix=...{gh_token[-4:]}")
 
     openrouter_keys  = get_openrouter_keys_from_airtable(at_key)
-    classifier_model = get_classifier_model_from_airtable(at_key)
+    classifier_model = get_classifier_model_from_airtable(at_key) if openrouter_keys else None
     gemini_key       = get_gemini_key_from_airtable(at_key)
 
     # --- Collection pass (Qwen pre-classifier filters noise at write time) ---
