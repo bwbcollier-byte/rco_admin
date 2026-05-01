@@ -2106,21 +2106,12 @@ def main():
     else:
         print("gemini evaluation: skipped (no keys)")
 
-    # Refresh AI Models catalog — wrapped in try/except while field IDs are being resolved
-    # (TABLE_AI_MODELS was renamed April 2026; field schema pending audit).
-    try:
-        collect_ai_models(at_key, today)
-    except Exception as e:
-        print(f"WARN collect_ai_models skipped: {e}", file=sys.stderr)
-    try:
-        collect_hf_models(at_key, today)
-    except Exception as e:
-        print(f"WARN collect_hf_models skipped: {e}", file=sys.stderr)
-    # Discover new AI Apps from FutureTools + Futurepedia sitemaps.
-    try:
-        collect_ai_apps(at_key, today)
-    except Exception as e:
-        print(f"WARN collect_ai_apps skipped: {e}", file=sys.stderr)
+    # AI Models + AI Apps collectors are DISABLED pending field ID audit on tblzehtQS5H1TKlSP.
+    # Re-enable once correct field IDs are confirmed (April 2026 schema migration).
+    # collect_ai_models(at_key, today)
+    # collect_hf_models(at_key, today)
+    # collect_ai_apps(at_key, today)
+    print("collect_ai_models/hf_models/ai_apps: skipped (field IDs pending audit)")
 
 
 if __name__ == "__main__":
