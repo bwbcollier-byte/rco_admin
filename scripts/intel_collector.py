@@ -1751,11 +1751,17 @@ def get_gemini_keys_from_airtable(at_key):
     except Exception as e:
         print(f"WARN gemini key lookup: {e}", file=sys.stderr)
         rows = []
+    print(f"DEBUG gemini key lookup: {len(rows)} total rows in Logins & Keys")
     for r in rows:
         f = r.get("fields", {}) or {}
         name = (f.get(F_LK_NAME) or "").strip().lower().replace(" ", "")
+        raw_name = (f.get(F_LK_NAME) or "").strip()
         if "googleaistudio" in name or "gemini" in name:
-            for line in (f.get(F_LK_KEYS) or "").splitlines():
+            raw_val = f.get(F_LK_KEYS) or ""
+            lines = raw_val.splitlines()
+            print(f"DEBUG gemini row '{raw_name}': {len(lines)} lines, "
+                  f"repr={repr(raw_val[:80])}")
+            for line in lines:
                 line = line.strip()
                 # Handle "Key: AIzaSy..." or bare "AIzaSy..." formats
                 key_val = line
