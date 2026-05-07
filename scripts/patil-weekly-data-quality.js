@@ -30,20 +30,30 @@ const today = new Date().toISOString().split('T')[0];
 
 async function getHypeBaseQuality() {
   try {
-    // NOTE: Verify table name — may be hb_artists
-    const { data, error } = await supabase
-      .from('hb_talent')
-      .select('updated_at, spotify_id', { count: 'exact' });
-    if (error) throw error;
-
-    const total = data.length;
     const now = new Date();
     const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
     const oneWeekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
 
-    const freshLast30d = data.filter(r => r.updated_at && new Date(r.updated_at) > thirtyDaysAgo).length;
-    const updatedThisWeek = data.filter(r => r.updated_at && new Date(r.updated_at) > oneWeekAgo).length;
-    const hasSpotify = data.filter(r => r.spotify_id).length;
+    // Use server-side counts — avoids fetching all 1.6M rows
+    const { count: total, error: totalError } = await supabase
+      .from('hb_talent').select('*', { count: 'exact', head: true });
+    if (totalError) throw totalError;
+
+    const { count: freshLast30d, error: freshError } = await supabase
+      .from('hb_talent').select('*', { count: 'exact', head: true })
+      .gte('updated_at', thirtyDaysAgo.toISOString());
+    if (freshError) throw freshError;
+
+    const { count: updatedThisWeek, error: weekError } = await supabase
+      .from('hb_talent').select('*', { count: 'exact', head: true })
+      .gte('updated_at', oneWeekAgo.toISOString());
+    if (weekError) throw weekError;
+
+    // soc_spotify is the correct column name (not spotify_id)
+    const { count: hasSpotify, error: spotifyError } = await supabase
+      .from('hb_talent').select('*', { count: 'exact', head: true })
+      .not('soc_spotify', 'is', null);
+    if (spotifyError) throw spotifyError;
 
     return {
       total,
@@ -67,15 +77,11 @@ async function getFitspireSignals() {
     const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
     const oneWeekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
 
-    // DAU and MAU
-    const [{ data: dauData }, { data: mauData }] = await Promise.all([
-      supabase.from('fs_events').select('user_id').gte('created_at', todayStart.toISOString()),
-      supabase.from('fs_events').select('user_id').gte('created_at', thirtyDaysAgo.toISOString())
-    ]);
-
-    const dau = new Set((dauData || []).map(r => r.user_id)).size;
-    const mau = new Set((mauData || []).map(r => r.user_id)).size;
-    const stickyFactor = mau > 0 ? Math.round(dau / mau * 100 * 10) / 10 : 0;
+    // fs_events is a store/marketing events table — user analytics not yet instrumented
+    // DAU/MAU unavailable until user activity tracking is added
+    const dau = null;
+    const mau = null;
+    const stickyFactor = null;
 
     const { count: newUsers } = await supabase
       .from('fs_profiles')

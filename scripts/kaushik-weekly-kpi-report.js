@@ -43,21 +43,28 @@ const today = new Date().toISOString().split('T')[0];
 
 async function getHypeBaseStats() {
   try {
-    // Total artist count and freshness
-    // NOTE: Verify table name — may be hb_talent, hb_profiles, or similar
-    const { data: overview, error: overviewError } = await supabase
-      .from('hb_talent')
-      .select('updated_at', { count: 'exact' });
-
-    if (overviewError) throw overviewError;
-
-    const totalArtists = overview.length;
     const now = new Date();
     const oneWeekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
     const oneDayAgo = new Date(now - 24 * 60 * 60 * 1000);
 
-    const updatedThisWeek = overview.filter(r => new Date(r.updated_at) > oneWeekAgo).length;
-    const updatedToday = overview.filter(r => new Date(r.updated_at) > oneDayAgo).length;
+    // Use server-side counts to avoid fetching 1.6M rows
+    const { count: totalArtists, error: totalError } = await supabase
+      .from('hb_talent')
+      .select('*', { count: 'exact', head: true });
+    if (totalError) throw totalError;
+
+    const { count: updatedThisWeek, error: weekError } = await supabase
+      .from('hb_talent')
+      .select('*', { count: 'exact', head: true })
+      .gte('updated_at', oneWeekAgo.toISOString());
+    if (weekError) throw weekError;
+
+    const { count: updatedToday, error: dayError } = await supabase
+      .from('hb_talent')
+      .select('*', { count: 'exact', head: true })
+      .gte('updated_at', oneDayAgo.toISOString());
+    if (dayError) throw dayError;
+
     const weeklyFreshnessPct = totalArtists > 0
       ? Math.round(updatedThisWeek / totalArtists * 100 * 10) / 10
       : 0;
@@ -96,39 +103,29 @@ async function getHypeBaseStats() {
 
 async function getFitspireStats() {
   try {
-    // NOTE: Verify table names — may differ from fs_events / fs_users
     const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
-
-    // DAU — distinct users with an event today
-    const { data: dauData, error: dauError } = await supabase
-      .from('fs_events')
-      .select('user_id')
-      .gte('created_at', todayStart.toISOString());
-    if (dauError) throw dauError;
-
-    const dau = new Set(dauData.map(r => r.user_id)).size;
-
-    // MAU — distinct users last 30 days
-    const { data: mauData, error: mauError } = await supabase
-      .from('fs_events')
-      .select('user_id')
-      .gte('created_at', thirtyDaysAgo.toISOString());
-    if (mauError) throw mauError;
-
-    const mau = new Set(mauData.map(r => r.user_id)).size;
-    const stickyFactor = mau > 0 ? Math.round(dau / mau * 100 * 10) / 10 : 0;
-
-    // New sign-ups this week
     const oneWeekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+    // fs_events is a store/marketing events table — user analytics not yet instrumented
+    // Only query what exists: new profile sign-ups this week
     const { count: newInstalls, error: installError } = await supabase
       .from('fs_profiles')
       .select('*', { count: 'exact', head: true })
       .gte('created_at', oneWeekAgo.toISOString());
     if (installError) throw installError;
 
-    return { dau, mau, stickyFactor, newInstalls: newInstalls || 0, error: null };
+    const { count: totalProfiles, error: totalError } = await supabase
+      .from('fs_profiles')
+      .select('*', { count: 'exact', head: true });
+    if (totalError) throw totalError;
+
+    return {
+      dau: null, mau: null, stickyFactor: null,
+      newInstalls: newInstalls || 0,
+      totalProfiles: totalProfiles || 0,
+      note: 'DAU/MAU unavailable — user activity events table not yet instrumented',
+      error: null
+    };
   } catch (err) {
     console.warn('⚠️  Fitspire stats error:', err.message);
     return { error: err.message };
