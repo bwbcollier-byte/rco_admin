@@ -1,0 +1,32 @@
+name: McCord — Monthly Hiring Readiness Check
+
+on:
+  schedule:
+    # First Monday of each month, 7:00am AEST (Sunday 9pm UTC)
+    # Runs every Monday; script checks if it's the first Monday of the month
+    - cron: '0 21 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — generate brief but do not post to Slack'
+        required: false
+        default: 'false'
+
+jobs:
+  monthly-hiring-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install @anthropic-ai/sdk airtable axios
+      - name: Run monthly hiring readiness check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: node scripts/mccord-monthly-hiring.js

@@ -1,0 +1,31 @@
+name: Patel — Weekly Paid Media Report
+
+on:
+  schedule:
+    # Thursday 10pm UTC = Friday 8am AEST
+    - cron: '0 22 * * 4'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — generate report but do not post to Slack'
+        required: false
+        default: 'false'
+
+jobs:
+  weekly-paid-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install @anthropic-ai/sdk airtable axios
+      - name: Run weekly paid media report
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_GROWTH_MARKETING: ${{ secrets.SLACK_CHANNEL_GROWTH_MARKETING }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: node scripts/patel-weekly-paid-media.js

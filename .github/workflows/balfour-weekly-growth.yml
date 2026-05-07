@@ -1,0 +1,33 @@
+name: Balfour — Weekly Growth Brief
+
+on:
+  schedule:
+    # Thursday 9pm UTC = Friday 7am AEST — synthesises Kaushik (Mon) + Patil (Thu) data
+    - cron: '0 21 * * 4'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — generate brief but do not post to Slack'
+        required: false
+        default: 'false'
+
+jobs:
+  weekly-growth-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install @anthropic-ai/sdk @supabase/supabase-js airtable axios
+      - name: Run weekly growth brief
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_GROWTH_MARKETING: ${{ secrets.SLACK_CHANNEL_GROWTH_MARKETING }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: node scripts/balfour-weekly-growth.js
