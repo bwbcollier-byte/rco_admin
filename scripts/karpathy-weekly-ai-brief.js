@@ -188,7 +188,7 @@ async function main() {
   try {
     console.log('⏳ Fetching AI/ML news...');
     const data = await getAIData();
-    console.log(`Fetched: ${data.anthropicNews.length} Anthropic items, ${data.hfPapers.length} HF papers`);
+    console.log(`Fetched: ${data.openaiNews.length} OpenAI items, ${data.hfPapers.length} HF papers`);
 
     console.log('⏳ Generating Karpathy brief...');
     const brief = await generateBrief(data);
