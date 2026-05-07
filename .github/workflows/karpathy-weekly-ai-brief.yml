@@ -1,0 +1,39 @@
+name: Karpathy — Weekly AI/ML Brief
+
+on:
+  schedule:
+    # Tuesday 9pm UTC = Wednesday 7am AEST (UTC+10)
+    - cron: '0 21 * * 2'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — generate brief but do not post to Slack'
+        required: false
+        default: 'false'
+
+jobs:
+  weekly-ai-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install @anthropic-ai/sdk airtable axios
+
+      - name: Run weekly AI brief
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: node scripts/karpathy-weekly-ai-brief.js
