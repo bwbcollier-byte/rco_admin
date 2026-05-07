@@ -33,11 +33,10 @@ const today = new Date().toISOString().split('T')[0];
 
 // ── Data Collection ─────────────────────────────────────────────────────────
 
-async function fetchAnthropicBlog() {
+async function fetchOpenAIBlog() {
   try {
-    // Anthropic news RSS
-    const response = await axios.get('https://www.anthropic.com/news/rss.xml', { timeout: 10000 });
-    // Extract titles and snippets from RSS XML (simple parse)
+    // OpenAI news RSS (reliable public feed)
+    const response = await axios.get('https://openai.com/news/rss.xml', { timeout: 10000 });
     const items = [];
     const matches = response.data.matchAll(/<item>[\s\S]*?<title><!\[CDATA\[(.*?)\]\]><\/title>[\s\S]*?<pubDate>(.*?)<\/pubDate>[\s\S]*?<\/item>/g);
     let count = 0;
@@ -46,9 +45,19 @@ async function fetchAnthropicBlog() {
       items.push({ title: match[1], date: match[2] });
       count++;
     }
+    // Fallback: try plain <title> tags if CDATA not found
+    if (items.length === 0) {
+      const plain = response.data.matchAll(/<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<\/item>/g);
+      let c = 0;
+      for (const m of plain) {
+        if (c >= 3) break;
+        items.push({ title: m[1], date: '' });
+        c++;
+      }
+    }
     return items;
   } catch (err) {
-    console.warn('⚠️  Anthropic RSS fetch failed:', err.message);
+    console.warn('⚠️  OpenAI blog fetch failed:', err.message);
     return [];
   }
 }
@@ -68,19 +77,19 @@ async function fetchHuggingFacePapers() {
 }
 
 async function getAIData() {
-  const [anthropicNews, hfPapers] = await Promise.all([
-    fetchAnthropicBlog(),
+  const [openaiNews, hfPapers] = await Promise.all([
+    fetchOpenAIBlog(),
     fetchHuggingFacePapers()
   ]);
-  return { anthropicNews, hfPapers };
+  return { openaiNews, hfPapers };
 }
 
 // ── Report Generation ───────────────────────────────────────────────────────
 
 async function generateBrief(data) {
-  const anthropicSection = data.anthropicNews.length > 0
-    ? data.anthropicNews.map(n => `- ${n.title}`).join('\n')
-    : 'No recent Anthropic news fetched this week.';
+  const openaiSection = data.openaiNews.length > 0
+    ? data.openaiNews.map(n => `- ${n.title}`).join('\n')
+    : 'No recent OpenAI news fetched this week.';
 
   const hfSection = data.hfPapers.length > 0
     ? data.hfPapers.map(p => `- ${p.title}: ${p.abstract}`).join('\n')
@@ -88,8 +97,8 @@ async function generateBrief(data) {
 
   const prompt = `Produce this week's AI/ML research brief for Rascals Inc. Date: ${today}.
 
-ANTHROPIC NEWS THIS WEEK:
-${anthropicSection}
+OPENAI NEWS THIS WEEK:
+${openaiSection}
 
 RECENT RESEARCH PAPERS (HuggingFace Daily Papers):
 ${hfSection}
@@ -165,7 +174,6 @@ async function logToRunLog(status, notes) {
       Status: status,
       Date: today,
       Summary: notes.substring(0, 500),
-      Repo: 'rco_admin',
       'Workflow File': 'karpathy-weekly-ai-brief.yml'
     }
   }]);
