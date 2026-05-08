@@ -225,18 +225,10 @@ async function postToSlack(text) {
   } catch (err) { console.warn('Slack failed:', err.message); }
 }
 
-// ─── Playwright — sign up ─────────────────────────────────────────────────────
+// ─── Playwright — generic field filler ───────────────────────────────────────
 
-async function signUp(page, site, email, password) {
-  const url = site.fields['URL'];
-  const siteName = site.fields['Name'];
-
-  console.log(`\n  Navigating to: ${url}`);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(4000);
-  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
-
-  const filled = await page.evaluate((data) => {
+async function fillStandardForm(page, email, password) {
+  return page.evaluate((data) => {
     const { email, password, firstName, lastName, company, username } = data;
     let filledCount = 0;
 
@@ -256,39 +248,34 @@ async function signUp(page, site, email, password) {
       return false;
     }
 
-    // Email
     fill(['input[type="email"]', 'input[name*="email" i]', 'input[id*="email" i]', 'input[placeholder*="email" i]'], email);
 
-    // Password fields (password + confirm)
     const pwFields = document.querySelectorAll('input[type="password"]');
     pwFields.forEach(el => {
-      el.value = password;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      filledCount++;
+      if (el.offsetParent !== null && !el.disabled && !el.readOnly) {
+        el.value = password;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        filledCount++;
+      }
     });
 
-    // Username
-    fill([
-      'input[name*="username" i]', 'input[id*="username" i]',
-      'input[placeholder*="username" i]', 'input[autocomplete="username"]',
-      'input[name="user"]', 'input[id="user"]',
-    ], username);
-
-    // First name
+    fill(['input[name*="username" i]', 'input[id*="username" i]', 'input[placeholder*="username" i]', 'input[autocomplete="username"]', 'input[name="user"]', 'input[id="user"]'], username);
     fill(['input[name*="first" i]', 'input[id*="first" i]', 'input[placeholder*="first" i]', 'input[autocomplete="given-name"]'], firstName);
-
-    // Last name
     fill(['input[name*="last" i]', 'input[id*="last" i]', 'input[placeholder*="last" i]', 'input[autocomplete="family-name"]'], lastName);
-
-    // Full name
     fill(['input[name*="fullname" i]', 'input[id*="fullname" i]', 'input[placeholder*="full name" i]'], `${firstName} ${lastName}`);
-
-    // Name (generic — only if no first/last filled)
     fill(['input[name="name"]:not([name*="user" i]):not([name*="company" i])'], `${firstName} ${lastName}`);
-
-    // Company
     fill(['input[name*="company" i]', 'input[id*="company" i]', 'input[name*="org" i]'], company);
+
+    // Tick any terms/agreement checkboxes
+    document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      if (!cb.checked && cb.offsetParent !== null) {
+        cb.checked = true;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+        cb.dispatchEvent(new Event('click', { bubbles: true }));
+        filledCount++;
+      }
+    });
 
     return filledCount;
   }, {
@@ -297,45 +284,128 @@ async function signUp(page, site, email, password) {
     firstName: DEFAULTS.firstName,
     lastName: DEFAULTS.lastName,
     company: DEFAULTS.company,
-    username: email.split('@')[0], // use email local part as username
+    username: email.split('@')[0],
   });
+}
 
+function clickSubmit(page) {
+  return page.evaluate(() => {
+    const btns = [...document.querySelectorAll('button[type="submit"], input[type="submit"], button')];
+    const btn = btns.find(b => /sign up|register|create|get started|join|continue|next/i.test(b.innerText || b.value || ''));
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+}
+
+async function checkPageResult(page, siteId, label) {
+  await page.waitForTimeout(4000);
+  await page.screenshot({ path: `/tmp/marie-signup-${siteId}-${label}.png` });
+  const text = await page.evaluate(() => document.body.innerText);
+  const hasError = /error|invalid|already exists|already registered|try again/i.test(text);
+  if (hasError) {
+    const m = text.match(/(error|invalid|already)[^\n]{0,100}/i);
+    return { success: false, reason: m?.[0] || 'Error detected on page' };
+  }
+  const needsVerification = /verify|check your email|confirmation|welcome|account created|success|thank you/i.test(text);
+  return { success: true, needsVerification };
+}
+
+// ─── Site-specific flows ──────────────────────────────────────────────────────
+
+// Tavily — Auth0 multi-step: email → Continue → password → submit
+async function signUpTavily(page, site, email, password) {
+  await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(3000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+
+  // Step 1: fill email and click Continue
+  await page.evaluate((email) => {
+    const el = document.querySelector('input[type="email"], input[name*="email" i], input[id*="email" i]');
+    if (el) { el.value = email; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+  }, email);
+
+  const step1 = await clickSubmit(page);
+  if (!step1) return { success: false, reason: 'Tavily: Continue button not found on step 1' };
+
+  // Step 2: wait for password field to appear
+  try {
+    await page.waitForSelector('input[type="password"]', { timeout: 10000 });
+  } catch {
+    return { success: false, reason: 'Tavily: password field never appeared after Continue' };
+  }
+  await page.waitForTimeout(1000);
+
+  // Fill password
+  await page.evaluate((password) => {
+    document.querySelectorAll('input[type="password"]').forEach(el => {
+      el.value = password;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }, password);
+
+  const step2 = await clickSubmit(page);
+  if (!step2) return { success: false, reason: 'Tavily: submit button not found on step 2' };
+
+  console.log('  Form submitted (multi-step)');
+  return checkPageResult(page, site.id, 'after');
+}
+
+// OMDB — email-based API key request form (no account, just email + name)
+async function signUpOMDB(page, site, email) {
+  await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(3000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+
+  await page.evaluate((data) => {
+    const { email, firstName, lastName } = data;
+    function fill(sel, val) {
+      const el = document.querySelector(sel);
+      if (el) { el.value = val; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
+    fill('input[name="emailaddress"], input[type="email"]', email);
+    fill('input[name="firstname"], input[id*="first" i]', firstName);
+    fill('input[name="lastname"], input[id*="last" i]', lastName);
+    // Select free tier if radio exists
+    const freeRadio = document.querySelector('input[type="radio"][value*="free" i], input[type="radio"][value="1"]');
+    if (freeRadio) { freeRadio.checked = true; freeRadio.dispatchEvent(new Event('change', { bubbles: true })); }
+  }, { email, firstName: DEFAULTS.firstName, lastName: DEFAULTS.lastName });
+
+  const submitted = await clickSubmit(page);
+  if (!submitted) return { success: false, reason: 'OMDB: submit button not found' };
+
+  console.log('  Key request submitted');
+  return checkPageResult(page, site.id, 'after');
+}
+
+// ─── Playwright — sign up dispatcher ─────────────────────────────────────────
+
+async function signUp(page, site, email, password) {
+  const url = site.fields['URL'];
+  const siteName = site.fields['Name'];
+
+  console.log(`\n  Navigating to: ${url}`);
+
+  // Site-specific flows
+  if (siteName === 'Tavily') return signUpTavily(page, site, email, password);
+  if (siteName === 'OMDB')   return signUpOMDB(page, site, email);
+
+  // Generic flow
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(4000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+
+  const filled = await fillStandardForm(page, email, password);
   console.log(`  Filled ${filled} field(s)`);
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-filled.png` });
 
-  if (filled === 0) {
-    return { success: false, reason: 'No fields found to fill' };
-  }
+  if (filled === 0) return { success: false, reason: 'No fields found to fill' };
 
-  // Find and click submit button
-  const submitted = await page.evaluate(() => {
-    const btns = [...document.querySelectorAll('button[type="submit"], input[type="submit"], button')];
-    const submitBtn = btns.find(b => {
-      const text = (b.innerText || b.value || '').toLowerCase();
-      return /sign up|register|create|get started|join|continue|next/i.test(text);
-    });
-    if (submitBtn) { submitBtn.click(); return true; }
-    return false;
-  });
-
-  if (!submitted) {
-    return { success: false, reason: 'Submit button not found' };
-  }
+  const submitted = await clickSubmit(page);
+  if (!submitted) return { success: false, reason: 'Submit button not found' };
 
   console.log('  Form submitted');
-  await page.waitForTimeout(4000);
-  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-after.png` });
-
-  const pageText = await page.evaluate(() => document.body.innerText);
-  const hasError = /error|invalid|already exists|already registered|try again/i.test(pageText);
-
-  if (hasError) {
-    const errorMatch = pageText.match(/(error|invalid|already)[^\n]{0,100}/i);
-    return { success: false, reason: errorMatch?.[0] || 'Error detected on page' };
-  }
-
-  const needsVerification = /verify|check your email|confirmation|welcome|account created|success|thank you/i.test(pageText);
-  return { success: true, needsVerification };
+  return checkPageResult(page, site.id, 'after');
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
