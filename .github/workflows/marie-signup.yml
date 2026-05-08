@@ -44,6 +44,10 @@ jobs:
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           SIGNUP_PASSWORD: ${{ secrets.SIGNUP_PASSWORD }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           MAX_PER_RUN: ${{ github.event.inputs.max_per_run || vars.SIGNUP_MAX_PER_RUN || '20' }}
         run: node scripts/marie-account-creator.js
