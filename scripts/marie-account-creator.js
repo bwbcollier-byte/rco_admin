@@ -361,10 +361,29 @@ async function fillStandardForm(page, email, password) {
 function clickSubmit(page) {
   return page.evaluate(() => {
     const btns = [...document.querySelectorAll('button[type="submit"], input[type="submit"], button')];
-    const btn = btns.find(b => /sign up|register|create|get started|join|continue|next/i.test(b.innerText || b.value || ''));
+    const btn = btns.find(b => /sign up|register|create|get started|join|continue|next|submit/i.test(b.innerText || b.value || ''));
     if (btn) { btn.click(); return true; }
     return false;
   });
+}
+
+// Real Playwright click — more reliable than JS .click() for React/Auth0 SPAs
+async function playwrightClickSubmit(page) {
+  try {
+    const btn = page.locator('button[type="submit"], input[type="submit"]').first();
+    await btn.click({ timeout: 5000 });
+    return true;
+  } catch {
+    // Fallback: find by text
+    const texts = ['Continue', 'Sign up', 'Register', 'Create account', 'Submit', 'Get started'];
+    for (const text of texts) {
+      try {
+        await page.getByRole('button', { name: new RegExp(text, 'i') }).first().click({ timeout: 3000 });
+        return true;
+      } catch { /* try next */ }
+    }
+    return false;
+  }
 }
 
 async function checkPageResult(page, siteId, label) {
@@ -382,44 +401,49 @@ async function checkPageResult(page, siteId, label) {
 
 // ─── Site-specific flows ──────────────────────────────────────────────────────
 
-// Tavily — Auth0 multi-step: email → Continue → password → submit
-async function signUpTavily(page, site, email, password) {
+// Multi-step Auth0-style signup: email → Continue → password → submit
+// Used by Tavily and Cerebras
+async function signUpMultiStep(page, site, email, password) {
   await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(3000);
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
 
-  // Step 1: fill email and click Continue
-  await page.evaluate((email) => {
-    const el = document.querySelector('input[type="email"], input[name*="email" i], input[id*="email" i]');
-    if (el) { el.value = email; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
-  }, email);
-
-  const step1 = await clickSubmit(page);
-  if (!step1) return { success: false, reason: 'Tavily: Continue button not found on step 1' };
-
-  // Step 2: wait for password field to appear
+  // Step 1: fill email using Playwright's real fill()
   try {
-    await page.waitForSelector('input[type="password"]', { timeout: 10000 });
+    const emailSel = 'input[type="email"], input[name*="email" i], input[id*="email" i], input[placeholder*="email" i]';
+    await page.waitForSelector(emailSel, { timeout: 8000 });
+    await page.fill(emailSel, email);
   } catch {
-    return { success: false, reason: 'Tavily: password field never appeared after Continue' };
+    return { success: false, reason: `${site.fields['Name']}: email field not found` };
+  }
+
+  // Click Continue with real Playwright click
+  const step1 = await playwrightClickSubmit(page);
+  if (!step1) return { success: false, reason: `${site.fields['Name']}: Continue button not found on step 1` };
+
+  // Step 2: wait for password field
+  try {
+    await page.waitForSelector('input[type="password"]', { timeout: 12000 });
+  } catch {
+    return { success: false, reason: `${site.fields['Name']}: password field never appeared after Continue` };
   }
   await page.waitForTimeout(1000);
 
-  // Fill password
-  await page.evaluate((password) => {
-    document.querySelectorAll('input[type="password"]').forEach(el => {
-      el.value = password;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-  }, password);
+  // Fill password + confirm if present
+  const pwFields = await page.$$('input[type="password"]');
+  for (const field of pwFields) {
+    await field.fill(password);
+  }
 
-  const step2 = await clickSubmit(page);
-  if (!step2) return { success: false, reason: 'Tavily: submit button not found on step 2' };
+  const step2 = await playwrightClickSubmit(page);
+  if (!step2) return { success: false, reason: `${site.fields['Name']}: submit button not found on step 2` };
 
   console.log('  Form submitted (multi-step)');
   return checkPageResult(page, site.id, 'after');
 }
+
+const signUpTavily   = signUpMultiStep;
+const signUpCerebras = signUpMultiStep;
 
 // OMDB — email-based API key request form (no account, just email + name)
 async function signUpOMDB(page, site, email) {
@@ -427,21 +451,22 @@ async function signUpOMDB(page, site, email) {
   await page.waitForTimeout(3000);
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
 
-  await page.evaluate((data) => {
-    const { email, firstName, lastName } = data;
-    function fill(sel, val) {
-      const el = document.querySelector(sel);
-      if (el) { el.value = val; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
-    }
-    fill('input[name="emailaddress"], input[type="email"]', email);
-    fill('input[name="firstname"], input[id*="first" i]', firstName);
-    fill('input[name="lastname"], input[id*="last" i]', lastName);
-    // Select free tier if radio exists
-    const freeRadio = document.querySelector('input[type="radio"][value*="free" i], input[type="radio"][value="1"]');
-    if (freeRadio) { freeRadio.checked = true; freeRadio.dispatchEvent(new Event('change', { bubbles: true })); }
-  }, { email, firstName: DEFAULTS.firstName, lastName: DEFAULTS.lastName });
+  // Select free tier radio
+  try { await page.check('input[type="radio"][value*="free" i], input[type="radio"][value="1"]'); } catch {}
 
-  const submitted = await clickSubmit(page);
+  // Fill fields with real Playwright fill()
+  const tryFill = async (selectors, value) => {
+    for (const sel of selectors) {
+      try { await page.fill(sel, value); return; } catch {}
+    }
+  };
+  await tryFill(['input[name="emailaddress"]', 'input[type="email"]'], email);
+  await tryFill(['input[name="firstname"]', 'input[id*="first" i]'], DEFAULTS.firstName);
+  await tryFill(['input[name="lastname"]', 'input[id*="last" i]'], DEFAULTS.lastName);
+
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-filled.png` });
+
+  const submitted = await playwrightClickSubmit(page);
   if (!submitted) return { success: false, reason: 'OMDB: submit button not found' };
 
   console.log('  Key request submitted');
@@ -457,8 +482,9 @@ async function signUp(page, site, email, password) {
   console.log(`\n  Navigating to: ${url}`);
 
   // Site-specific flows
-  if (siteName === 'Tavily') return signUpTavily(page, site, email, password);
-  if (siteName === 'OMDB')   return signUpOMDB(page, site, email);
+  if (siteName === 'Tavily')   return signUpTavily(page, site, email, password);
+  if (siteName === 'Cerebras') return signUpCerebras(page, site, email, password);
+  if (siteName === 'OMDB')     return signUpOMDB(page, site, email);
 
   // Generic flow
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
