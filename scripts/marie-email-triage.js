@@ -467,10 +467,17 @@ async function logToRunLog(status, summary) {
 async function main() {
   try {
     const results = await runTriage();
-    await postToSlack(results);
 
     const summary = `Processed ${results.processed}. Trashed ${results.trashed}, archived ${results.archived}, created ${results.tasksCreated} tasks, queued ${results.draftsCreated} drafts, kept ${results.kept}.`;
     console.log(`✅ Done. ${summary}`);
+
+    // Slack is non-fatal — log warning if it fails but don't exit
+    try {
+      await postToSlack(results);
+    } catch (slackErr) {
+      console.warn(`⚠️  Slack notification failed: ${slackErr.message}`);
+    }
+
     if (!DRY_RUN) await logToRunLog('✅ Success', summary);
 
   } catch (err) {
