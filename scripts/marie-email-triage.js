@@ -255,7 +255,9 @@ async function classifyBatch(emails) {
   const lines_out = response.content[0].text.trim().split('\n');
   return lines_out.map(line => {
     const [cat, reason] = line.split('|').map(s => s.trim());
-    return { category: cat?.toUpperCase() || 'KEEP', reason: reason || '' };
+    // Strip any leading index like "[0] " that Claude echoes back
+    const cleanCat = cat?.replace(/^\[\d+\]\s*/, '').toUpperCase() || 'KEEP';
+    return { category: cleanCat, reason: reason || '' };
   });
 }
 
