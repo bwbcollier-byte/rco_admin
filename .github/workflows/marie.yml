@@ -63,6 +63,7 @@ jobs:
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }}
           GCAL_REFRESH_TOKEN: ${{ secrets.GCAL_REFRESH_TOKEN }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           SIGNUP_PASSWORD: ${{ secrets.SIGNUP_PASSWORD }}
           FLIGHT_ROUTES: ${{ vars.FLIGHT_ROUTES || 'SYD-TYO' }}
           FLIGHT_MAX_PRICE_AUD: ${{ vars.FLIGHT_MAX_PRICE_AUD || '900' }}
