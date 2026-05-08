@@ -444,7 +444,7 @@ async function postToSlack(results) {
 
   const response = await axios.post(
     'https://slack.com/api/chat.postMessage',
-    { channel: SLACK_CHANNEL, text: lines.join('\n'), username: 'Marie Kondo', icon_emoji: ':blossom:' },
+    { channel: SLACK_CHANNEL, text: lines.join('\n') },
     { headers: { Authorization: `Bearer ${SLACK_TOKEN}`, 'Content-Type': 'application/json' } }
   );
   if (!response.data.ok) throw new Error(`Slack error: ${response.data.error}`);
