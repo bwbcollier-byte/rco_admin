@@ -247,7 +247,7 @@ async function saveToAirtable(siteName, email, password, notes) {
           fldoqWChj7NAo6uRg: email,
           fldqoPo0O06uAHILu: password,
           fldcZ9nAY8GD2OZW8: 'Active',
-          fldmNEniveVp5upxh: 'Email / Password',
+          fldmNEniveVp5upxh: 'Email Password',
           fldupBswggA36MOyI: notes || '',
         },
       },
@@ -264,7 +264,7 @@ async function saveToAirtable(siteName, email, password, notes) {
         fields: {
           fld2lJoFqSGAEK5tw: `${siteName} — ${email}`,
           flddhlUwVQW6vrY55: [loginId],
-          fldSNad5zoyLbpebm: 'Password',
+          fldSNad5zoyLbpebm: 'Other',
           fld4tDedZ5uGVy3gP: 'Active',
           fldXq9LKkrwecF5Fp: email,
           fldGMbEDOCtLXqbLX: password,
