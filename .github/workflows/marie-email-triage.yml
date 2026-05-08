@@ -1,0 +1,54 @@
+name: Marie — Email Triage
+
+on:
+  schedule:
+    # 8pm UTC Sunday–Thursday = 6am AEST Monday–Friday
+    - cron: '0 20 * * 0-4'
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Classify emails but take no action (safe to test)'
+        required: false
+        default: 'false'
+      initial_cleanup:
+        description: 'Process full backlog (up to MAX_INITIAL messages)'
+        required: false
+        default: 'false'
+      max_initial:
+        description: 'Max emails to process in initial cleanup (default 500)'
+        required: false
+        default: '500'
+
+jobs:
+  triage:
+    name: Marie Kondo Email Triage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install googleapis @anthropic-ai/sdk airtable axios
+
+      - name: Run Marie Kondo triage
+        env:
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          INITIAL_CLEANUP: ${{ github.event.inputs.initial_cleanup || 'false' }}
+          MAX_INITIAL: ${{ github.event.inputs.max_initial || '500' }}
+        run: node scripts/marie-email-triage.js
