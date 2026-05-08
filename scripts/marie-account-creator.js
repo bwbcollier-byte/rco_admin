@@ -39,6 +39,7 @@ const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
 const SIGNUP_PASSWORD   = process.env.SIGNUP_PASSWORD;
 const DRY_RUN           = process.env.DRY_RUN === 'true';
+const MAX_PER_RUN       = parseInt(process.env.MAX_PER_RUN || '20', 10);
 
 // Default name details for signup forms
 const DEFAULTS = {
@@ -489,8 +490,9 @@ async function main() {
   if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
   if (!RAPIDAPI_KEY) throw new Error('RAPIDAPI_KEY not set');
 
-  const pending = await getPendingSignups();
-  console.log(`\nPending signups: ${pending.length}`);
+  const allPending = await getPendingSignups();
+  const pending = allPending.slice(0, MAX_PER_RUN);
+  console.log(`\nPending signups: ${allPending.length} total, processing ${pending.length} (max ${MAX_PER_RUN})`);
 
   if (pending.length === 0) {
     console.log('Nothing to do. Add entries with Status = "Pending" to the Signup Queue Airtable table.');
