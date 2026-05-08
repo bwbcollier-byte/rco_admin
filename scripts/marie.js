@@ -42,6 +42,11 @@ const FORCE_TASK        = process.env.TASK || 'auto'; // 'auto' | 'morning' | 'f
 const AIRTABLE_API_KEY  = process.env.AIRTABLE_API_KEY;
 const AIRTABLE_BASE_ID  = 'app6biS7yjV6XzFVG';
 
+// Google Calendar — re-uses Gmail OAuth client, needs calendar scope on refresh token
+const GCAL_CLIENT_ID     = process.env.GMAIL_CLIENT_ID;
+const GCAL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
+const GCAL_REFRESH_TOKEN = process.env.GCAL_REFRESH_TOKEN; // separate secret — see setup notes
+
 const FLIGHT_ROUTES     = (process.env.FLIGHT_ROUTES || 'SYD-TYO').split(',').map(r => r.trim());
 const FLIGHT_MAX_PRICE  = parseInt(process.env.FLIGHT_MAX_PRICE_AUD || '900', 10);
 const FLIGHT_STATE_FILE = '/tmp/marie-flight-state.json';
@@ -290,6 +295,64 @@ function saveApartmentState(state) {
   console.log('Apartment state saved.');
 }
 
+// ─── Google Calendar ──────────────────────────────────────────────────────────
+
+async function createCalendarEvent(classInfo) {
+  if (!GCAL_REFRESH_TOKEN) {
+    console.warn('GCAL_REFRESH_TOKEN not set — skipping calendar event');
+    return;
+  }
+  try {
+    // Exchange refresh token for access token
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: GCAL_CLIENT_ID,
+      client_secret: GCAL_CLIENT_SECRET,
+      refresh_token: GCAL_REFRESH_TOKEN,
+      grant_type: 'refresh_token',
+    });
+    const accessToken = tokenRes.data.access_token;
+
+    // Parse class time e.g. "7:00 AM"
+    const match = (classInfo.time || '').match(/(\d+):(\d+)\s*(AM|PM)/i);
+    if (!match) { console.warn('Could not parse class time for calendar event'); return; }
+    let h = parseInt(match[1]);
+    const m = parseInt(match[2]);
+    if (match[3].toUpperCase() === 'PM' && h !== 12) h += 12;
+    if (match[3].toUpperCase() === 'AM' && h === 12) h = 0;
+
+    const start = new Date();
+    start.setDate(start.getDate() + 1); // tomorrow
+    start.setHours(h, m, 0, 0);
+    const end = new Date(start);
+    end.setMinutes(end.getMinutes() + 45); // assume 45-min class
+
+    const event = {
+      summary: `🏋️ ${classInfo.name}`,
+      location: 'One Playground, 2/2 Unwins Bridge Rd, Sydenham NSW 2044',
+      description: `Booked by Kondo.\n\n⚠️ Cancel 10+ hours before if you can't make it ($5 late cancel / $15 no-show).`,
+      start: { dateTime: start.toISOString(), timeZone: 'Australia/Sydney' },
+      end:   { dateTime: end.toISOString(),   timeZone: 'Australia/Sydney' },
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'popup', minutes: 60 },  // 1hr before
+          { method: 'popup', minutes: 720 }, // 12hr before (cancel window reminder)
+        ],
+      },
+    };
+
+    await axios.post(
+      'https://www.googleapis.com/calendar/v3/calendars/primary/events',
+      event,
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`📅 Calendar event created: ${classInfo.name} at ${classInfo.time}`);
+  } catch (err) {
+    // Non-fatal — class is still booked even if calendar fails
+    console.warn('Calendar event creation failed:', err.response?.data?.error?.message || err.message);
+  }
+}
+
 // ─── Task: Gym Class Booker ───────────────────────────────────────────────────
 
 const GYM_STUDIO_ID   = '152065';
@@ -450,13 +513,15 @@ async function runGymBooker() {
     await page.screenshot({ path: '/tmp/marie-gym-after.png' });
 
     if (booked.success) {
+      await createCalendarEvent(target);
       await postToSlack([
         `🏋️✅ *One Playground — Booked!*`,
         `*${target.name}*`,
         `📅 ${getTomorrowLabel()} at ${target.time}`,
         `📍 ${GYM_STUDIO_NAME}`,
+        GCAL_REFRESH_TOKEN ? `🗓 Added to Google Calendar` : ``,
         `_Cancel 10+ hours before if you can't make it (avoid the $5 late cancel fee)._`,
-      ].join('\n'));
+      ].filter(Boolean).join('\n'));
     } else {
       await postToSlack([
         `🏋️❌ *One Playground — Booking Failed*`,

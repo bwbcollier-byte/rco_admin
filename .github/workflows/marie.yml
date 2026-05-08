@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: 'Which task to run (auto=schedule-based, apartment, gym, all)'
+        description: 'Which task to run (auto=schedule-based, apartment, gym, flights, morning, signup, all)'
         required: false
         default: 'auto'
       dry_run:
@@ -32,7 +32,7 @@ jobs:
           node-version: '22'
 
       - name: Install dependencies
-        run: npm install playwright axios
+        run: npm install playwright axios googleapis
 
       - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
@@ -58,11 +58,22 @@ jobs:
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
           MINDBODY_EMAIL: ${{ secrets.MINDBODY_EMAIL }}
           MINDBODY_PASSWORD: ${{ secrets.MINDBODY_PASSWORD }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }}
+          GCAL_REFRESH_TOKEN: ${{ secrets.GCAL_REFRESH_TOKEN }}
+          SIGNUP_PASSWORD: ${{ secrets.SIGNUP_PASSWORD }}
           FLIGHT_ROUTES: ${{ vars.FLIGHT_ROUTES || 'SYD-TYO' }}
           FLIGHT_MAX_PRICE_AUD: ${{ vars.FLIGHT_MAX_PRICE_AUD || '900' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           TASK: ${{ github.event.inputs.task || 'auto' }}
-        run: node scripts/marie.js
+        run: |
+          if [ "$TASK" = "signup" ]; then
+            node scripts/marie-account-creator.js
+          else
+            node scripts/marie.js
+          fi
 
       - name: Upload apartment state
         uses: actions/upload-artifact@v4

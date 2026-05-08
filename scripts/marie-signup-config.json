@@ -1,0 +1,20 @@
+{
+  "_comment": "Add sites here with status: pending. Kondo will sign up, verify, and save credentials to Airtable.",
+  "defaults": {
+    "firstName": "Ben",
+    "lastName": "Collier",
+    "emailBase": "benwbcollier",
+    "company": "Rascals Inc"
+  },
+  "signups": [
+    {
+      "id": "example-placeholder",
+      "name": "Example Service",
+      "url": "https://example.com/signup",
+      "emailAlias": "example",
+      "category": "API",
+      "notes": "Replace this with a real service",
+      "status": "skip"
+    }
+  ]
+}
