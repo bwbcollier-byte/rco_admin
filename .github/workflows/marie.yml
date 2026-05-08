@@ -1,0 +1,73 @@
+name: Kondo — Daily Automation
+
+on:
+  schedule:
+    # Every hour — tasks decide internally whether to run
+    - cron: '0 * * * *'
+
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Which task to run (auto=schedule-based, apartment, gym, all)'
+        required: false
+        default: 'auto'
+      dry_run:
+        description: 'Check/find but take no action'
+        required: false
+        default: 'false'
+
+jobs:
+  run:
+    name: Marie
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install playwright axios
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      - name: Download apartment state
+        uses: actions/download-artifact@v4
+        with:
+          name: marie-apartment-state
+          path: /tmp/
+        continue-on-error: true  # OK on first run
+
+      - name: Run Marie
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
+          MINDBODY_EMAIL: ${{ secrets.MINDBODY_EMAIL }}
+          MINDBODY_PASSWORD: ${{ secrets.MINDBODY_PASSWORD }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          TASK: ${{ github.event.inputs.task || 'auto' }}
+        run: node scripts/marie.js
+
+      - name: Upload apartment state
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marie-apartment-state
+          path: /tmp/social-apartment-state.json
+          retention-days: 90
+          overwrite: true
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marie-screenshots
+          path: /tmp/marie-*.png
+          retention-days: 7
+          overwrite: true
