@@ -44,12 +44,22 @@ jobs:
           path: /tmp/
         continue-on-error: true  # OK on first run
 
+      - name: Download flight state
+        uses: actions/download-artifact@v4
+        with:
+          name: marie-flight-state
+          path: /tmp/
+        continue-on-error: true  # OK on first run
+
       - name: Run Marie
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
           MINDBODY_EMAIL: ${{ secrets.MINDBODY_EMAIL }}
           MINDBODY_PASSWORD: ${{ secrets.MINDBODY_PASSWORD }}
+          FLIGHT_ROUTES: ${{ vars.FLIGHT_ROUTES || 'SYD-TYO' }}
+          FLIGHT_MAX_PRICE_AUD: ${{ vars.FLIGHT_MAX_PRICE_AUD || '900' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           TASK: ${{ github.event.inputs.task || 'auto' }}
         run: node scripts/marie.js
@@ -60,6 +70,15 @@ jobs:
         with:
           name: marie-apartment-state
           path: /tmp/social-apartment-state.json
+          retention-days: 90
+          overwrite: true
+
+      - name: Upload flight state
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marie-flight-state
+          path: /tmp/marie-flight-state.json
           retention-days: 90
           overwrite: true
 

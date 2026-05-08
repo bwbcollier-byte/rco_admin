@@ -6,16 +6,25 @@
  * Tasks are isolated — one failure won't block others.
  *
  * Tasks:
+ *   - Morning Brief             → 10pm UTC daily (= 8am AEST)
+ *       • Task digest (Airtable — overdue/today/this week)
+ *       • Credential expiry check (Airtable — exhausted or resetting soon)
+ *   - Flight Price Monitor      → 10pm UTC daily (= 8am AEST)
  *   - Social Apartment Monitor  → every 4 hours (UTC hours 0, 4, 8, 12, 16, 20)
  *   - Gym Class Booker          → 11am UTC daily (= 9pm AEST)
  *
- * Manual dispatch: set TASK env var to 'apartment', 'gym', or 'all' to force a specific task.
+ * Manual dispatch: set TASK env var to 'morning', 'flights', 'apartment', 'gym', or 'all'.
  *
  * Secrets required:
  *   SLACK_BOT_TOKEN
  *   SLACK_CHANNEL_AI_ENGINEERING
+ *   AIRTABLE_API_KEY
  *   MINDBODY_EMAIL
  *   MINDBODY_PASSWORD
+ *
+ * Optional env vars:
+ *   FLIGHT_ROUTES          comma-separated e.g. "SYD-TYO,TYO-SYD"  (default: SYD-TYO)
+ *   FLIGHT_MAX_PRICE_AUD   alert threshold e.g. "900"               (default: 900)
  */
 
 const { chromium } = require('playwright');
@@ -28,7 +37,14 @@ const crypto = require('crypto');
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
 const DRY_RUN           = process.env.DRY_RUN === 'true';
-const FORCE_TASK        = process.env.TASK || 'auto'; // 'auto' | 'apartment' | 'gym' | 'all'
+const FORCE_TASK        = process.env.TASK || 'auto'; // 'auto' | 'morning' | 'flights' | 'apartment' | 'gym' | 'all'
+
+const AIRTABLE_API_KEY  = process.env.AIRTABLE_API_KEY;
+const AIRTABLE_BASE_ID  = 'app6biS7yjV6XzFVG';
+
+const FLIGHT_ROUTES     = (process.env.FLIGHT_ROUTES || 'SYD-TYO').split(',').map(r => r.trim());
+const FLIGHT_MAX_PRICE  = parseInt(process.env.FLIGHT_MAX_PRICE_AUD || '900', 10);
+const FLIGHT_STATE_FILE = '/tmp/marie-flight-state.json';
 
 // ─── Shared Utilities ─────────────────────────────────────────────────────────
 
@@ -549,6 +565,250 @@ async function bookGymClass(page, classInfo) {
   }
 }
 
+// ─── Task: Morning Brief ─────────────────────────────────────────────────────
+// Task digest + credential check — 10pm UTC = 8am AEST
+
+function shouldRunMorningBrief(nowUtcHour) {
+  return nowUtcHour === 22;
+}
+
+async function airtableGet(tableId, params = {}) {
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}`;
+  const res = await axios.get(url, {
+    headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+    params,
+  });
+  return res.data.records || [];
+}
+
+async function runMorningBrief() {
+  console.log('\n' + '─'.repeat(60));
+  console.log('TASK: Morning Brief');
+  console.log('─'.repeat(60));
+
+  if (!AIRTABLE_API_KEY) {
+    console.warn('AIRTABLE_API_KEY not set — skipping morning brief');
+    return;
+  }
+
+  const sections = [];
+
+  const taskSection = await buildTaskDigest();
+  if (taskSection) sections.push(taskSection);
+
+  const credSection = await buildCredentialCheck();
+  if (credSection) sections.push(credSection);
+
+  if (sections.length === 0) {
+    console.log('Nothing to flag this morning — all clear.');
+    return;
+  }
+
+  const today = new Date().toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'long' });
+  const msg = `☀️ *Morning Brief — ${today}*\n\n` + sections.join('\n\n─\n\n');
+  await postToSlack(msg);
+}
+
+async function buildTaskDigest() {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const weekEnd = new Date(today);
+  weekEnd.setDate(weekEnd.getDate() + 7);
+
+  let records;
+  try {
+    records = await airtableGet('tblaWsnrpapyjiIgi', {
+      filterByFormula: `AND({Status} != "Done", {Assigned To} = "Ben")`,
+      fields: ['Task Name', 'Status', 'Priority', 'Due Date'],
+      maxRecords: 100,
+    });
+  } catch (err) {
+    console.warn('Task digest fetch failed:', err.message);
+    return null;
+  }
+
+  const overdue = [], dueToday = [], dueThisWeek = [];
+
+  for (const r of records) {
+    const f = r.fields;
+    const name = (f['Task Name'] || '(unnamed)').split('\n')[0].trim();
+    const priority = f['Priority'] || '';
+    const dueStr = f['Due Date'];
+    const label = priority ? `[${priority}] ${name}` : name;
+
+    if (!dueStr) continue; // no due date = skip from digest
+
+    const due = new Date(dueStr);
+    due.setHours(0, 0, 0, 0);
+
+    if (due < today)                          overdue.push(`⚠️ ${label}`);
+    else if (due.getTime() === today.getTime()) dueToday.push(`• ${label}`);
+    else if (due <= weekEnd)                   dueThisWeek.push(`• ${label}`);
+  }
+
+  const byPriority = arr => arr.sort((a, b) => {
+    const pa = parseInt((a.match(/\[P(\d)\]/) || ['', '9'])[1]);
+    const pb = parseInt((b.match(/\[P(\d)\]/) || ['', '9'])[1]);
+    return pa - pb;
+  });
+
+  const lines = [];
+  if (overdue.length)     lines.push(`*🔴 Overdue (${overdue.length}):*\n${byPriority(overdue).join('\n')}`);
+  if (dueToday.length)    lines.push(`*📌 Due today (${dueToday.length}):*\n${byPriority(dueToday).join('\n')}`);
+  if (dueThisWeek.length) lines.push(`*📅 This week (${dueThisWeek.length}):*\n${byPriority(dueThisWeek).join('\n')}`);
+
+  console.log(`Tasks: ${overdue.length} overdue, ${dueToday.length} today, ${dueThisWeek.length} this week`);
+  return lines.length ? `*📋 Tasks*\n\n${lines.join('\n\n')}` : null;
+}
+
+async function buildCredentialCheck() {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const warnBefore = new Date(today);
+  warnBefore.setDate(warnBefore.getDate() + 14);
+
+  let records;
+  try {
+    records = await airtableGet('tblvBr6RIc7bcGXYJ', {
+      filterByFormula: `{Status} = "Active"`,
+      fields: ['Name', 'Calls Status', 'Reset Date'],
+      maxRecords: 200,
+    });
+  } catch (err) {
+    console.warn('Credentials fetch failed:', err.message);
+    return null;
+  }
+
+  const exhausted = [], expiringSoon = [];
+
+  for (const r of records) {
+    const f = r.fields;
+    const name = f['Name'] || '(unnamed)';
+    const callsStatus = f['Calls Status'] || '';
+    const resetDate = f['Reset Date'];
+
+    if (/exhausted|out/i.test(callsStatus)) {
+      exhausted.push(`• ${name}`);
+    }
+    if (resetDate) {
+      const reset = new Date(resetDate);
+      reset.setHours(0, 0, 0, 0);
+      if (reset >= today && reset <= warnBefore) {
+        const daysLeft = Math.round((reset - today) / 86400000);
+        expiringSoon.push(`• ${name} — resets in ${daysLeft}d`);
+      }
+    }
+  }
+
+  console.log(`Credentials: ${exhausted.length} exhausted, ${expiringSoon.length} expiring soon`);
+
+  const lines = [];
+  if (exhausted.length)   lines.push(`*🔑 Exhausted (${exhausted.length}):*\n${exhausted.join('\n')}`);
+  if (expiringSoon.length) lines.push(`*⏳ Resetting soon (${expiringSoon.length}):*\n${expiringSoon.join('\n')}`);
+  return lines.length ? `*🔐 Credentials*\n\n${lines.join('\n\n')}` : null;
+}
+
+// ─── Task: Flight Price Monitor ───────────────────────────────────────────────
+// Checks Google Flights for configured routes — 10pm UTC = 8am AEST
+
+function shouldRunFlightMonitor(nowUtcHour) {
+  return nowUtcHour === 22;
+}
+
+function loadFlightState() {
+  try {
+    if (fs.existsSync(FLIGHT_STATE_FILE)) return JSON.parse(fs.readFileSync(FLIGHT_STATE_FILE, 'utf8'));
+  } catch (e) {}
+  return {};
+}
+
+function saveFlightState(state) {
+  fs.writeFileSync(FLIGHT_STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+async function runFlightMonitor() {
+  console.log('\n' + '─'.repeat(60));
+  console.log('TASK: Flight Price Monitor');
+  console.log(`Routes: ${FLIGHT_ROUTES.join(', ')}`);
+  console.log(`Price threshold: A$${FLIGHT_MAX_PRICE}`);
+  console.log('─'.repeat(60));
+
+  const state = loadFlightState();
+  const alerts = [];
+
+  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    locale: 'en-AU',
+  });
+
+  for (const route of FLIGHT_ROUTES) {
+    const [origin, dest] = route.split('-');
+    if (!origin || !dest) continue;
+
+    console.log(`\nChecking ${route}...`);
+
+    const page = await context.newPage();
+    try {
+      // Google Flights explore URL — shows cheapest upcoming prices
+      const url = `https://www.google.com/travel/flights?q=Flights+from+${origin}+to+${dest}&curr=AUD`;
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+      await page.waitForTimeout(4000);
+      await page.screenshot({ path: `/tmp/marie-flights-${route}.png` });
+
+      // Extract prices from the page
+      const prices = await page.evaluate(() => {
+        const priceEls = document.querySelectorAll('[data-gs], [class*="price"], [class*="YMlIz"], [class*="FpEdX"]');
+        const found = [];
+        priceEls.forEach(el => {
+          const text = el.innerText || el.textContent || '';
+          const match = text.match(/\$[\d,]+/);
+          if (match) {
+            const num = parseInt(match[0].replace(/[\$,]/g, ''), 10);
+            if (num > 50 && num < 50000) found.push(num);
+          }
+        });
+        return found;
+      });
+
+      if (prices.length === 0) {
+        console.log(`  No prices found for ${route} — may need selector update`);
+        await page.close();
+        continue;
+      }
+
+      const minPrice = Math.min(...prices);
+      const lastPrice = state[route]?.lastPrice;
+      const priceDrop = lastPrice && minPrice < lastPrice;
+      const belowThreshold = minPrice <= FLIGHT_MAX_PRICE;
+
+      console.log(`  ${route}: A$${minPrice} (last: ${lastPrice ? `A$${lastPrice}` : 'unknown'})`);
+
+      state[route] = { lastPrice: minPrice, checkedAt: new Date().toISOString() };
+
+      if (belowThreshold || priceDrop) {
+        const dropNote = priceDrop ? ` ↓ was A$${lastPrice}` : '';
+        alerts.push(`✈️ *${origin} → ${dest}:* A$${minPrice}${dropNote}${belowThreshold ? ` _(under A$${FLIGHT_MAX_PRICE} threshold)_` : ''}`);
+      }
+
+    } catch (err) {
+      console.warn(`  Flight check failed for ${route}:`, err.message);
+    }
+    await page.close();
+  }
+
+  await browser.close();
+  saveFlightState(state);
+
+  if (alerts.length > 0) {
+    const msg = `✈️ *Flight Price Alert*\n\n${alerts.join('\n')}\n\n_Routes checked: ${FLIGHT_ROUTES.join(', ')} | Threshold: A$${FLIGHT_MAX_PRICE}_`;
+    await postToSlack(msg);
+    console.log(`\nPosted flight alert to Slack (${alerts.length} alert(s))`);
+  } else {
+    console.log('\nNo price alerts — all routes above threshold or unchanged.');
+  }
+}
+
 // ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 async function main() {
@@ -563,22 +823,48 @@ async function main() {
   console.log(`Dry run: ${DRY_RUN}`);
   console.log('='.repeat(60));
 
+  const runMorning   = FORCE_TASK === 'all' || FORCE_TASK === 'morning'
+    || (FORCE_TASK === 'auto' && shouldRunMorningBrief(nowUtcHour));
+
+  const runFlights   = FORCE_TASK === 'all' || FORCE_TASK === 'flights'
+    || (FORCE_TASK === 'auto' && shouldRunFlightMonitor(nowUtcHour));
+
   const runApartment = FORCE_TASK === 'all' || FORCE_TASK === 'apartment'
     || (FORCE_TASK === 'auto' && shouldRunApartmentMonitor(nowUtcHour));
 
-  const runGym = FORCE_TASK === 'all' || FORCE_TASK === 'gym'
+  const runGym       = FORCE_TASK === 'all' || FORCE_TASK === 'gym'
     || (FORCE_TASK === 'auto' && shouldRunGymBooker(nowUtcHour));
 
   console.log(`\nTasks this run:`);
+  console.log(`  Morning Brief:     ${runMorning   ? '✅ running' : '⏭ skipped'}`);
+  console.log(`  Flight Monitor:    ${runFlights   ? '✅ running' : '⏭ skipped'}`);
   console.log(`  Apartment Monitor: ${runApartment ? '✅ running' : '⏭ skipped'}`);
-  console.log(`  Gym Booker:        ${runGym ? '✅ running' : '⏭ skipped'}`);
+  console.log(`  Gym Booker:        ${runGym       ? '✅ running' : '⏭ skipped'}`);
 
-  if (!runApartment && !runGym) {
+  if (!runMorning && !runFlights && !runApartment && !runGym) {
     console.log('\nNothing scheduled this hour. Exiting.');
     return;
   }
 
   // Run tasks sequentially, isolated
+  if (runMorning) {
+    try {
+      await runMorningBrief();
+    } catch (err) {
+      console.error('Morning brief crashed:', err.message);
+      await postToSlack(`⚠️ *Marie — Morning Brief crashed*\n${err.message}`).catch(() => {});
+    }
+  }
+
+  if (runFlights) {
+    try {
+      await runFlightMonitor();
+    } catch (err) {
+      console.error('Flight monitor crashed:', err.message);
+      await postToSlack(`⚠️ *Marie — Flight Monitor crashed*\n${err.message}`).catch(() => {});
+    }
+  }
+
   if (runApartment) {
     try {
       await runApartmentMonitor();
