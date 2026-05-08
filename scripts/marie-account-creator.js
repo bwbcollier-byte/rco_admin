@@ -232,8 +232,8 @@ async function signUp(page, site, email, password) {
   const siteName = site.fields['Name'];
 
   console.log(`\n  Navigating to: ${url}`);
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
-  await page.waitForTimeout(2000);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(4000);
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
 
   const filled = await page.evaluate((data) => {
