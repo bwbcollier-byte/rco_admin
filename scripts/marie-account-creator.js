@@ -75,6 +75,75 @@ async function generateTempEmail(siteName) {
   return email;
 }
 
+async function pollInbox(email, timeoutMs = 120000) {
+  const hash = md5(email);
+  console.log(`  Polling Temp Mail inbox for ${email}...`);
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    await new Promise(r => setTimeout(r, 8000));
+    try {
+      const res = await axios.get(
+        `https://privatix-temp-mail-v1.p.rapidapi.com/request/mail/id/${hash}/`,
+        { headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPMAIL_HOST } }
+      );
+      const messages = Array.isArray(res.data) ? res.data : [];
+      if (messages.length > 0) return messages;
+      console.log(`  No messages yet...`);
+    } catch (err) {
+      if (err.response?.status === 404) {
+        console.log(`  Inbox empty (404), waiting...`);
+      } else {
+        console.warn(`  Temp Mail poll error: ${err.message}`);
+      }
+    }
+  }
+  return [];
+}
+
+async function waitForOMDBKey(email, timeoutMs = 120000) {
+  const messages = await pollInbox(email, timeoutMs);
+  for (const msg of messages) {
+    const body = msg.mail_text_only || msg.mail_html || '';
+    console.log(`  Found message: "${msg.mail_subject}"`);
+    // OMDB keys are 8 alphanumeric chars
+    const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
+    if (keyMatch) {
+      console.log(`  OMDB API key found: ${keyMatch[1]}`);
+      return keyMatch[1];
+    }
+  }
+  console.warn(`  No OMDB API key found in inbox`);
+  return null;
+}
+
+async function saveOMDBApiKey(email, apiKey) {
+  if (DRY_RUN) {
+    console.log(`  [DRY RUN] Would save OMDB API key to Credentials: ${apiKey}`);
+    return;
+  }
+  try {
+    await axios.post(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}`,
+      {
+        fields: {
+          fld2lJoFqSGAEK5tw: `OMDB — ${email}`,
+          fldSNad5zoyLbpebm: 'API Key',
+          fld4tDedZ5uGVy3gP: 'Active',
+          fldXq9LKkrwecF5Fp: email,
+          fldGMbEDOCtLXqbLX: apiKey,
+          fldivTYDSK44aY26J: 'Use as ?apikey= query param on omdbapi.com',
+          fld5NI6ls6Qu16wnL: 'Free tier — 1,000 daily requests',
+        },
+      },
+      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`  ✅ OMDB API key saved to Credentials`);
+  } catch (err) {
+    console.warn(`  Airtable save failed:`, err.response?.data?.error || err.message);
+  }
+}
+
 async function waitForVerificationEmail(email, timeoutMs = 120000) {
   const hash = md5(email);
   console.log(`  Polling Temp Mail inbox for ${email} (md5: ${hash})...`);
@@ -464,29 +533,39 @@ async function main() {
 
       console.log(`  ✅ Signup submitted`);
 
-      // Step 3: Verify email if needed
-      if (signupResult.needsVerification) {
-        const verifyLink = await waitForVerificationEmail(email);
-
-        if (verifyLink) {
-          const verifyPage = await context.newPage();
-          try {
-            console.log(`  Clicking verification link...`);
-            await verifyPage.goto(verifyLink, { waitUntil: 'networkidle', timeout: 30000 });
-            await verifyPage.waitForTimeout(2000);
-            await verifyPage.screenshot({ path: `/tmp/marie-signup-${site.id}-verified.png` });
-            console.log(`  ✅ Email verified`);
-          } catch (err) {
-            console.warn(`  Verification navigation failed: ${err.message}`);
-          }
-          await verifyPage.close();
+      if (siteName === 'OMDB') {
+        // OMDB: extract API key from email, save as Credential only (no Login/password)
+        const apiKey = await waitForOMDBKey(email);
+        if (apiKey) {
+          await saveOMDBApiKey(email, apiKey);
         } else {
-          console.warn(`  ⚠️ No verification email found — account may still be pending`);
+          console.warn(`  ⚠️ OMDB key not received — check ${email} manually`);
         }
-      }
+      } else {
+        // Step 3: Verify email if needed
+        if (signupResult.needsVerification) {
+          const verifyLink = await waitForVerificationEmail(email);
 
-      // Step 4: Save to Airtable
-      await saveToAirtable(siteName, email, SIGNUP_PASSWORD, notes);
+          if (verifyLink) {
+            const verifyPage = await context.newPage();
+            try {
+              console.log(`  Clicking verification link...`);
+              await verifyPage.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await verifyPage.waitForTimeout(2000);
+              await verifyPage.screenshot({ path: `/tmp/marie-signup-${site.id}-verified.png` });
+              console.log(`  ✅ Email verified`);
+            } catch (err) {
+              console.warn(`  Verification navigation failed: ${err.message}`);
+            }
+            await verifyPage.close();
+          } else {
+            console.warn(`  ⚠️ No verification email found — account may still be pending`);
+          }
+        }
+
+        // Step 4: Save Login + Credential to Airtable
+        await saveToAirtable(siteName, email, SIGNUP_PASSWORD, notes);
+      }
 
       // Step 5: Update Signup Queue
       await updateSignupStatus(site.id, 'Done', {
