@@ -798,6 +798,82 @@ async function subscribeToRapidAPIs(context) {
 
 // ─── Playwright — sign up dispatcher ─────────────────────────────────────────
 
+async function signUpGroq(page, site, email, password) {
+  // Groq uses Clerk: email-only first step, then sends a magic link (no password entry)
+  await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+
+  // Look for "Sign up" tab/link if on the login page
+  const signUpLink = page.locator('a:has-text("Sign up"), button:has-text("Sign up")').first();
+  if (await signUpLink.isVisible().catch(() => false)) {
+    await signUpLink.click();
+    await page.waitForTimeout(2000);
+  }
+
+  // Fill email field
+  const emailInput = page.locator('input[type="email"], input[name*="email" i]').first();
+  if (!await emailInput.isVisible().catch(() => false)) {
+    return { success: false, reason: 'Groq: email input not found' };
+  }
+  await emailInput.fill(email);
+  await page.waitForTimeout(500);
+
+  // Submit — Clerk uses "Continue" button
+  await playwrightClickSubmit(page);
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-after.png` });
+
+  // Groq sends a magic link — always needs verification regardless of page text
+  console.log('  Groq: magic link sent, flagging for Phase 2 verification');
+  return { success: true, needsVerification: true };
+}
+
+async function signUpLastFM(page, site, email, password) {
+  await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(4000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+
+  // Username derived from email prefix (max 15 chars, alphanumeric + _ -)
+  const username = email.split('@')[0].replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 15);
+
+  // Fill fields with Playwright (handles React-bound inputs better than JS fill)
+  await page.locator('input[name="username"], #id_username').fill(username).catch(() => {});
+  await page.locator('input[type="email"], input[name*="email" i]').first().fill(email).catch(() => {});
+  // Last FM has two password fields (password + confirm)
+  const pwFields = await page.locator('input[type="password"]').all();
+  for (const f of pwFields) await f.fill(password).catch(() => {});
+
+  // Date of birth — Last FM uses <select> dropdowns
+  await page.locator('select[name="day"], #id_dob_day').selectOption('15').catch(() => {});
+  await page.locator('select[name="month"], #id_dob_month').selectOption('6').catch(() => {});
+  await page.locator('select[name="year"], #id_dob_year').selectOption('1990').catch(() => {});
+
+  // Gender optional — prefer not to say
+  await page.locator('select[name="gender"]').selectOption('n').catch(() => {});
+
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-filled.png` });
+
+  // Submit
+  const submitted = await playwrightClickSubmit(page);
+  if (!submitted) return { success: false, reason: 'Submit button not found' };
+
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-after.png` });
+
+  const text = await page.evaluate(() => document.body.innerText);
+  // Last FM CAPTCHA will block — detect and report cleanly
+  if (/captcha|robot|not a human/i.test(text)) {
+    return { success: false, reason: 'Last FM: CAPTCHA challenge — needs manual signup' };
+  }
+  const hasError = /error|invalid|already (registered|exists|taken)|try again/i.test(text);
+  if (hasError) {
+    const m = text.match(/(error|invalid|already)[^\n]{0,100}/i);
+    return { success: false, reason: m?.[0] || 'Error detected on page' };
+  }
+  return { success: true, needsVerification: true };
+}
+
 async function signUp(page, site, email, password) {
   const url = site.fields['URL'];
   const siteName = site.fields['Name'];
@@ -807,7 +883,9 @@ async function signUp(page, site, email, password) {
   // Site-specific flows
   if (siteName === 'Tavily')      return signUpTavily(page, site, email, password);
   if (siteName === 'Grok / xAI') return signUpXAI(page, site, email, password);
-  if (siteName === 'OMDB')     return signUpOMDB(page, site, email);
+  if (siteName === 'OMDB')        return signUpOMDB(page, site, email);
+  if (siteName === 'Groq')        return signUpGroq(page, site, email, password);
+  if (siteName === 'Last FM')     return signUpLastFM(page, site, email, password);
 
   // Generic flow
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
