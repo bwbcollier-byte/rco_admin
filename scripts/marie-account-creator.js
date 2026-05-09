@@ -36,10 +36,6 @@ const AIRTABLE_APIS     = 'tblMb9HFyKcnQ7aKb';   // APIs
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;
 const TEMPMAIL_HOST     = 'privatix-temp-mail-v1.p.rapidapi.com';
 
-const GMAIL_CLIENT_ID     = process.env.GMAIL_CLIENT_ID;
-const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
-const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
-const GMAIL_USER_EMAIL    = process.env.GMAIL_USER_EMAIL;
 
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
@@ -154,83 +150,6 @@ async function saveOMDBApiKey(email, apiKey) {
 
 // ─── Gmail API ────────────────────────────────────────────────────────────────
 
-async function getGmailAccessToken() {
-  const res = await axios.post('https://oauth2.googleapis.com/token', {
-    client_id: GMAIL_CLIENT_ID,
-    client_secret: GMAIL_CLIENT_SECRET,
-    refresh_token: GMAIL_REFRESH_TOKEN,
-    grant_type: 'refresh_token',
-  });
-  return res.data.access_token;
-}
-
-// Shared helper: extract readable text body from a Gmail message object
-function extractGmailBody(msg) {
-  const getBody = (parts) => {
-    if (!parts) return '';
-    for (const p of parts) {
-      if (p.mimeType === 'text/plain' || p.mimeType === 'text/html') {
-        return Buffer.from(p.body?.data || '', 'base64url').toString('utf-8');
-      }
-      if (p.parts) { const sub = getBody(p.parts); if (sub) return sub; }
-    }
-    return '';
-  };
-  return getBody(msg.payload?.parts) || Buffer.from(msg.payload?.body?.data || '', 'base64url').toString('utf-8');
-}
-
-async function waitForGmailVerification(aliasEmail, timeoutMs = 120000) {
-  if (!GMAIL_CLIENT_ID || !GMAIL_REFRESH_TOKEN) {
-    console.warn('  Gmail credentials not set — cannot poll Gmail inbox');
-    return null;
-  }
-
-  console.log(`  Polling Gmail inbox for ${aliasEmail}...`);
-  const start = Date.now();
-  const accessToken = await getGmailAccessToken();
-
-  while (Date.now() - start < timeoutMs) {
-    await new Promise(r => setTimeout(r, 10000));
-    try {
-      // Search for emails sent to this alias in the last 10 minutes
-      const query = `to:${aliasEmail} newer_than:1h`;
-      const listRes = await axios.get('https://gmail.googleapis.com/gmail/v1/users/me/messages', {
-        params: { q: query, maxResults: 5 },
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-
-      const messages = listRes.data.messages || [];
-      if (messages.length === 0) { console.log(`  No Gmail messages yet...`); continue; }
-
-      // Get the first message body
-      for (const { id } of messages) {
-        const msgRes = await axios.get(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`,
-          { params: { format: 'full' }, headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-
-        const msg = msgRes.data;
-        const subject = msg.payload?.headers?.find(h => h.name === 'Subject')?.value || '';
-        console.log(`  Found Gmail message: "${subject}"`);
-
-        const body = extractGmailBody(msg);
-
-        const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:verif|confirm|activate|validate)[^\s"'<>]*/i)
-          || body.match(/https?:\/\/[^\s"'<>]{30,}/);
-
-        if (linkMatch) {
-          console.log(`  Gmail verification link found`);
-          return linkMatch[0];
-        }
-      }
-    } catch (err) {
-      console.warn(`  Gmail poll error: ${err.response?.data?.error?.message || err.message}`);
-    }
-  }
-
-  console.warn(`  No Gmail verification email found after ${timeoutMs / 1000}s`);
-  return null;
-}
 
 async function waitForVerificationEmail(email, timeoutMs = 120000) {
   const hash = md5(email);
@@ -293,7 +212,7 @@ async function getPendingSignups() {
     {
       params: {
         filterByFormula: `{Status} = "Pending"`,
-        fields: ['Name', 'URL', 'Email Alias', 'Category', 'Status', 'Notes'],
+        fields: ['Name', 'URL', 'Category', 'Status', 'Notes'],
       },
       headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
     }
