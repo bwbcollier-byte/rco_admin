@@ -486,53 +486,133 @@ async function checkPageResult(page, siteId, label) {
 // Used by Tavily and Cerebras
 async function signUpMultiStep(page, site, email, password) {
   await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(8000); // extra time for JS-heavy auth pages
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
 
-  // Step 1: fill email using Playwright's real fill()
-  // Try specific selectors first, then fall back to first visible text/email input
+  // Debug: log current URL (may have redirected) and all inputs on page + frames
+  const landedUrl = page.url();
+  console.log(`  Landed URL: ${landedUrl}`);
+  try {
+    const allInputs = await page.$$eval('input', els => els.map(el => ({
+      type: el.type, id: el.id, name: el.name,
+      placeholder: el.placeholder, autocomplete: el.autocomplete,
+    })));
+    console.log(`  Inputs on main frame: ${JSON.stringify(allInputs)}`);
+  } catch (e) { console.log(`  Could not list inputs: ${e.message}`); }
+
+  // Also check iframes
+  const frames = page.frames();
+  console.log(`  Total frames: ${frames.length}`);
+  for (const frame of frames) {
+    if (frame === page.mainFrame()) continue;
+    const furl = frame.url();
+    console.log(`  Frame URL: ${furl}`);
+    try {
+      const fi = await frame.$$eval('input', els => els.map(el => ({
+        type: el.type, id: el.id, name: el.name, placeholder: el.placeholder,
+      })));
+      if (fi.length) console.log(`  Frame inputs: ${JSON.stringify(fi)}`);
+    } catch { /* cross-origin frame */ }
+  }
+
+  // Step 1: fill email — try main frame first, then each iframe
   const emailSelectors = [
     'input[type="email"]',
     'input[autocomplete="email"]',
+    'input[autocomplete="username"]',
     'input[name*="email" i]',
     'input[id*="email" i]',
     'input[placeholder*="email" i]',
     'input[placeholder*="@" i]',
-    'input[type="text"]:visible',
+    'input[type="text"]',
   ];
-  let emailFilled = false;
-  for (const sel of emailSelectors) {
-    try {
-      await page.waitForSelector(sel, { timeout: 3000 });
-      await page.fill(sel, email);
-      emailFilled = true;
-      break;
-    } catch { /* try next */ }
+
+  // Helper: try to fill email in a given frame context
+  async function tryFillEmailIn(ctx) {
+    for (const sel of emailSelectors) {
+      try {
+        await ctx.waitForSelector(sel, { state: 'visible', timeout: 2000 });
+        await ctx.fill(sel, email);
+        return true;
+      } catch { /* try next */ }
+    }
+    return false;
   }
+
+  let emailFilled = await tryFillEmailIn(page);
+
+  // If not found in main frame, try each iframe
+  if (!emailFilled) {
+    for (const frame of frames) {
+      if (frame === page.mainFrame()) continue;
+      emailFilled = await tryFillEmailIn(frame);
+      if (emailFilled) {
+        console.log(`  Email filled in frame: ${frame.url()}`);
+        break;
+      }
+    }
+  }
+
   if (!emailFilled) {
     await page.screenshot({ path: `/tmp/marie-signup-${site.id}-email-not-found.png` });
     return { success: false, reason: `${site.fields['Name']}: email field not found` };
   }
 
-  // Click Continue with real Playwright click
-  const step1 = await playwrightClickSubmit(page);
+  // Determine which frame context the email was filled in (for subsequent steps)
+  let activeCtx = page;
+  for (const frame of frames) {
+    if (frame === page.mainFrame()) continue;
+    try {
+      const hasEmail = await frame.$eval(emailSelectors[0] + ', ' + emailSelectors.join(', '), () => true).catch(() => false);
+      if (hasEmail) { activeCtx = frame; break; }
+    } catch {}
+  }
+
+  // Click Continue — try activeCtx first, then page
+  async function clickContinue(ctx) {
+    const texts = ['Continue', 'Continue with email', 'Sign up', 'Register', 'Create account', 'Submit', 'Get started', 'Next'];
+    try {
+      const btn = ctx.locator('button[type="submit"], input[type="submit"]').first();
+      await btn.click({ timeout: 5000 });
+      return true;
+    } catch {}
+    for (const text of texts) {
+      try {
+        await ctx.getByRole('button', { name: new RegExp(text, 'i') }).first().click({ timeout: 3000 });
+        return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  let step1 = await clickContinue(activeCtx);
+  if (!step1 && activeCtx !== page) step1 = await clickContinue(page);
   if (!step1) return { success: false, reason: `${site.fields['Name']}: Continue button not found on step 1` };
 
-  // Step 2: wait for password field
+  // Step 2: wait for password field (in same ctx or page)
+  let pwCtx = activeCtx;
   try {
-    await page.waitForSelector('input[type="password"]', { timeout: 12000 });
+    await pwCtx.waitForSelector('input[type="password"]', { state: 'visible', timeout: 12000 });
   } catch {
-    return { success: false, reason: `${site.fields['Name']}: password field never appeared after Continue` };
+    // Try main page
+    try {
+      await page.waitForSelector('input[type="password"]', { state: 'visible', timeout: 5000 });
+      pwCtx = page;
+    } catch {
+      await page.screenshot({ path: `/tmp/marie-signup-${site.id}-no-password.png` });
+      return { success: false, reason: `${site.fields['Name']}: password field never appeared after Continue` };
+    }
   }
   await page.waitForTimeout(1000);
 
   // Fill password + confirm if present
-  const pwFields = await page.$$('input[type="password"]');
+  const pwFields = await pwCtx.$$('input[type="password"]');
   for (const field of pwFields) {
     await field.fill(password);
   }
 
-  const step2 = await playwrightClickSubmit(page);
+  let step2 = await clickContinue(pwCtx);
+  if (!step2 && pwCtx !== page) step2 = await clickContinue(page);
   if (!step2) return { success: false, reason: `${site.fields['Name']}: submit button not found on step 2` };
 
   console.log('  Form submitted (multi-step)');
