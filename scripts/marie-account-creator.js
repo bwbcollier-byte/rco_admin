@@ -1,23 +1,18 @@
 /**
  * Marie — Account Creator
  *
- * Reads the Airtable "Signup Queue" table for entries with Status = "Pending":
- *   1. Generates a fresh temp email via Temp Mail API (Privatix / RapidAPI)
- *   2. Navigates to signup URL with Playwright
- *   3. Fills form intelligently (email, name, password, username)
- *   4. Submits and polls Temp Mail inbox for verification email
- *   5. Clicks verification link
- *   6. Saves login + credentials to Airtable Logins + Credentials tables
- *   7. Updates Signup Queue record status to "Done" or "Failed"
- *   8. Posts summary to Slack
- *
- * Triggered manually: workflow_dispatch with TASK=signup
+ * Architecture: ONE Gmail alias per run (benwbcollier+marie{ts}@gmail.com).
+ * All sites sign up with that address. After Phase 1 (all forms submitted),
+ * Phase 2 polls Gmail for every email that arrived, clicks all verification
+ * links in one pass. Phase 3 subscribes to curated RapidAPI APIs while the
+ * browser session is still live. Phase 4 saves credentials + marks Done.
  *
  * Secrets required:
- *   RAPIDAPI_KEY
+ *   GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_USER_EMAIL
  *   AIRTABLE_API_KEY
+ *   RAPIDAPI_KEY
  *   SLACK_BOT_TOKEN, SLACK_CHANNEL_AI_ENGINEERING
- *   SIGNUP_PASSWORD  — base password for all new accounts
+ *   SIGNUP_PASSWORD
  */
 
 const { chromium } = require('playwright');
@@ -36,6 +31,10 @@ const AIRTABLE_APIS     = 'tblMb9HFyKcnQ7aKb';   // APIs
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;
 const TEMPMAIL_HOST     = 'privatix-temp-mail-v1.p.rapidapi.com';
 
+const GMAIL_CLIENT_ID     = process.env.GMAIL_CLIENT_ID;
+const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
+const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
+const GMAIL_USER_EMAIL    = process.env.GMAIL_USER_EMAIL;   // e.g. benwbcollier@gmail.com
 
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
@@ -288,15 +287,93 @@ async function saveToAirtable(siteName, email, password, notes) {
   }
 }
 
+// ─── Gmail API ────────────────────────────────────────────────────────────────
+
+// Generate a unique Gmail alias for this run — all sites use this one address.
+// Gmail delivers it to the main inbox; we filter by the alias when polling.
+function generateBatchEmail() {
+  if (!GMAIL_USER_EMAIL) throw new Error('GMAIL_USER_EMAIL not set');
+  const ts  = Date.now().toString(36); // compact 8-char timestamp
+  const base = GMAIL_USER_EMAIL.split('@')[0];
+  return `${base}+marie${ts}@gmail.com`;
+}
+
+async function getGmailAccessToken() {
+  const res = await axios.post('https://oauth2.googleapis.com/token', {
+    client_id:     GMAIL_CLIENT_ID,
+    client_secret: GMAIL_CLIENT_SECRET,
+    refresh_token: GMAIL_REFRESH_TOKEN,
+    grant_type:    'refresh_token',
+  });
+  return res.data.access_token;
+}
+
+function extractGmailBody(msg) {
+  const getBody = (parts) => {
+    if (!parts) return '';
+    for (const p of parts) {
+      if (p.mimeType === 'text/plain' || p.mimeType === 'text/html')
+        return Buffer.from(p.body?.data || '', 'base64url').toString('utf-8');
+      if (p.parts) { const sub = getBody(p.parts); if (sub) return sub; }
+    }
+    return '';
+  };
+  return getBody(msg.payload?.parts)
+    || Buffer.from(msg.payload?.body?.data || '', 'base64url').toString('utf-8');
+}
+
+// Poll Gmail for ALL emails sent to the batch alias.
+// Returns array of { subject, from, body } — same shape pollInbox uses.
+async function pollGmailBatch(aliasEmail, timeoutMs = 600000) {
+  console.log(`  Polling Gmail for emails to: ${aliasEmail}`);
+  const accessToken = await getGmailAccessToken();
+  const deadline    = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const listRes = await axios.get(
+        'https://gmail.googleapis.com/gmail/v1/users/me/messages',
+        {
+          params: { q: `to:${aliasEmail} newer_than:2h`, maxResults: 30 },
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      const ids = listRes.data.messages || [];
+      if (ids.length > 0) {
+        console.log(`  Found ${ids.length} message(s)`);
+        const messages = [];
+        for (const { id } of ids) {
+          const detail = await axios.get(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`,
+            { params: { format: 'full' }, headers: { Authorization: `Bearer ${accessToken}` } }
+          );
+          const hdrs    = detail.data.payload?.headers || [];
+          const subject = hdrs.find(h => h.name === 'Subject')?.value || '';
+          const from    = hdrs.find(h => h.name === 'From')?.value    || '';
+          const body    = extractGmailBody(detail.data);
+          messages.push({ mail_subject: subject, mail_from: from, mail_text_only: body, mail_html: body });
+        }
+        return messages;
+      }
+      console.log(`  No Gmail messages yet, waiting 15s...`);
+    } catch (e) {
+      console.warn(`  Gmail poll error: ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 15000));
+  }
+  console.warn(`  Gmail inbox empty after ${timeoutMs / 1000}s`);
+  return [];
+}
+
 // ─── Airtable — RapidAPI subscription list ────────────────────────────────────
 
 async function getUnsubscribedRapidAPIs() {
-  // Returns APIs table records where Source = "RapidAPI" and Subscribed = false
+  // Only pulls APIs where "Subscribe via Marie" is checked AND not yet subscribed
   const res = await axios.get(
     `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}`,
     {
       params: {
-        filterByFormula: `AND({Source} = "RapidAPI", NOT({Subscribed}))`,
+        filterByFormula: `AND({Subscribe via Marie}, NOT({Subscribed}))`,
         fields: ['Name', 'Link'],
       },
       headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
@@ -863,8 +940,8 @@ async function main() {
     return;
   }
 
-  // Generate ONE temp email for the entire batch
-  const batchEmail = await generateTempEmail('rascals');
+  // Generate ONE Gmail alias for the entire batch — real inbox, no blocklist issues
+  const batchEmail = generateBatchEmail();
   console.log(`\nBatch email for this run: ${batchEmail}`);
 
   const browser = await chromium.launch({
@@ -942,8 +1019,8 @@ async function main() {
     console.log(`Phase 2 — Batch verifying ${needVerify.length} account(s) from shared inbox`);
     console.log('═'.repeat(60));
 
-    // Poll with generous timeout — all services share the same inbox
-    const messages = await pollInbox(batchEmail, 180000); // 3 min
+    // Poll Gmail — real inbox, no blocklist issues, 10 min timeout
+    const messages = await pollGmailBatch(batchEmail, 600000);
     console.log(`  Found ${messages.length} message(s) in inbox`);
 
     const omdbItem = submitted.find(s => s.isOMDB);
