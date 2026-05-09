@@ -971,9 +971,9 @@ async function signUpRapidAPI(page, site, email, password) {
     return { success: false, reason: m?.[0] || 'Error detected on page' };
   }
 
-  // RapidAPI always sends a verification email — flag for Phase 2
-  console.log('  RapidAPI: flagging for Phase 2 email verification');
-  return { success: true, needsVerification: true };
+  // RapidAPI does not send a verification email — session is ready immediately
+  console.log('  RapidAPI: signup complete (no email verification required)');
+  return { success: true, needsVerification: false };
 }
 
 async function signUp(page, site, email, password) {
@@ -1349,8 +1349,9 @@ async function captureLastFMKey(context, loginId) {
       if (await descInput.isVisible().catch(() => false)) {
         await descInput.fill('Internal music data integration');
       }
-      const submitBtn = page.locator('button[type="submit"], input[type="submit"]').first();
-      await submitBtn.click();
+      // Scope to the form to avoid clicking the site's masthead search button
+      const submitBtn = page.locator('form input[type="submit"], form button[type="submit"]:not(.masthead-search-submit)').first();
+      await submitBtn.click({ timeout: 10000 });
       await page.waitForTimeout(3000);
     }
 
@@ -1504,10 +1505,15 @@ async function main() {
     const omdbItem = submitted.find(s => s.isOMDB);
 
     for (const msg of messages) {
+      // Log raw keys so we can confirm field names from this API
+      console.log(`  Raw message keys: ${Object.keys(msg).join(', ')}`);
+      console.log(`  Raw message sample: ${JSON.stringify(msg).slice(0, 300)}`);
+
       // Normalise field names across possible API response shapes
-      const subject = msg.subject || msg.mail_subject || msg.Subject || '(no subject)';
-      const from    = msg.from    || msg.mail_from    || msg.From    || '';
-      const body    = msg.body    || msg.mail_text_only || msg.text  || msg.html || msg.mail_html || '';
+      const subject = msg.subject || msg.Subject || msg.mail_subject || msg.title || '(no subject)';
+      const from    = msg.from    || msg.From    || msg.mail_from    || msg.sender || '';
+      const body    = msg.body    || msg.Body    || msg.text         || msg.html
+                   || msg.content || msg.message || msg.mail_text_only || msg.mail_html || '';
       console.log(`\n  Message: "${subject}" from ${from}`);
 
       // OMDB sends API key in email body (not a verification link)
