@@ -1399,11 +1399,35 @@ async function captureLastFMKey(context, loginId) {
       if (await descInput.isVisible().catch(() => false)) {
         await descInput.fill('Internal music data integration');
       }
-      // Use getByRole to find the form submit button by text, avoiding the search button
-      const submitBtn = page.getByRole('button', { name: /apply|create|submit|save/i }).first();
-      const submitInput = page.locator('input[type="submit"]').first();
-      const btn = (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) ? submitBtn : submitInput;
-      await btn.click({ timeout: 8000 });
+      // Screenshot to debug what submit element is present
+      await page.screenshot({ path: '/tmp/lastfm-api-form.png' });
+      // Try multiple submit patterns — Last FM API form may use button or input
+      const submitSelectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Apply")',
+        'button:has-text("Create")',
+        'button:has-text("Submit")',
+        'button:has-text("Save")',
+        '.btn[type="submit"]',
+        'form .btn',
+      ];
+      let clicked = false;
+      for (const sel of submitSelectors) {
+        try {
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 2000 })) {
+            await el.click({ timeout: 5000 });
+            clicked = true;
+            console.log(`  Last FM API form submitted via: ${sel}`);
+            break;
+          }
+        } catch { /* try next */ }
+      }
+      if (!clicked) {
+        console.warn('  ⚠️ Last FM: could not find submit button — check /tmp/lastfm-api-form.png');
+        return;
+      }
       await page.waitForTimeout(3000);
     } else {
       console.warn('  ⚠️ Last FM: API account form not found — session may not be authenticated');
