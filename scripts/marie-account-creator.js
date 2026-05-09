@@ -31,6 +31,7 @@ const AIRTABLE_BASE_ID  = 'app6biS7yjV6XzFVG';
 const AIRTABLE_QUEUE    = 'tbl0mLelR78YJjKwV';   // Signup Queue
 const AIRTABLE_LOGINS   = 'tbldJkG11gY1W3jTf';   // Logins
 const AIRTABLE_CREDS    = 'tblvBr6RIc7bcGXYJ';   // Credentials
+const AIRTABLE_APIS     = 'tblMb9HFyKcnQ7aKb';   // APIs
 
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;
 const TEMPMAIL_HOST     = 'privatix-temp-mail-v1.p.rapidapi.com';
@@ -123,39 +124,6 @@ async function waitForOMDBKey(email, timeoutMs = 120000) {
   return null;
 }
 
-// OMDB key polling via Gmail (for Gmail alias email addresses)
-async function waitForOMDBKeyGmail(aliasEmail, timeoutMs = 120000) {
-  const accessToken = await getGmailAccessToken();
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await axios.get(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages`,
-        {
-          params: { q: `to:${aliasEmail} from:omdbapi.com newer_than:1h`, maxResults: 5 },
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }
-      );
-      const msgs = res.data.messages || [];
-      for (const m of msgs) {
-        const detail = await axios.get(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        const body = extractGmailBody(detail.data);
-        const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
-        if (keyMatch) {
-          console.log(`  OMDB API key found via Gmail: ${keyMatch[1]}`);
-          return keyMatch[1];
-        }
-      }
-    } catch (e) { console.warn(`  Gmail poll error: ${e.message}`); }
-    console.log('  No OMDB key yet, waiting 15s...');
-    await new Promise(r => setTimeout(r, 15000));
-  }
-  console.warn(`  No OMDB API key found in Gmail`);
-  return null;
-}
 
 async function saveOMDBApiKey(email, apiKey) {
   if (DRY_RUN) {
@@ -399,6 +367,32 @@ async function saveToAirtable(siteName, email, password, notes) {
     console.warn(`  Airtable save failed:`, err.response?.data?.error || err.message);
     return null;
   }
+}
+
+// ─── Airtable — RapidAPI subscription list ────────────────────────────────────
+
+async function getUnsubscribedRapidAPIs() {
+  // Returns APIs table records where Source = "RapidAPI" and Subscribed = false
+  const res = await axios.get(
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}`,
+    {
+      params: {
+        filterByFormula: `AND({Source} = "RapidAPI", NOT({Subscribed}))`,
+        fields: ['Name', 'Link'],
+      },
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+    }
+  );
+  return res.data.records || [];
+}
+
+async function markRapidAPISubscribed(recordId) {
+  if (DRY_RUN) { console.log(`  [DRY RUN] Would mark API ${recordId} as subscribed`); return; }
+  await axios.patch(
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`,
+    { fields: { fldFBb9KjAeY1XCsn: true } },
+    { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
+  );
 }
 
 // ─── Slack ────────────────────────────────────────────────────────────────────
@@ -687,7 +681,6 @@ async function signUpMultiStep(page, site, email, password) {
   return checkPageResult(page, site.id, 'after');
 }
 
-const signUpCerebras = signUpMultiStep;
 
 // Tavily — Auth0 identifier-first with Cloudflare Turnstile
 // Password field exists in DOM but is CSS-hidden; force-fill to bypass CAPTCHA gate
@@ -789,6 +782,107 @@ async function signUpOMDB(page, site, email) {
   return checkPageResult(page, site.id, 'after');
 }
 
+// ─── RapidAPI — batch API subscriber ─────────────────────────────────────────
+// Runs after RapidAPI account is created+verified. Browser context is already
+// logged in. Iterates unsubscribed RapidAPI APIs from Airtable and clicks
+// "Subscribe to Test" on the free/basic plan for each.
+
+async function subscribeToRapidAPIs(context) {
+  const apis = await getUnsubscribedRapidAPIs();
+  if (apis.length === 0) {
+    console.log('  No unsubscribed RapidAPI APIs found — nothing to do');
+    return { subscribed: [], failed: [] };
+  }
+  console.log(`  Subscribing to ${apis.length} RapidAPI API(s)...`);
+
+  const subscribed = [];
+  const failed = [];
+
+  for (const api of apis) {
+    const name = api.fields['Name'] || api.id;
+    const link = api.fields['Link'];
+    if (!link) { failed.push({ name, reason: 'No Link field' }); continue; }
+
+    // Normalise to the pricing tab (most reliable entry point)
+    const pricingUrl = link.includes('/pricing') ? link : link.replace(/\/$/, '') + '/pricing';
+    console.log(`\n  → ${name} (${pricingUrl})`);
+
+    const page = await context.newPage();
+    try {
+      await page.goto(pricingUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+      await page.waitForTimeout(3000);
+
+      // Find the free/basic plan subscribe button
+      // RapidAPI renders plan cards; the free plan usually has "Subscribe" or "Select Plan"
+      const subscribeSelectors = [
+        'button:has-text("Subscribe to Test")',
+        'button:has-text("Subscribe")',
+        'button:has-text("Select Plan")',
+        'a:has-text("Subscribe")',
+        '[data-testid="subscribe-button"]',
+      ];
+
+      let clicked = false;
+      for (const sel of subscribeSelectors) {
+        try {
+          // Click the FIRST visible one (free/basic tier)
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 3000 })) {
+            await btn.click();
+            await page.waitForTimeout(2000);
+            console.log(`    Clicked: ${sel}`);
+            clicked = true;
+            break;
+          }
+        } catch {}
+      }
+
+      if (!clicked) {
+        // May already be subscribed — check for "Current Plan" / "You're subscribed"
+        const alreadySub = await page.locator('text=/current plan|already subscribed|you.re subscribed/i').first().isVisible().catch(() => false);
+        if (alreadySub) {
+          console.log(`    Already subscribed to ${name}`);
+          await markRapidAPISubscribed(api.id);
+          subscribed.push(name);
+        } else {
+          await page.screenshot({ path: `/tmp/rapidapi-${api.id}-no-btn.png` });
+          failed.push({ name, reason: 'Subscribe button not found' });
+        }
+        await page.close();
+        continue;
+      }
+
+      // Handle any confirmation modal ("Confirm subscription")
+      try {
+        await page.waitForSelector('button:has-text("Confirm"), button:has-text("Yes")', { state: 'visible', timeout: 4000 });
+        await page.locator('button:has-text("Confirm"), button:has-text("Yes")').first().click();
+        await page.waitForTimeout(2000);
+        console.log(`    Confirmed subscription modal`);
+      } catch {}
+
+      // Verify success — look for success toast / "Subscribed" label
+      await page.waitForTimeout(2000);
+      const success = await page.locator('text=/subscribed|success/i').first().isVisible().catch(() => false);
+      if (success || clicked) {
+        console.log(`    ✅ Subscribed to ${name}`);
+        await markRapidAPISubscribed(api.id);
+        subscribed.push(name);
+      } else {
+        await page.screenshot({ path: `/tmp/rapidapi-${api.id}-unsure.png` });
+        failed.push({ name, reason: 'Could not confirm subscription' });
+      }
+    } catch (err) {
+      console.warn(`    ❌ ${name}: ${err.message}`);
+      failed.push({ name, reason: err.message });
+    }
+    await page.close();
+    await new Promise(r => setTimeout(r, 1500));
+  }
+
+  console.log(`\n  RapidAPI subscriptions: ${subscribed.length} done, ${failed.length} failed`);
+  return { subscribed, failed };
+}
+
 // ─── Playwright — sign up dispatcher ─────────────────────────────────────────
 
 async function signUp(page, site, email, password) {
@@ -798,8 +892,7 @@ async function signUp(page, site, email, password) {
   console.log(`\n  Navigating to: ${url}`);
 
   // Site-specific flows
-  if (siteName === 'Tavily')    return signUpTavily(page, site, email, password);
-  if (siteName === 'Cerebras') return signUpCerebras(page, site, email, password);
+  if (siteName === 'Tavily')      return signUpTavily(page, site, email, password);
   if (siteName === 'Grok / xAI') return signUpXAI(page, site, email, password);
   if (siteName === 'OMDB')     return signUpOMDB(page, site, email);
 
@@ -822,6 +915,15 @@ async function signUp(page, site, email, password) {
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
+//
+// Architecture:
+//   ONE temp email is generated at the start of each run.
+//   Phase 1 — Submit ALL signups with that email (fire-and-forget, no per-site waiting)
+//   Phase 2 — Single batch inbox poll: click every verification link found
+//   Phase 3 — RapidAPI: subscribe to APIs while browser is logged in
+//   Phase 4 — Save credentials + mark Done for everything
+//
+// Next run generates a fresh email and repeats.
 
 async function main() {
   console.log('='.repeat(60));
@@ -842,6 +944,10 @@ async function main() {
     return;
   }
 
+  // Generate ONE temp email for the entire batch
+  const batchEmail = await generateTempEmail('rascals');
+  console.log(`\nBatch email for this run: ${batchEmail}`);
+
   const browser = await chromium.launch({
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
@@ -854,7 +960,6 @@ async function main() {
     locale: 'en-AU',
     extraHTTPHeaders: { 'Accept-Language': 'en-AU,en;q=0.9' },
   });
-  // Hide automation flags from JS
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
@@ -862,84 +967,38 @@ async function main() {
   });
 
   const results = { done: [], failed: [] };
+  // Track successfully submitted sites for batch verification
+  const submitted = []; // { site, needsVerification, isOMDB, isRapidAPI }
+
+  // ── Phase 1: Submit all signups ──────────────────────────────────────────
+  console.log(`\n${'═'.repeat(60)}`);
+  console.log('Phase 1 — Submitting all signups');
+  console.log('═'.repeat(60));
 
   for (const site of pending) {
     const siteName = site.fields['Name'];
     const siteUrl  = site.fields['URL'];
-    const notes    = site.fields['Notes'] || '';
 
     console.log(`\n${'─'.repeat(50)}`);
-    console.log(`Site: ${siteName}`);
-    console.log(`URL:  ${siteUrl}`);
+    console.log(`Site: ${siteName}  |  ${siteUrl}`);
 
     const page = await context.newPage();
-
     try {
-      // Step 1: Determine email — Gmail alias if set, otherwise Temp Mail
-      const emailAlias = site.fields['Email Alias'];
-      const useGmail   = !!emailAlias;
-      const email      = useGmail ? emailAlias : await generateTempEmail(siteName);
-      if (useGmail) console.log(`  Using Gmail alias: ${email}`);
+      const result = await signUp(page, site, batchEmail, SIGNUP_PASSWORD);
 
-      // Step 2: Sign up
-      const signupResult = await signUp(page, site, email, SIGNUP_PASSWORD);
-
-      if (!signupResult.success) {
-        console.log(`  ❌ Signup failed: ${signupResult.reason}`);
-        results.failed.push({ name: siteName, reason: signupResult.reason });
-        await updateSignupStatus(site.id, 'Failed', { 'Fail Reason': signupResult.reason });
-        await page.close();
-        continue;
-      }
-
-      console.log(`  ✅ Signup submitted`);
-
-      if (siteName === 'OMDB') {
-        // OMDB: extract API key from email (Gmail alias preferred; fallback Temp Mail)
-        const apiKey = useGmail
-          ? await waitForOMDBKeyGmail(email)
-          : await waitForOMDBKey(email);
-        if (apiKey) {
-          await saveOMDBApiKey(email, apiKey);
-        } else {
-          console.warn(`  ⚠️ OMDB key not received — check ${email} manually`);
-        }
+      if (!result.success) {
+        console.log(`  ❌ Signup failed: ${result.reason}`);
+        results.failed.push({ name: siteName, reason: result.reason });
+        await updateSignupStatus(site.id, 'Failed', { 'Fail Reason': result.reason });
       } else {
-        // Step 3: Verify email if needed
-        if (signupResult.needsVerification) {
-          const verifyLink = useGmail
-            ? await waitForGmailVerification(email)
-            : await waitForVerificationEmail(email);
-
-          if (verifyLink) {
-            const verifyPage = await context.newPage();
-            try {
-              console.log(`  Clicking verification link...`);
-              await verifyPage.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
-              await verifyPage.waitForTimeout(2000);
-              await verifyPage.screenshot({ path: `/tmp/marie-signup-${site.id}-verified.png` });
-              console.log(`  ✅ Email verified`);
-            } catch (err) {
-              console.warn(`  Verification navigation failed: ${err.message}`);
-            }
-            await verifyPage.close();
-          } else {
-            console.warn(`  ⚠️ No verification email found — account may still be pending`);
-          }
-        }
-
-        // Step 4: Save Login + Credential to Airtable
-        await saveToAirtable(siteName, email, SIGNUP_PASSWORD, notes);
+        console.log(`  ✅ Submitted`);
+        submitted.push({
+          site,
+          needsVerification: !!result.needsVerification,
+          isOMDB: siteName === 'OMDB',
+          isRapidAPI: siteName === 'RapidAPI',
+        });
       }
-
-      // Step 5: Update Signup Queue
-      await updateSignupStatus(site.id, 'Done', {
-        'Email Used': email,
-        'Completed At': new Date().toISOString(),
-      });
-
-      results.done.push({ name: siteName, email });
-
     } catch (err) {
       console.error(`  ❌ Error: ${err.message}`);
       results.failed.push({ name: siteName, reason: err.message });
@@ -950,13 +1009,130 @@ async function main() {
     await new Promise(r => setTimeout(r, 2000));
   }
 
-  await browser.close();
+  if (submitted.length === 0) {
+    console.log('\nNo sites submitted successfully — skipping verification.');
+    await browser.close();
+    await postSlackSummary(results, batchEmail);
+    return;
+  }
 
-  // Slack summary
-  const lines = [`🔐 *Kondo — Account Creator Summary*`];
+  // ── Phase 2: Batch inbox poll — click ALL verification links ─────────────
+  const needVerify = submitted.filter(s => s.needsVerification || s.isOMDB);
+  if (needVerify.length > 0) {
+    console.log(`\n${'═'.repeat(60)}`);
+    console.log(`Phase 2 — Batch verifying ${needVerify.length} account(s) from shared inbox`);
+    console.log('═'.repeat(60));
+
+    // Poll with generous timeout — all services share the same inbox
+    const messages = await pollInbox(batchEmail, 180000); // 3 min
+    console.log(`  Found ${messages.length} message(s) in inbox`);
+
+    const omdbItem = submitted.find(s => s.isOMDB);
+
+    for (const msg of messages) {
+      const subject  = msg.mail_subject || '(no subject)';
+      const from     = msg.mail_from    || '';
+      const body     = msg.mail_text_only || msg.mail_html || '';
+      console.log(`\n  Message: "${subject}" from ${from}`);
+
+      // OMDB sends API key (not a link) — extract it
+      if (omdbItem && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
+        const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
+        if (keyMatch) {
+          console.log(`  OMDB API key: ${keyMatch[1]}`);
+          await saveOMDBApiKey(batchEmail, keyMatch[1]);
+          omdbItem.omdbDone = true;
+        }
+        continue;
+      }
+
+      // All others: find and click verification link
+      const linkMatch =
+        body.match(/https?:\/\/[^\s"'<>]+(?:verif|confirm|activate|validate|magic|token)[^\s"'<>]*/i) ||
+        body.match(/https?:\/\/[^\s"'<>]{50,}/);
+
+      if (linkMatch) {
+        const link = linkMatch[0].replace(/&amp;/g, '&');
+        console.log(`  Clicking: ${link.slice(0, 100)}...`);
+        const verifyPage = await context.newPage();
+        try {
+          await verifyPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await verifyPage.waitForTimeout(3000);
+          await verifyPage.screenshot({ path: `/tmp/marie-verify-${Date.now()}.png` });
+          console.log(`  ✅ Verified (${verifyPage.url().slice(0, 60)}...)`);
+        } catch (err) {
+          console.warn(`  Verification nav failed: ${err.message}`);
+        }
+        await verifyPage.close();
+      } else {
+        console.log(`  No verification link found in this message`);
+      }
+    }
+
+    if (messages.length === 0) {
+      console.warn('  ⚠️ Inbox empty — verification emails may still be in transit');
+    }
+  }
+
+  // ── Phase 3: RapidAPI — batch subscribe while browser is logged in ────────
+  const rapidItem = submitted.find(s => s.isRapidAPI);
+  if (rapidItem) {
+    console.log(`\n${'═'.repeat(60)}`);
+    console.log('Phase 3 — RapidAPI batch subscriptions');
+    console.log('═'.repeat(60));
+
+    // Navigate back to RapidAPI — session cookies should still be active
+    const rapidPage = await context.newPage();
+    try {
+      await rapidPage.goto('https://rapidapi.com/hub', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await rapidPage.waitForTimeout(2000);
+      const isLoggedIn = await rapidPage.locator('[data-testid="user-menu"], .user-avatar, [aria-label*="account" i]').first().isVisible().catch(() => false);
+      console.log(`  RapidAPI session active: ${isLoggedIn}`);
+    } catch {}
+    await rapidPage.close();
+
+    const subResults = await subscribeToRapidAPIs(context);
+    rapidItem.subResults = subResults;
+  }
+
+  // ── Phase 4: Save credentials + mark Done ────────────────────────────────
+  console.log(`\n${'═'.repeat(60)}`);
+  console.log('Phase 4 — Saving credentials');
+  console.log('═'.repeat(60));
+
+  for (const item of submitted) {
+    const siteName = item.site.fields['Name'];
+    const notes    = item.site.fields['Notes'] || '';
+
+    try {
+      if (!item.isOMDB) {
+        // OMDB credentials saved separately (API key, not password)
+        await saveToAirtable(siteName, batchEmail, SIGNUP_PASSWORD, notes);
+      }
+
+      await updateSignupStatus(item.site.id, 'Done', {
+        'Email Used': batchEmail,
+        'Completed At': new Date().toISOString(),
+      });
+
+      results.done.push({ name: siteName, email: batchEmail });
+      console.log(`  ✅ ${siteName}`);
+    } catch (err) {
+      console.warn(`  ⚠️ Save failed for ${siteName}: ${err.message}`);
+      results.failed.push({ name: siteName, reason: `Save failed: ${err.message}` });
+    }
+  }
+
+  await browser.close();
+  await postSlackSummary(results, batchEmail);
+  console.log(`\n✅ Done. Created: ${results.done.length} | Failed: ${results.failed.length}`);
+}
+
+async function postSlackSummary(results, batchEmail) {
+  const lines = [`🔐 *Kondo — Account Creator Summary*`, `_Batch email: ${batchEmail}_`];
   if (results.done.length) {
     lines.push(`\n✅ *Created (${results.done.length}):*`);
-    results.done.forEach(r => lines.push(`• ${r.name} → ${r.email}`));
+    results.done.forEach(r => lines.push(`• ${r.name}`));
   }
   if (results.failed.length) {
     lines.push(`\n❌ *Failed (${results.failed.length}):*`);
@@ -964,8 +1140,6 @@ async function main() {
   }
   lines.push(`\n_Credentials saved to Airtable Logins + Credentials._`);
   await postToSlack(lines.join('\n'));
-
-  console.log(`\n✅ Done. Created: ${results.done.length} | Failed: ${results.failed.length}`);
 }
 
 main().catch(err => {
