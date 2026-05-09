@@ -176,7 +176,7 @@ async function waitForGmailVerification(aliasEmail, timeoutMs = 120000) {
     await new Promise(r => setTimeout(r, 10000));
     try {
       // Search for emails sent to this alias in the last 10 minutes
-      const query = `to:${aliasEmail} newer_than:10m`;
+      const query = `to:${aliasEmail} newer_than:1h`;
       const listRes = await axios.get('https://gmail.googleapis.com/gmail/v1/users/me/messages', {
         params: { q: query, maxResults: 5 },
         headers: { Authorization: `Bearer ${accessToken}` },
@@ -486,15 +486,16 @@ async function checkPageResult(page, siteId, label) {
 // Used by Tavily and Cerebras
 async function signUpMultiStep(page, site, email, password) {
   await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(5000);
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
 
   // Step 1: fill email using Playwright's real fill()
   try {
-    const emailSel = 'input[type="email"], input[name*="email" i], input[id*="email" i], input[placeholder*="email" i]';
-    await page.waitForSelector(emailSel, { timeout: 8000 });
+    const emailSel = 'input[type="email"], input[name*="email" i], input[id*="email" i], input[placeholder*="email" i], input[autocomplete="email"]';
+    await page.waitForSelector(emailSel, { timeout: 15000 });
     await page.fill(emailSel, email);
   } catch {
+    await page.screenshot({ path: `/tmp/marie-signup-${site.id}-email-not-found.png` });
     return { success: false, reason: `${site.fields['Name']}: email field not found` };
   }
 
