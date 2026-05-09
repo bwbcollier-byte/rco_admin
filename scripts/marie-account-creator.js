@@ -532,9 +532,12 @@ async function signUpMultiStep(page, site, email, password) {
   const emailTriggers = [
     'button:has-text("Continue with email")',
     'button:has-text("Sign up with email")',
+    'button:has-text("Login with email")',
+    'button:has-text("Sign in with email")',
     'button:has-text("Use email")',
     'a:has-text("Continue with email")',
     'a:has-text("Sign up with email")',
+    'a:has-text("Login with email")',
     '[data-provider="email"]',
     '[data-method="email"]',
   ];
@@ -645,6 +648,7 @@ async function signUpMultiStep(page, site, email, password) {
 
 const signUpTavily   = signUpMultiStep;
 const signUpCerebras = signUpMultiStep;
+const signUpXAI      = signUpMultiStep;
 
 // OMDB — email-based API key request form (no account, just email + name)
 async function signUpOMDB(page, site, email) {
@@ -683,8 +687,9 @@ async function signUp(page, site, email, password) {
   console.log(`\n  Navigating to: ${url}`);
 
   // Site-specific flows
-  if (siteName === 'Tavily')   return signUpTavily(page, site, email, password);
+  if (siteName === 'Tavily')    return signUpTavily(page, site, email, password);
   if (siteName === 'Cerebras') return signUpCerebras(page, site, email, password);
+  if (siteName === 'Grok / xAI') return signUpXAI(page, site, email, password);
   if (siteName === 'OMDB')     return signUpOMDB(page, site, email);
 
   // Generic flow
