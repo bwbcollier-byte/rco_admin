@@ -205,7 +205,9 @@ async function getPendingSignups() {
     `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_QUEUE}`,
     {
       params: {
-        filterByFormula: `{Status} = "Pending"`,
+        // Run everything except sites explicitly marked Failed (e.g. Qwen — needs phone SMS)
+        // Done sites are retried each run to create fresh accounts
+        filterByFormula: `{Status} != "Failed"`,
         fields: ['Name', 'URL', 'Category', 'Status', 'Notes', 'Repeatable'],
       },
       headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
