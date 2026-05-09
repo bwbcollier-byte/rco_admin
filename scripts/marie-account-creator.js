@@ -874,6 +874,36 @@ async function signUpLastFM(page, site, email, password) {
   return { success: true, needsVerification: true };
 }
 
+async function signUpRapidAPI(page, site, email, password) {
+  await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+
+  // Fill standard fields — RapidAPI has email, password, first/last name
+  const filled = await fillStandardForm(page, email, password);
+  console.log(`  Filled ${filled} field(s)`);
+  if (filled === 0) return { success: false, reason: 'No fields found to fill' };
+
+  // RapidAPI may have a terms checkbox — already handled by fillStandardForm
+  // Use Playwright click for the submit (handles React SPAs better)
+  const submitted = await playwrightClickSubmit(page);
+  if (!submitted) return { success: false, reason: 'Submit button not found' };
+
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-after.png` });
+
+  const text = await page.evaluate(() => document.body.innerText);
+  const hasError = /error|invalid|already (exists|registered|taken)|try again/i.test(text);
+  if (hasError) {
+    const m = text.match(/(error|invalid|already)[^\n]{0,100}/i);
+    return { success: false, reason: m?.[0] || 'Error detected on page' };
+  }
+
+  // RapidAPI always sends a verification email — flag for Phase 2
+  console.log('  RapidAPI: flagging for Phase 2 email verification');
+  return { success: true, needsVerification: true };
+}
+
 async function signUp(page, site, email, password) {
   const url = site.fields['URL'];
   const siteName = site.fields['Name'];
@@ -886,6 +916,7 @@ async function signUp(page, site, email, password) {
   if (siteName === 'OMDB')        return signUpOMDB(page, site, email);
   if (siteName === 'Groq')        return signUpGroq(page, site, email, password);
   if (siteName === 'Last FM')     return signUpLastFM(page, site, email, password);
+  if (siteName === 'RapidAPI')    return signUpRapidAPI(page, site, email, password);
 
   // Generic flow
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
