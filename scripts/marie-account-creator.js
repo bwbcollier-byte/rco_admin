@@ -120,10 +120,9 @@ async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
  * Tries several param combinations since the API docs are sparse.
  */
 async function fetchGmailMessageBody(mid, email) {
-  // Try param combinations most likely to work given the /inbox pattern
+  // Documented params: email + mid (no password)
   const attempts = [
-    { mid, email, password: TEMPGMAIL_PASS },
-    { mid, email },
+    { email, mid },
     { mid },
   ];
 
@@ -172,6 +171,7 @@ async function createFlashMailbox() {
       'https://flash-temp-mail.p.rapidapi.com/mailbox/create',
       { not_required: 'not_required' },
       {
+        params: { free_domains: false },
         headers: {
           'x-rapidapi-key': RAPIDAPI_KEY,
           'x-rapidapi-host': FLASHMAIL_HOST,
@@ -200,7 +200,7 @@ async function pollFlashInbox(email, timeoutMs = 600000) {
   while (Date.now() - start < timeoutMs) {
     await new Promise(r => setTimeout(r, 10000));
     try {
-      const res = await axios.get('https://flash-temp-mail.p.rapidapi.com/mailbox/emails', {
+      const res = await axios.get('https://flash-temp-mail.p.rapidapi.com/mailbox/emails-html', {
         params: { email_address: email },
         headers: {
           'x-rapidapi-key': RAPIDAPI_KEY,
@@ -214,6 +214,9 @@ async function pollFlashInbox(email, timeoutMs = 600000) {
         : [];
       if (messages.length > 0) {
         console.log(`  Got ${messages.length} message(s) in Flash Mail inbox`);
+        // Log first message structure so we know field names
+        console.log(`  Flash msg keys: ${Object.keys(messages[0]).join(', ')}`);
+        console.log(`  Flash msg sample: ${JSON.stringify(messages[0]).slice(0, 500)}`);
         return messages;
       }
       console.log(`  No messages yet...`);
@@ -231,18 +234,18 @@ async function pollFlashInbox(email, timeoutMs = 600000) {
 // ─── Email provider router ────────────────────────────────────────────────────
 
 /**
- * Try Gmail first; fall back to Flash Temp Mail if Gmail API errors.
+ * Try Flash Temp Mail first (returns full email bodies); fall back to Gmail.
  * Returns { email, service } so Phase 2 knows which inbox to poll.
  */
 async function getBatchEmail() {
   try {
-    const email = await getGmailAddress();
-    return { email, service: 'gmail' };
-  } catch (err) {
-    console.warn(`  ⚠️ Gmail API failed: ${err.message}`);
-    console.log('  → Falling back to Flash Temp Mail...');
     const email = await createFlashMailbox();
     return { email, service: 'flash' };
+  } catch (err) {
+    console.warn(`  ⚠️ Flash Mail API failed: ${err.message}`);
+    console.log('  → Falling back to Gmail...');
+    const email = await getGmailAddress();
+    return { email, service: 'gmail' };
   }
 }
 
@@ -1574,28 +1577,31 @@ async function main() {
   const needVerify = submitted.filter(s => s.needsVerification || s.isOMDB);
   if (needVerify.length > 0) {
     console.log(`\n${'═'.repeat(60)}`);
-    console.log(`Phase 2 — Polling Gmail inbox for ${needVerify.length} account verification(s)`);
+    console.log(`Phase 2 — Polling ${emailService} inbox for ${needVerify.length} account verification(s)`);
     console.log('═'.repeat(60));
 
-    // Poll the batch inbox — Gmail uses timestamp filter, Flash returns all (freshly created)
+    // Poll the batch inbox — Flash returns full HTML bodies, Gmail needs per-message fetch
     const messages = await pollBatchInbox(batchEmail, emailService, startTimestamp, 600000);
-    console.log(`  Found ${messages.length} message(s) in Gmail inbox`);
+    console.log(`  Found ${messages.length} message(s) in inbox`);
 
     const omdbItem = submitted.find(s => s.isOMDB);
 
     for (const msg of messages) {
-      // Field names from temp-gmail API: mid, textTo, textFrom, textSubject, textDate
-      const subject = msg.textSubject || msg.subject || msg.Subject || msg.mail_subject || '(no subject)';
-      const from    = msg.textFrom    || msg.from    || msg.From    || msg.mail_from    || '';
-      const mid     = msg.mid         || msg.id      || msg.messageId;
+      // Normalise field names — Gmail uses textSubject/textFrom, Flash may differ
+      const subject = msg.textSubject || msg.subject  || msg.Subject || msg.mail_subject || '(no subject)';
+      const from    = msg.textFrom    || msg.from     || msg.From    || msg.sender       || msg.mail_from || '';
+      const mid     = msg.mid         || msg.id       || msg.messageId;
+      // Flash returns body inline; Gmail requires a separate /message fetch
+      const inlineBody = msg.body || msg.textBody || msg.htmlBody || msg.html || msg.text || msg.content || '';
 
-      console.log(`\n  Message: "${subject}" from ${from} (mid: ${mid})`);
+      console.log(`\n  Message: "${subject}" from ${from}`);
 
-      // Fetch full body — inbox only returns metadata; pass email for auth
-      const body = mid ? await fetchGmailMessageBody(mid, batchEmail) : '';
+      // Get full body — use inline if present (Flash), else fetch via API (Gmail)
+      const body = inlineBody || (mid ? await fetchGmailMessageBody(mid, batchEmail) : '');
+      if (!body) console.warn('  ⚠️ No body found for this message');
 
       // OMDB sends API key in email body (not a verification link)
-      if (omdbItem && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
+      if (omdbItem && (from.toLowerCase().includes('omdb') || subject.toLowerCase().includes('omdb'))) {
         const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
         if (keyMatch) {
           console.log(`  OMDB API key: ${keyMatch[1]}`);
