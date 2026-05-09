@@ -123,6 +123,40 @@ async function waitForOMDBKey(email, timeoutMs = 120000) {
   return null;
 }
 
+// OMDB key polling via Gmail (for Gmail alias email addresses)
+async function waitForOMDBKeyGmail(aliasEmail, timeoutMs = 120000) {
+  const accessToken = await getGmailAccessToken();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await axios.get(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages`,
+        {
+          params: { q: `to:${aliasEmail} from:omdbapi.com newer_than:1h`, maxResults: 5 },
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      const msgs = res.data.messages || [];
+      for (const m of msgs) {
+        const detail = await axios.get(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        const body = extractGmailBody(detail.data);
+        const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
+        if (keyMatch) {
+          console.log(`  OMDB API key found via Gmail: ${keyMatch[1]}`);
+          return keyMatch[1];
+        }
+      }
+    } catch (e) { console.warn(`  Gmail poll error: ${e.message}`); }
+    console.log('  No OMDB key yet, waiting 15s...');
+    await new Promise(r => setTimeout(r, 15000));
+  }
+  console.warn(`  No OMDB API key found in Gmail`);
+  return null;
+}
+
 async function saveOMDBApiKey(email, apiKey) {
   if (DRY_RUN) {
     console.log(`  [DRY RUN] Would save OMDB API key to Credentials: ${apiKey}`);
@@ -162,6 +196,21 @@ async function getGmailAccessToken() {
   return res.data.access_token;
 }
 
+// Shared helper: extract readable text body from a Gmail message object
+function extractGmailBody(msg) {
+  const getBody = (parts) => {
+    if (!parts) return '';
+    for (const p of parts) {
+      if (p.mimeType === 'text/plain' || p.mimeType === 'text/html') {
+        return Buffer.from(p.body?.data || '', 'base64url').toString('utf-8');
+      }
+      if (p.parts) { const sub = getBody(p.parts); if (sub) return sub; }
+    }
+    return '';
+  };
+  return getBody(msg.payload?.parts) || Buffer.from(msg.payload?.body?.data || '', 'base64url').toString('utf-8');
+}
+
 async function waitForGmailVerification(aliasEmail, timeoutMs = 120000) {
   if (!GMAIL_CLIENT_ID || !GMAIL_REFRESH_TOKEN) {
     console.warn('  Gmail credentials not set — cannot poll Gmail inbox');
@@ -196,18 +245,7 @@ async function waitForGmailVerification(aliasEmail, timeoutMs = 120000) {
         const subject = msg.payload?.headers?.find(h => h.name === 'Subject')?.value || '';
         console.log(`  Found Gmail message: "${subject}"`);
 
-        // Decode body
-        const getBody = (parts) => {
-          if (!parts) return '';
-          for (const p of parts) {
-            if (p.mimeType === 'text/plain' || p.mimeType === 'text/html') {
-              return Buffer.from(p.body?.data || '', 'base64url').toString('utf-8');
-            }
-            if (p.parts) { const sub = getBody(p.parts); if (sub) return sub; }
-          }
-          return '';
-        };
-        const body = getBody(msg.payload?.parts) || Buffer.from(msg.payload?.body?.data || '', 'base64url').toString('utf-8');
+        const body = extractGmailBody(msg);
 
         const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:verif|confirm|activate|validate)[^\s"'<>]*/i)
           || body.match(/https?:\/\/[^\s"'<>]{30,}/);
@@ -482,40 +520,44 @@ async function checkPageResult(page, siteId, label) {
 
 // ─── Site-specific flows ──────────────────────────────────────────────────────
 
-// Multi-step Auth0-style signup: email → Continue → password → submit
-// Used by Tavily and Cerebras
+// Multi-step signup: handles WorkOS (Cerebras) and Auth0 (Tavily) flows
 async function signUpMultiStep(page, site, email, password) {
   await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(8000); // extra time for JS-heavy auth pages
+  await page.waitForTimeout(8000);
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+  console.log(`  Landed URL: ${page.url()}`);
 
-  // Debug: log current URL (may have redirected) and all inputs on page + frames
-  const landedUrl = page.url();
-  console.log(`  Landed URL: ${landedUrl}`);
+  // Step 0: Some pages (WorkOS/Cerebras) show auth method options first.
+  // Click "Continue with email" / "Sign up with email" before the form appears.
+  const emailTriggers = [
+    'button:has-text("Continue with email")',
+    'button:has-text("Sign up with email")',
+    'button:has-text("Use email")',
+    'a:has-text("Continue with email")',
+    'a:has-text("Sign up with email")',
+    '[data-provider="email"]',
+    '[data-method="email"]',
+  ];
+  for (const sel of emailTriggers) {
+    try {
+      await page.waitForSelector(sel, { state: 'visible', timeout: 3000 });
+      await page.click(sel);
+      console.log(`  Clicked email auth trigger: ${sel}`);
+      await page.waitForTimeout(3000);
+      break;
+    } catch { /* not present */ }
+  }
+
+  // Debug: log all inputs after any trigger click
   try {
     const allInputs = await page.$$eval('input', els => els.map(el => ({
       type: el.type, id: el.id, name: el.name,
       placeholder: el.placeholder, autocomplete: el.autocomplete,
     })));
-    console.log(`  Inputs on main frame: ${JSON.stringify(allInputs)}`);
-  } catch (e) { console.log(`  Could not list inputs: ${e.message}`); }
+    console.log(`  Inputs after trigger: ${JSON.stringify(allInputs)}`);
+  } catch {}
 
-  // Also check iframes
-  const frames = page.frames();
-  console.log(`  Total frames: ${frames.length}`);
-  for (const frame of frames) {
-    if (frame === page.mainFrame()) continue;
-    const furl = frame.url();
-    console.log(`  Frame URL: ${furl}`);
-    try {
-      const fi = await frame.$$eval('input', els => els.map(el => ({
-        type: el.type, id: el.id, name: el.name, placeholder: el.placeholder,
-      })));
-      if (fi.length) console.log(`  Frame inputs: ${JSON.stringify(fi)}`);
-    } catch { /* cross-origin frame */ }
-  }
-
-  // Step 1: fill email — try main frame first, then each iframe
+  // Step 1: fill email field
   const emailSelectors = [
     'input[type="email"]',
     'input[autocomplete="email"]',
@@ -527,30 +569,15 @@ async function signUpMultiStep(page, site, email, password) {
     'input[type="text"]',
   ];
 
-  // Helper: try to fill email in a given frame context
-  async function tryFillEmailIn(ctx) {
-    for (const sel of emailSelectors) {
-      try {
-        await ctx.waitForSelector(sel, { state: 'visible', timeout: 2000 });
-        await ctx.fill(sel, email);
-        return true;
-      } catch { /* try next */ }
-    }
-    return false;
-  }
-
-  let emailFilled = await tryFillEmailIn(page);
-
-  // If not found in main frame, try each iframe
-  if (!emailFilled) {
-    for (const frame of frames) {
-      if (frame === page.mainFrame()) continue;
-      emailFilled = await tryFillEmailIn(frame);
-      if (emailFilled) {
-        console.log(`  Email filled in frame: ${frame.url()}`);
-        break;
-      }
-    }
+  let emailFilled = false;
+  for (const sel of emailSelectors) {
+    try {
+      await page.waitForSelector(sel, { state: 'visible', timeout: 2000 });
+      await page.fill(sel, email);
+      emailFilled = true;
+      console.log(`  Email filled via: ${sel}`);
+      break;
+    } catch { /* try next */ }
   }
 
   if (!emailFilled) {
@@ -558,22 +585,25 @@ async function signUpMultiStep(page, site, email, password) {
     return { success: false, reason: `${site.fields['Name']}: email field not found` };
   }
 
-  // Determine which frame context the email was filled in (for subsequent steps)
-  let activeCtx = page;
-  for (const frame of frames) {
-    if (frame === page.mainFrame()) continue;
-    try {
-      const hasEmail = await frame.$eval(emailSelectors[0] + ', ' + emailSelectors.join(', '), () => true).catch(() => false);
-      if (hasEmail) { activeCtx = frame; break; }
-    } catch {}
+  // Check if password field is already visible (Auth0 combined login/signup form)
+  // If so, fill it directly rather than clicking Continue and waiting for it
+  const pwAlreadyVisible = await page.locator('input[type="password"]').first().isVisible().catch(() => false);
+
+  if (pwAlreadyVisible) {
+    console.log('  Password field already visible — filling directly (Auth0 combined form)');
+    const pwFields = await page.$$('input[type="password"]');
+    for (const field of pwFields) await field.fill(password);
+    const submitted = await playwrightClickSubmit(page);
+    if (!submitted) return { success: false, reason: `${site.fields['Name']}: submit button not found` };
+    console.log('  Form submitted (combined email+password)');
+    return checkPageResult(page, site.id, 'after');
   }
 
-  // Click Continue — try activeCtx first, then page
+  // Step 1b: click Continue to advance to password step
   async function clickContinue(ctx) {
     const texts = ['Continue', 'Continue with email', 'Sign up', 'Register', 'Create account', 'Submit', 'Get started', 'Next'];
     try {
-      const btn = ctx.locator('button[type="submit"], input[type="submit"]').first();
-      await btn.click({ timeout: 5000 });
+      await ctx.locator('button[type="submit"], input[type="submit"]').first().click({ timeout: 5000 });
       return true;
     } catch {}
     for (const text of texts) {
@@ -585,34 +615,28 @@ async function signUpMultiStep(page, site, email, password) {
     return false;
   }
 
-  let step1 = await clickContinue(activeCtx);
-  if (!step1 && activeCtx !== page) step1 = await clickContinue(page);
+  const step1 = await clickContinue(page);
   if (!step1) return { success: false, reason: `${site.fields['Name']}: Continue button not found on step 1` };
 
-  // Step 2: wait for password field (in same ctx or page)
-  let pwCtx = activeCtx;
+  // Step 2: wait for password field to appear (may require page transition)
   try {
-    await pwCtx.waitForSelector('input[type="password"]', { state: 'visible', timeout: 12000 });
+    await page.waitForSelector('input[type="password"]', { state: 'visible', timeout: 15000 });
   } catch {
-    // Try main page
+    await page.screenshot({ path: `/tmp/marie-signup-${site.id}-no-password.png` });
+    console.log(`  URL after Continue: ${page.url()}`);
     try {
-      await page.waitForSelector('input[type="password"]', { state: 'visible', timeout: 5000 });
-      pwCtx = page;
-    } catch {
-      await page.screenshot({ path: `/tmp/marie-signup-${site.id}-no-password.png` });
-      return { success: false, reason: `${site.fields['Name']}: password field never appeared after Continue` };
-    }
+      const inputs = await page.$$eval('input', els => els.map(el => ({ type: el.type, id: el.id, name: el.name })));
+      console.log(`  Inputs after Continue: ${JSON.stringify(inputs)}`);
+    } catch {}
+    return { success: false, reason: `${site.fields['Name']}: password field never appeared after Continue` };
   }
   await page.waitForTimeout(1000);
 
   // Fill password + confirm if present
-  const pwFields = await pwCtx.$$('input[type="password"]');
-  for (const field of pwFields) {
-    await field.fill(password);
-  }
+  const pwFields = await page.$$('input[type="password"]');
+  for (const field of pwFields) await field.fill(password);
 
-  let step2 = await clickContinue(pwCtx);
-  if (!step2 && pwCtx !== page) step2 = await clickContinue(page);
+  const step2 = await clickContinue(page);
   if (!step2) return { success: false, reason: `${site.fields['Name']}: submit button not found on step 2` };
 
   console.log('  Form submitted (multi-step)');
@@ -742,8 +766,10 @@ async function main() {
       console.log(`  ✅ Signup submitted`);
 
       if (siteName === 'OMDB') {
-        // OMDB: extract API key from email, save as Credential only (no Login/password)
-        const apiKey = await waitForOMDBKey(email);
+        // OMDB: extract API key from email (Gmail alias preferred; fallback Temp Mail)
+        const apiKey = useGmail
+          ? await waitForOMDBKeyGmail(email)
+          : await waitForOMDBKey(email);
         if (apiKey) {
           await saveOMDBApiKey(email, apiKey);
         } else {
