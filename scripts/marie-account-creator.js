@@ -29,7 +29,8 @@ const AIRTABLE_CREDS    = 'tblvBr6RIc7bcGXYJ';   // Credentials
 const AIRTABLE_APIS     = 'tblMb9HFyKcnQ7aKb';   // APIs
 
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;
-const TEMPMAIL_HOST     = 'privatix-temp-mail-v1.p.rapidapi.com';
+const TEMPGMAIL_HOST    = 'temp-gmail.p.rapidapi.com';
+const TEMPGMAIL_PASS    = 'marie2024'; // password for the temp Gmail alias — must be consistent per session
 
 
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
@@ -45,83 +46,66 @@ const DEFAULTS = {
   company: 'Rascals Inc',
 };
 
-// ─── Temp Mail API ────────────────────────────────────────────────────────────
+// ─── Temp Gmail API (temp-gmail.p.rapidapi.com) ───────────────────────────────
 
-async function getTempMailDomains() {
-  const res = await axios.get('https://privatix-temp-mail-v1.p.rapidapi.com/request/domains/', {
+/**
+ * GET /random — creates a temporary Gmail alias and returns its address.
+ * Response shape: { email: "xyz@gmail.com", ... }
+ */
+async function getGmailAddress() {
+  const res = await axios.get('https://temp-gmail.p.rapidapi.com/random', {
+    params: { type: 'alias', password: TEMPGMAIL_PASS },
     headers: {
       'x-rapidapi-key': RAPIDAPI_KEY,
-      'x-rapidapi-host': TEMPMAIL_HOST,
+      'x-rapidapi-host': TEMPGMAIL_HOST,
+      'Content-Type': 'application/json',
     },
   });
-  return res.data; // array of domain strings e.g. ["@mailto.plus", ...]
-}
-
-function md5(str) {
-  return crypto.createHash('md5').update(str).digest('hex');
-}
-
-// Domains known to be widely blacklisted by signup forms — skip these
-const BLOCKED_DOMAINS = ['cevipsa.com', 'maildrop.cc', 'mailnull.com', 'spamgourmet.com'];
-
-async function generateTempEmail(siteName) {
-  const domains = await getTempMailDomains();
-  console.log(`  Available temp mail domains: ${domains.slice(0, 6).join(', ')}...`);
-
-  // Filter out known-bad domains, pick randomly from the rest
-  const usable = domains.filter(d => !BLOCKED_DOMAINS.some(b => d.includes(b)));
-  const pool = usable.length > 0 ? usable : domains; // fallback to full list if all blocked
-  const domain = pool[Math.floor(Math.random() * pool.length)];
-
-  const slug = siteName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
-  const suffix = Math.random().toString(36).slice(2, 7);
-  const email = `${slug}${suffix}${domain}`;
-  console.log(`  Generated temp email: ${email}`);
+  const email = res.data.email || res.data.gmail || res.data.address || res.data;
+  if (!email || typeof email !== 'string') throw new Error(`Unexpected Gmail API response: ${JSON.stringify(res.data)}`);
+  console.log(`  Temp Gmail address: ${email}`);
   return email;
 }
 
-async function pollInbox(email, timeoutMs = 120000) {
-  const hash = md5(email);
-  console.log(`  Polling Temp Mail inbox for ${email}...`);
+/**
+ * GET /inbox — polls the Gmail alias inbox since a given Unix timestamp.
+ * Keeps polling until messages arrive or timeout is reached.
+ * Response shape: array of message objects.
+ */
+async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
+  console.log(`  Polling Gmail inbox for ${email} (since ${sinceTimestamp})...`);
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
-    await new Promise(r => setTimeout(r, 8000));
+    await new Promise(r => setTimeout(r, 10000));
     try {
-      const res = await axios.get(
-        `https://privatix-temp-mail-v1.p.rapidapi.com/request/mail/id/${hash}/`,
-        { headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPMAIL_HOST } }
-      );
-      const messages = Array.isArray(res.data) ? res.data : [];
-      if (messages.length > 0) return messages;
+      const res = await axios.get('https://temp-gmail.p.rapidapi.com/inbox', {
+        params: { email, timestamp: sinceTimestamp },
+        headers: {
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-host': TEMPGMAIL_HOST,
+          'Content-Type': 'application/json',
+        },
+      });
+      const messages = Array.isArray(res.data) ? res.data
+        : Array.isArray(res.data?.messages) ? res.data.messages
+        : Array.isArray(res.data?.emails)   ? res.data.emails
+        : [];
+      if (messages.length > 0) {
+        console.log(`  Got ${messages.length} message(s) in Gmail inbox`);
+        return messages;
+      }
       console.log(`  No messages yet...`);
     } catch (err) {
       if (err.response?.status === 404) {
         console.log(`  Inbox empty (404), waiting...`);
       } else {
-        console.warn(`  Temp Mail poll error: ${err.message}`);
+        console.warn(`  Gmail poll error: ${err.message}`);
       }
     }
   }
   return [];
 }
-
-async function waitForOMDBKey(email, timeoutMs = 120000) {
-  const messages = await pollInbox(email, timeoutMs);
-  for (const msg of messages) {
-    const body = msg.mail_text_only || msg.mail_html || '';
-    console.log(`  Found message: "${msg.mail_subject}"`);
-    // OMDB keys are 8 alphanumeric chars
-    const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
-    if (keyMatch) {
-      console.log(`  OMDB API key found: ${keyMatch[1]}`);
-      return keyMatch[1];
-    }
-  }
-  console.warn(`  No OMDB API key found in inbox`);
-  return null;
-}
-
 
 async function saveOMDBApiKey(email, apiKey) {
   if (DRY_RUN) {
@@ -148,62 +132,6 @@ async function saveOMDBApiKey(email, apiKey) {
   } catch (err) {
     console.warn(`  Airtable save failed:`, err.response?.data?.error || err.message);
   }
-}
-
-// ─── Gmail API ────────────────────────────────────────────────────────────────
-
-
-async function waitForVerificationEmail(email, timeoutMs = 120000) {
-  const hash = md5(email);
-  console.log(`  Polling Temp Mail inbox for ${email} (md5: ${hash})...`);
-  const start = Date.now();
-
-  while (Date.now() - start < timeoutMs) {
-    await new Promise(r => setTimeout(r, 8000));
-
-    try {
-      const res = await axios.get(
-        `https://privatix-temp-mail-v1.p.rapidapi.com/request/mail/id/${hash}/`,
-        {
-          headers: {
-            'x-rapidapi-key': RAPIDAPI_KEY,
-            'x-rapidapi-host': TEMPMAIL_HOST,
-          },
-        }
-      );
-
-      const messages = Array.isArray(res.data) ? res.data : [];
-      if (messages.length === 0) {
-        console.log(`  No messages yet...`);
-        continue;
-      }
-
-      // Find a message that looks like a verification email
-      for (const msg of messages) {
-        const subject = msg.mail_subject || '';
-        const body = msg.mail_text_only || msg.mail_html || '';
-        console.log(`  Found message: "${subject}"`);
-
-        // Extract verification link
-        const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:verif|confirm|activate|validate)[^\s"'<>]*/i)
-          || body.match(/https?:\/\/[^\s"'<>]{30,}/);
-
-        if (linkMatch) {
-          console.log(`  Verification link: ${linkMatch[0].slice(0, 80)}...`);
-          return linkMatch[0];
-        }
-      }
-    } catch (err) {
-      if (err.response?.status === 404) {
-        console.log(`  Inbox empty (404), waiting...`);
-      } else {
-        console.warn(`  Temp Mail poll error: ${err.message}`);
-      }
-    }
-  }
-
-  console.warn(`  No verification email found after ${timeoutMs / 1000}s`);
-  return null;
 }
 
 // ─── Airtable — Signup Queue ──────────────────────────────────────────────────
@@ -1384,9 +1312,10 @@ async function main() {
     return;
   }
 
-  // Per-site email strategy: each site gets its own temp email from a random domain.
-  // This maximises the chance that at least some domains deliver verification mail.
-  console.log('\nPer-site email strategy — each site gets its own temp email address');
+  // Get ONE Gmail address for the entire batch via temp-gmail RapidAPI
+  const batchEmail = await getGmailAddress();
+  const startTimestamp = Math.floor(Date.now() / 1000); // Unix ts — inbox poll filters to messages after this
+  console.log(`\nBatch Gmail for this run: ${batchEmail}`);
 
   const browser = await chromium.launch({
     args: [
@@ -1424,11 +1353,7 @@ async function main() {
 
     const page = await context.newPage();
     try {
-      // Each site gets its own email from a randomly-chosen domain
-      const siteEmail = await generateTempEmail(siteName);
-      console.log(`  Email: ${siteEmail}`);
-
-      const result = await signUp(page, site, siteEmail, SIGNUP_PASSWORD);
+      const result = await signUp(page, site, batchEmail, SIGNUP_PASSWORD);
 
       if (!result.success) {
         console.log(`  ❌ Signup failed: ${result.reason}`);
@@ -1438,7 +1363,6 @@ async function main() {
         console.log(`  ✅ Submitted`);
         submitted.push({
           site,
-          email: siteEmail,
           needsVerification: !!result.needsVerification,
           isOMDB: siteName === 'OMDB',
           isRapidAPI: siteName === 'RapidAPI',
@@ -1458,54 +1382,42 @@ async function main() {
   if (submitted.length === 0) {
     console.log('\nNo sites submitted successfully — skipping verification.');
     await browser.close();
-    await postSlackSummary(results);
+    await postSlackSummary(results, batchEmail);
     return;
   }
 
-  // ── Phase 2: Parallel inbox poll — each site's own inbox ────────────────
+  // ── Phase 2: Gmail inbox poll — click ALL verification links ────────────
   const needVerify = submitted.filter(s => s.needsVerification || s.isOMDB);
   if (needVerify.length > 0) {
     console.log(`\n${'═'.repeat(60)}`);
-    console.log(`Phase 2 — Verifying ${needVerify.length} account(s) via per-site inboxes`);
+    console.log(`Phase 2 — Polling Gmail inbox for ${needVerify.length} account verification(s)`);
     console.log('═'.repeat(60));
 
-    // Collect unique emails that need polling
-    const uniqueEmails = [...new Set(needVerify.map(s => s.email))];
-    console.log(`  Polling ${uniqueEmails.length} unique inbox(es) in parallel (10 min timeout each)...`);
-
-    // Poll all inboxes simultaneously — 10 min timeout each
-    const pollResults = await Promise.all(
-      uniqueEmails.map(email =>
-        pollInbox(email, 600000)
-          .then(msgs => msgs.map(m => ({ ...m, _toEmail: email })))
-          .catch(err => { console.warn(`  Poll error for ${email}: ${err.message}`); return []; })
-      )
-    );
-
-    const allMessages = pollResults.flat();
-    console.log(`  Found ${allMessages.length} total message(s) across all inboxes`);
+    // Poll the shared Gmail inbox (10 min timeout) — filters to messages since run started
+    const messages = await pollGmailInbox(batchEmail, startTimestamp, 600000);
+    console.log(`  Found ${messages.length} message(s) in Gmail inbox`);
 
     const omdbItem = submitted.find(s => s.isOMDB);
 
-    for (const msg of allMessages) {
-      const subject  = msg.mail_subject || '(no subject)';
-      const from     = msg.mail_from    || '';
-      const body     = msg.mail_text_only || msg.mail_html || '';
-      const toEmail  = msg._toEmail;
-      console.log(`\n  Message: "${subject}" from ${from} → ${toEmail}`);
+    for (const msg of messages) {
+      // Normalise field names across possible API response shapes
+      const subject = msg.subject || msg.mail_subject || msg.Subject || '(no subject)';
+      const from    = msg.from    || msg.mail_from    || msg.From    || '';
+      const body    = msg.body    || msg.mail_text_only || msg.text  || msg.html || msg.mail_html || '';
+      console.log(`\n  Message: "${subject}" from ${from}`);
 
-      // OMDB sends API key (not a link) — extract it
-      if (omdbItem && toEmail === omdbItem.email && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
+      // OMDB sends API key in email body (not a verification link)
+      if (omdbItem && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
         const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
         if (keyMatch) {
           console.log(`  OMDB API key: ${keyMatch[1]}`);
-          await saveOMDBApiKey(omdbItem.email, keyMatch[1]);
+          await saveOMDBApiKey(batchEmail, keyMatch[1]);
           omdbItem.omdbDone = true;
         }
         continue;
       }
 
-      // All others: find and click verification link
+      // All others: find and click verification/magic link
       const linkMatch =
         body.match(/https?:\/\/[^\s"'<>]+(?:verif|confirm|activate|validate|magic|token)[^\s"'<>]*/i) ||
         body.match(/https?:\/\/[^\s"'<>]{50,}/);
@@ -1528,8 +1440,8 @@ async function main() {
       }
     }
 
-    if (allMessages.length === 0) {
-      console.warn('  ⚠️ All inboxes empty — verification emails may still be in transit or domains are blocked');
+    if (messages.length === 0) {
+      console.warn('  ⚠️ Gmail inbox empty after timeout — check API key and email delivery');
     }
   }
 
@@ -1564,11 +1476,10 @@ async function main() {
     const notes    = item.site.fields['Notes'] || '';
 
     try {
-      const siteEmail = item.email;
       let loginId = null;
       if (!item.isOMDB) {
         // OMDB credentials saved separately (API key, not password)
-        loginId = await saveToAirtable(siteName, siteEmail, SIGNUP_PASSWORD, notes);
+        loginId = await saveToAirtable(siteName, batchEmail, SIGNUP_PASSWORD, notes);
       }
 
       // Attempt to capture API key from the site dashboard
@@ -1583,12 +1494,12 @@ async function main() {
       // Repeatable sites (e.g. RapidAPI) reset to Pending so each run creates a fresh account
       const nextStatus = item.isRepeatable ? 'Pending' : 'Done';
       await updateSignupStatus(item.site.id, nextStatus, {
-        'Email Used': siteEmail,
+        'Email Used': batchEmail,
         'Completed At': new Date().toISOString(),
       });
       if (item.isRepeatable) console.log(`  ↻ ${siteName} is Repeatable — reset to Pending for next run`);
 
-      results.done.push({ name: siteName, email: siteEmail });
+      results.done.push({ name: siteName, email: batchEmail });
       console.log(`  ✅ ${siteName}`);
     } catch (err) {
       console.warn(`  ⚠️ Save failed for ${siteName}: ${err.message}`);
@@ -1597,19 +1508,15 @@ async function main() {
   }
 
   await browser.close();
-  await postSlackSummary(results);
+  await postSlackSummary(results, batchEmail);
   console.log(`\n✅ Done. Created: ${results.done.length} | Failed: ${results.failed.length}`);
 }
 
-async function postSlackSummary(results) {
-  const uniqueEmails = [...new Set((results.done || []).map(r => r.email).filter(Boolean))];
-  const emailNote = uniqueEmails.length > 0
-    ? `_${uniqueEmails.length} unique temp email(s) used (per-site strategy)_`
-    : `_No accounts created_`;
-  const lines = [`🔐 *Marie — Account Creator Summary*`, emailNote];
+async function postSlackSummary(results, batchEmail) {
+  const lines = [`🔐 *Marie — Account Creator Summary*`, `_Batch Gmail: ${batchEmail}_`];
   if (results.done.length) {
     lines.push(`\n✅ *Created (${results.done.length}):*`);
-    results.done.forEach(r => lines.push(`• ${r.name} — ${r.email}`));
+    results.done.forEach(r => lines.push(`• ${r.name}`));
   }
   if (results.failed.length) {
     lines.push(`\n❌ *Failed (${results.failed.length}):*`);
