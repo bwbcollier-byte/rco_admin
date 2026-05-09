@@ -30,7 +30,7 @@ const AIRTABLE_APIS     = 'tblMb9HFyKcnQ7aKb';   // APIs
 
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;
 const TEMPGMAIL_HOST    = 'temp-gmail.p.rapidapi.com';
-const TEMPGMAIL_PASS    = 'marie2024'; // password for the temp Gmail alias — must be consistent per session
+const TEMPGMAIL_PASS    = 'abc123'; // password for the temp Gmail alias — must be consistent per session
 
 
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
@@ -53,16 +53,23 @@ const DEFAULTS = {
  * Response shape: { email: "xyz@gmail.com", ... }
  */
 async function getGmailAddress() {
-  const res = await axios.get('https://temp-gmail.p.rapidapi.com/random', {
-    params: { type: 'alias', password: TEMPGMAIL_PASS },
-    headers: {
-      'x-rapidapi-key': RAPIDAPI_KEY,
-      'x-rapidapi-host': TEMPGMAIL_HOST,
-      'Content-Type': 'application/json',
-    },
-  });
-  const email = res.data.email || res.data.gmail || res.data.address || res.data;
-  if (!email || typeof email !== 'string') throw new Error(`Unexpected Gmail API response: ${JSON.stringify(res.data)}`);
+  let res;
+  try {
+    res = await axios.get('https://temp-gmail.p.rapidapi.com/random', {
+      params: { type: 'alias', password: TEMPGMAIL_PASS },
+      headers: {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': TEMPGMAIL_HOST,
+        'Content-Type': 'application/json',
+      },
+    });
+  } catch (err) {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    throw new Error(`Gmail API /random failed (${err.response?.status}): ${detail}`);
+  }
+  console.log(`  Gmail API response: ${JSON.stringify(res.data)}`);
+  const email = res.data.email || res.data.gmail || res.data.address || (typeof res.data === 'string' ? res.data : null);
+  if (!email) throw new Error(`Unexpected Gmail API response: ${JSON.stringify(res.data)}`);
   console.log(`  Temp Gmail address: ${email}`);
   return email;
 }
@@ -105,6 +112,103 @@ async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
     }
   }
   return [];
+}
+
+// ─── Flash Temp Mail API (flash-temp-mail.p.rapidapi.com) — fallback ─────────
+
+const FLASHMAIL_HOST = 'flash-temp-mail.p.rapidapi.com';
+
+/**
+ * POST /mailbox/create — creates a fresh temp mailbox, returns its address.
+ * Response shape: { email_address: "xxx@flashmail.my", ... }
+ */
+async function createFlashMailbox() {
+  let res;
+  try {
+    res = await axios.post(
+      'https://flash-temp-mail.p.rapidapi.com/mailbox/create',
+      { not_required: 'not_required' },
+      {
+        headers: {
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-host': FLASHMAIL_HOST,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+  } catch (err) {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    throw new Error(`Flash Mail /mailbox/create failed (${err.response?.status}): ${detail}`);
+  }
+  console.log(`  Flash Mail API response: ${JSON.stringify(res.data)}`);
+  const email = res.data.email_address || res.data.email || res.data.address;
+  if (!email) throw new Error(`Unexpected Flash Mail response: ${JSON.stringify(res.data)}`);
+  console.log(`  Flash Mail address: ${email}`);
+  return email;
+}
+
+/**
+ * GET /mailbox/emails — polls the Flash mailbox until messages arrive.
+ * No timestamp filter needed — mailbox is freshly created each run.
+ */
+async function pollFlashInbox(email, timeoutMs = 600000) {
+  console.log(`  Polling Flash Mail inbox for ${email}...`);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await new Promise(r => setTimeout(r, 10000));
+    try {
+      const res = await axios.get('https://flash-temp-mail.p.rapidapi.com/mailbox/emails', {
+        params: { email_address: email },
+        headers: {
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-host': FLASHMAIL_HOST,
+          'Content-Type': 'application/json',
+        },
+      });
+      const messages = Array.isArray(res.data) ? res.data
+        : Array.isArray(res.data?.emails)   ? res.data.emails
+        : Array.isArray(res.data?.messages) ? res.data.messages
+        : [];
+      if (messages.length > 0) {
+        console.log(`  Got ${messages.length} message(s) in Flash Mail inbox`);
+        return messages;
+      }
+      console.log(`  No messages yet...`);
+    } catch (err) {
+      if (err.response?.status === 404) {
+        console.log(`  Inbox empty (404), waiting...`);
+      } else {
+        console.warn(`  Flash Mail poll error: ${err.message}`);
+      }
+    }
+  }
+  return [];
+}
+
+// ─── Email provider router ────────────────────────────────────────────────────
+
+/**
+ * Try Gmail first; fall back to Flash Temp Mail if Gmail API errors.
+ * Returns { email, service } so Phase 2 knows which inbox to poll.
+ */
+async function getBatchEmail() {
+  try {
+    const email = await getGmailAddress();
+    return { email, service: 'gmail' };
+  } catch (err) {
+    console.warn(`  ⚠️ Gmail API failed: ${err.message}`);
+    console.log('  → Falling back to Flash Temp Mail...');
+    const email = await createFlashMailbox();
+    return { email, service: 'flash' };
+  }
+}
+
+/**
+ * Poll whichever inbox service was used to get the batch email.
+ */
+async function pollBatchInbox(email, service, startTimestamp, timeoutMs = 600000) {
+  if (service === 'flash') return pollFlashInbox(email, timeoutMs);
+  return pollGmailInbox(email, startTimestamp, timeoutMs);
 }
 
 async function saveOMDBApiKey(email, apiKey) {
@@ -1312,10 +1416,10 @@ async function main() {
     return;
   }
 
-  // Get ONE Gmail address for the entire batch via temp-gmail RapidAPI
-  const batchEmail = await getGmailAddress();
-  const startTimestamp = Math.floor(Date.now() / 1000); // Unix ts — inbox poll filters to messages after this
-  console.log(`\nBatch Gmail for this run: ${batchEmail}`);
+  // Get ONE email address for the entire batch (Gmail preferred, Flash fallback)
+  const startTimestamp = Math.floor(Date.now() / 1000); // Unix ts — Gmail inbox filter
+  const { email: batchEmail, service: emailService } = await getBatchEmail();
+  console.log(`\nBatch email for this run: ${batchEmail} (via ${emailService})`);
 
   const browser = await chromium.launch({
     args: [
@@ -1393,8 +1497,8 @@ async function main() {
     console.log(`Phase 2 — Polling Gmail inbox for ${needVerify.length} account verification(s)`);
     console.log('═'.repeat(60));
 
-    // Poll the shared Gmail inbox (10 min timeout) — filters to messages since run started
-    const messages = await pollGmailInbox(batchEmail, startTimestamp, 600000);
+    // Poll the batch inbox — Gmail uses timestamp filter, Flash returns all (freshly created)
+    const messages = await pollBatchInbox(batchEmail, emailService, startTimestamp, 600000);
     console.log(`  Found ${messages.length} message(s) in Gmail inbox`);
 
     const omdbItem = submitted.find(s => s.isOMDB);
