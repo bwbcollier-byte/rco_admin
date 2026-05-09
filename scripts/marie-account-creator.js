@@ -77,7 +77,7 @@ async function getGmailAddress() {
 /**
  * GET /inbox — polls the Gmail alias inbox since a given Unix timestamp.
  * Keeps polling until messages arrive or timeout is reached.
- * Response shape: array of message objects.
+ * Response shape: array of metadata objects (mid, textSubject, textFrom, textDate — no body).
  */
 async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
   console.log(`  Polling Gmail inbox for ${email} (since ${sinceTimestamp})...`);
@@ -112,6 +112,31 @@ async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
     }
   }
   return [];
+}
+
+/**
+ * GET /message — fetches full body of a single Gmail message by its mid.
+ * The inbox endpoint only returns metadata; this gets the actual content.
+ */
+async function fetchGmailMessageBody(mid) {
+  try {
+    const res = await axios.get('https://temp-gmail.p.rapidapi.com/message', {
+      params: { mid },
+      headers: {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': TEMPGMAIL_HOST,
+        'Content-Type': 'application/json',
+      },
+    });
+    console.log(`  Message body response keys: ${Object.keys(res.data || {}).join(', ')}`);
+    // Body may be in various fields depending on API version
+    return res.data?.textBody || res.data?.htmlBody || res.data?.body
+        || res.data?.text || res.data?.html || res.data?.content
+        || JSON.stringify(res.data);
+  } catch (err) {
+    console.warn(`  Could not fetch message body for mid ${mid}: ${err.response?.status} ${err.message}`);
+    return '';
+  }
 }
 
 // ─── Flash Temp Mail API (flash-temp-mail.p.rapidapi.com) — fallback ─────────
@@ -1349,8 +1374,8 @@ async function captureLastFMKey(context, loginId) {
       if (await descInput.isVisible().catch(() => false)) {
         await descInput.fill('Internal music data integration');
       }
-      // Scope to the form to avoid clicking the site's masthead search button
-      const submitBtn = page.locator('form input[type="submit"], form button[type="submit"]:not(.masthead-search-submit)').first();
+      // Avoid the site's search button — target the API form submit specifically
+      const submitBtn = page.locator('input[type="submit"][value*="Apply" i], input[type="submit"][value*="Create" i], input[type="submit"][value*="Submit" i], input[type="submit"]').first();
       await submitBtn.click({ timeout: 10000 });
       await page.waitForTimeout(3000);
     }
@@ -1505,16 +1530,15 @@ async function main() {
     const omdbItem = submitted.find(s => s.isOMDB);
 
     for (const msg of messages) {
-      // Log raw keys so we can confirm field names from this API
-      console.log(`  Raw message keys: ${Object.keys(msg).join(', ')}`);
-      console.log(`  Raw message sample: ${JSON.stringify(msg).slice(0, 300)}`);
+      // Field names from temp-gmail API: mid, textTo, textFrom, textSubject, textDate
+      const subject = msg.textSubject || msg.subject || msg.Subject || msg.mail_subject || '(no subject)';
+      const from    = msg.textFrom    || msg.from    || msg.From    || msg.mail_from    || '';
+      const mid     = msg.mid         || msg.id      || msg.messageId;
 
-      // Normalise field names across possible API response shapes
-      const subject = msg.subject || msg.Subject || msg.mail_subject || msg.title || '(no subject)';
-      const from    = msg.from    || msg.From    || msg.mail_from    || msg.sender || '';
-      const body    = msg.body    || msg.Body    || msg.text         || msg.html
-                   || msg.content || msg.message || msg.mail_text_only || msg.mail_html || '';
-      console.log(`\n  Message: "${subject}" from ${from}`);
+      console.log(`\n  Message: "${subject}" from ${from} (mid: ${mid})`);
+
+      // Fetch full body — inbox only returns metadata
+      const body = mid ? await fetchGmailMessageBody(mid) : '';
 
       // OMDB sends API key in email body (not a verification link)
       if (omdbItem && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
