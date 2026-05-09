@@ -196,7 +196,7 @@ async function createFlashMailbox() {
  */
 async function pollFlashInbox(email, timeoutMs = 600000) {
   console.log(`  Polling Flash Mail inbox for ${email}...`);
-  const SETTLE_MS = 120000; // keep polling 2 min after first message to catch late arrivals
+  const SETTLE_MS = 300000; // keep polling 5 min after first message to catch late arrivals
   const start = Date.now();
   let allMessages = [];
   let firstMessageAt = null;
@@ -246,6 +246,42 @@ async function pollFlashInbox(email, timeoutMs = 600000) {
   }
   console.log(`  Poll timeout — returning ${allMessages.length} message(s)`);
   return allMessages;
+}
+
+/**
+ * Polls the Flash inbox for messages with timestamp > sinceUnixTs.
+ * Used in Phase 4 re-auth flows where we need only NEW messages (after a fresh
+ * magic link is requested), not the full historical inbox.
+ */
+async function pollFlashInboxSince(email, sinceUnixTs, timeoutMs = 120000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await new Promise(r => setTimeout(r, 8000));
+    try {
+      const res = await axios.get('https://flash-temp-mail.p.rapidapi.com/mailbox/emails-html', {
+        params: { email_address: email },
+        headers: {
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-host': FLASHMAIL_HOST,
+          'Content-Type': 'application/json',
+        },
+      });
+      const messages = Array.isArray(res.data) ? res.data
+        : Array.isArray(res.data?.emails)   ? res.data.emails
+        : Array.isArray(res.data?.messages) ? res.data.messages
+        : [];
+      const newMsgs = messages.filter(m => (m.timestamp || 0) > sinceUnixTs);
+      if (newMsgs.length > 0) {
+        console.log(`  Flash inbox: found ${newMsgs.length} new message(s) since re-auth request`);
+        return newMsgs;
+      }
+      console.log(`  Flash inbox: no new messages yet (since ts=${sinceUnixTs})...`);
+    } catch (err) {
+      console.warn(`  Flash poll error: ${err.message}`);
+    }
+  }
+  console.warn('  Flash re-auth poll timed out — no new messages arrived');
+  return [];
 }
 
 // ─── Email provider router ────────────────────────────────────────────────────
@@ -1233,12 +1269,60 @@ async function captureTavilyKey(context, loginId) {
   }
 }
 
-async function captureXAIKey(context, loginId) {
+async function captureXAIKey(context, loginId, mailConfig) {
   const page = await context.newPage();
   try {
     console.log('  → xAI: navigating to API keys page...');
     await page.goto('https://console.x.ai/team/default/api-keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(4000);
+
+    // If not authenticated, re-request a fresh magic link
+    const currentUrl = page.url();
+    if (!currentUrl.includes('console.x.ai') && mailConfig?.email) {
+      console.log(`  xAI: not authenticated (at ${currentUrl.slice(0, 70)}) — requesting fresh magic link...`);
+      await page.goto('https://console.x.ai/sign-in', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(8000);
+
+      try {
+        const loginEmailBtn = page.locator('button:has-text("Login with email")').first();
+        if (await loginEmailBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await loginEmailBtn.click();
+          await page.waitForTimeout(2000);
+        }
+      } catch {}
+
+      const emailInput = page.locator('input[type="email"], input[name="email"]').first();
+      if (await emailInput.isVisible().catch(() => false)) {
+        await emailInput.fill(mailConfig.email);
+        await page.waitForTimeout(500);
+        try { await page.locator('button[type="submit"]').first().click({ timeout: 5000 }); } catch {}
+        await page.waitForTimeout(3000);
+        console.log('  xAI: fresh magic link requested, polling Flash inbox...');
+
+        const sinceTs = Math.floor(Date.now() / 1000);
+        const newMsgs = await pollFlashInboxSince(mailConfig.email, sinceTs - 5, 120000);
+        for (const msg of newMsgs) {
+          const body = msg.content || msg.body || msg.html || msg.text || '';
+          const subj = msg.subject || msg.textSubject || '';
+          if (body && (subj.toLowerCase().includes('x.ai') || subj.toLowerCase().includes('xai') || body.toLowerCase().includes('x.ai'))) {
+            const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:magic|token|verify|accounts\.x\.ai)[^\s"'<>]*/i)
+                           || body.match(/https?:\/\/[^\s"'<>]{60,}/);
+            if (linkMatch) {
+              const link = linkMatch[0].replace(/&amp;/g, '&');
+              console.log(`  xAI: clicking fresh magic link: ${link.slice(0, 80)}...`);
+              await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.waitForTimeout(5000);
+              console.log(`  xAI: after magic link redirect: ${page.url().slice(0, 80)}`);
+              break;
+            }
+          }
+        }
+      }
+
+      // Re-navigate to keys page
+      await page.goto('https://console.x.ai/team/default/api-keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+    }
 
     // Click "Create API Key" button
     const createBtn = page.locator('button:has-text("Create"), button:has-text("New"), button:has-text("Generate")').first();
@@ -1350,12 +1434,59 @@ async function captureRapidAPIKey(context, loginId) {
   }
 }
 
-async function captureGroqKey(context, loginId) {
+async function captureGroqKey(context, loginId, mailConfig) {
   const page = await context.newPage();
   try {
     console.log('  → Groq: navigating to API keys page...');
     await page.goto('https://console.groq.com/keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
+
+    // If not authenticated, re-request a fresh magic link
+    const currentUrl = page.url();
+    if (!currentUrl.includes('console.groq.com/keys') && mailConfig?.email) {
+      console.log(`  Groq: not authenticated (at ${currentUrl.slice(0, 70)}) — requesting fresh magic link...`);
+      await page.goto('https://console.groq.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(5000);
+
+      // Click "Sign up" tab if visible (in case Clerk shows login by default)
+      const signUpTab = page.locator('a:has-text("Sign up"), button:has-text("Sign up")').first();
+      if (await signUpTab.isVisible().catch(() => false)) {
+        await signUpTab.click();
+        await page.waitForTimeout(2000);
+      }
+
+      const emailInput = page.locator('input[type="email"], input[name*="email" i]').first();
+      if (await emailInput.isVisible().catch(() => false)) {
+        await emailInput.fill(mailConfig.email);
+        await page.waitForTimeout(500);
+        await playwrightClickSubmit(page);
+        await page.waitForTimeout(3000);
+        console.log('  Groq: fresh magic link requested, polling Flash inbox...');
+
+        const sinceTs = Math.floor(Date.now() / 1000);
+        const newMsgs = await pollFlashInboxSince(mailConfig.email, sinceTs - 5, 120000);
+        for (const msg of newMsgs) {
+          const body = msg.content || msg.body || msg.html || msg.text || '';
+          const subj = msg.subject || msg.textSubject || '';
+          if (body && (subj.toLowerCase().includes('groq') || body.toLowerCase().includes('groq') || body.toLowerCase().includes('stytch'))) {
+            const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:magic|token|redirect|stytch)[^\s"'<>]*/i)
+                           || body.match(/https?:\/\/[^\s"'<>]{60,}/);
+            if (linkMatch) {
+              const link = linkMatch[0].replace(/&amp;/g, '&');
+              console.log(`  Groq: clicking fresh magic link: ${link.slice(0, 80)}...`);
+              await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.waitForTimeout(5000);
+              console.log(`  Groq: after magic link redirect: ${page.url().slice(0, 80)}`);
+              break;
+            }
+          }
+        }
+      }
+
+      // Re-navigate to keys page after re-auth attempt
+      await page.goto('https://console.groq.com/keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(3000);
+    }
 
     // Click "Create API Key"
     const createBtn = page.locator('button:has-text("Create API Key"), button:has-text("New Key"), button:has-text("Generate")').first();
@@ -1473,13 +1604,13 @@ async function captureLastFMKey(context, loginId) {
  * Dispatcher: routes to the right capture function based on site name.
  * Returns without error for sites that don't have API keys to capture.
  */
-async function captureAPIKey(context, siteName, loginId) {
+async function captureAPIKey(context, siteName, loginId, mailConfig) {
   const name = (siteName || '').toLowerCase();
   if (name.includes('openrouter'))    return captureOpenRouterKey(context, loginId);
   if (name.includes('deepseek'))      return captureDeepSeekKey(context, loginId);
   if (name.includes('tavily'))        return captureTavilyKey(context, loginId);
-  if (name === 'groq')                return captureGroqKey(context, loginId);
-  if (name.includes('xai') || (name.includes('grok') && !name.includes('groq'))) return captureXAIKey(context, loginId);
+  if (name === 'groq')                return captureGroqKey(context, loginId, mailConfig);
+  if (name.includes('xai') || (name.includes('grok') && !name.includes('groq'))) return captureXAIKey(context, loginId, mailConfig);
   if (name.includes('tmdb'))          return captureTMDBKey(context, loginId);
   if (name.includes('rapidapi'))      return captureRapidAPIKey(context, loginId);
   if (name.includes('last fm') || name.includes('lastfm')) return captureLastFMKey(context, loginId);
@@ -1696,7 +1827,7 @@ async function main() {
       // Attempt to capture API key from the site dashboard
       if (loginId) {
         try {
-          await captureAPIKey(context, siteName, loginId);
+          await captureAPIKey(context, siteName, loginId, { email: batchEmail, service: emailService });
         } catch (keyErr) {
           console.warn(`  ⚠️ API key capture failed for ${siteName}: ${keyErr.message}`);
         }
