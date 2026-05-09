@@ -206,7 +206,7 @@ async function getPendingSignups() {
     {
       params: {
         filterByFormula: `{Status} = "Pending"`,
-        fields: ['Name', 'URL', 'Category', 'Status', 'Notes'],
+        fields: ['Name', 'URL', 'Category', 'Status', 'Notes', 'Repeatable'],
       },
       headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
     }
@@ -827,6 +827,384 @@ async function signUp(page, site, email, password) {
   return checkPageResult(page, site.id, 'after');
 }
 
+// ─── API Key Capture ──────────────────────────────────────────────────────────
+
+/**
+ * Saves an API key as a new Credential record in Airtable, linked to the login.
+ */
+async function saveAPIKeyToAirtable(siteName, apiKey, loginId) {
+  if (DRY_RUN) {
+    console.log(`  [DRY RUN] Would save API key for ${siteName}: ${apiKey}`);
+    return;
+  }
+  try {
+    await axios.post(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}`,
+      {
+        fields: {
+          fld2lJoFqSGAEK5tw: `${siteName} — API Key`,
+          flddhlUwVQW6vrY55: loginId ? [loginId] : [],
+          fldSNad5zoyLbpebm: 'API Key',
+          fld4tDedZ5uGVy3gP: 'Active',
+          fldGMbEDOCtLXqbLX: apiKey,
+          fld5NI6ls6Qu16wnL: `Captured automatically by Marie on ${new Date().toISOString().split('T')[0]}`,
+        },
+      },
+      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`  ✅ API key saved for ${siteName}: ${apiKey.slice(0, 12)}...`);
+  } catch (err) {
+    console.warn(`  ⚠️ API key Airtable save failed for ${siteName}:`, err.response?.data?.error || err.message);
+  }
+}
+
+async function captureOpenRouterKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → OpenRouter: navigating to API keys page...');
+    await page.goto('https://openrouter.ai/keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // Click "Create Key" button
+    const createBtn = page.locator('button:has-text("Create Key"), button:has-text("New Key"), button:has-text("Add Key")').first();
+    if (await createBtn.isVisible().catch(() => false)) {
+      await createBtn.click();
+      await page.waitForTimeout(2000);
+
+      // Fill in key name if prompted
+      const nameInput = page.locator('input[placeholder*="name" i], input[placeholder*="key" i]').first();
+      if (await nameInput.isVisible().catch(() => false)) {
+        await nameInput.fill('Marie Auto Key');
+        const confirmBtn = page.locator('button:has-text("Create"), button[type="submit"]').first();
+        await confirmBtn.click();
+        await page.waitForTimeout(2000);
+      }
+    }
+
+    // Grab key value — OpenRouter shows it in a text input or code block
+    const keyEl = page.locator('input[value^="sk-or-v1-"], code:has-text("sk-or-v1-"), [data-testid*="key"] input').first();
+    if (await keyEl.isVisible().catch(() => false)) {
+      const key = await keyEl.inputValue().catch(() => keyEl.textContent());
+      if (key && key.startsWith('sk-or-v1-')) {
+        await saveAPIKeyToAirtable('OpenRouter', key.trim(), loginId);
+        return;
+      }
+    }
+
+    // Fallback: scan all text for the key pattern
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/sk-or-v1-[A-Za-z0-9_-]{40,}/);
+    if (match) {
+      await saveAPIKeyToAirtable('OpenRouter', match[0].trim(), loginId);
+    } else {
+      console.warn('  ⚠️ OpenRouter: key not found on page');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ OpenRouter key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+async function captureDeepSeekKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → DeepSeek: navigating to API keys page...');
+    await page.goto('https://platform.deepseek.com/api_keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // Click "Create new API key" button
+    const createBtn = page.locator('button:has-text("Create"), button:has-text("New"), button:has-text("Generate")').first();
+    if (await createBtn.isVisible().catch(() => false)) {
+      await createBtn.click();
+      await page.waitForTimeout(2000);
+
+      // Confirm in modal if needed
+      const confirmBtn = page.locator('button:has-text("Confirm"), button:has-text("Create"), button[type="submit"]').first();
+      if (await confirmBtn.isVisible().catch(() => false)) {
+        await confirmBtn.click();
+        await page.waitForTimeout(2000);
+      }
+    }
+
+    // Grab key — DeepSeek shows full key once in a modal
+    const keyEl = page.locator('input[value^="sk-"], code:has-text("sk-"), [class*="key"] input').first();
+    if (await keyEl.isVisible().catch(() => false)) {
+      const key = (await keyEl.inputValue().catch(() => keyEl.textContent())).trim();
+      if (key && key.startsWith('sk-')) {
+        await saveAPIKeyToAirtable('DeepSeek', key, loginId);
+        return;
+      }
+    }
+
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/sk-[A-Za-z0-9]{32,}/);
+    if (match) {
+      await saveAPIKeyToAirtable('DeepSeek', match[0], loginId);
+    } else {
+      console.warn('  ⚠️ DeepSeek: key not found on page');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ DeepSeek key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+async function captureTavilyKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → Tavily: navigating to API keys page...');
+    await page.goto('https://app.tavily.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(4000);
+
+    // Tavily shows the key on the home dashboard
+    const keyEl = page.locator('input[value^="tvly-"], code:has-text("tvly-"), [class*="api-key"], [class*="apiKey"]').first();
+    if (await keyEl.isVisible().catch(() => false)) {
+      const key = (await keyEl.inputValue().catch(() => keyEl.textContent())).trim();
+      if (key && key.startsWith('tvly-')) {
+        await saveAPIKeyToAirtable('Tavily', key, loginId);
+        return;
+      }
+    }
+
+    // Try clicking a "Copy" or "Show" button near the key
+    const showBtn = page.locator('button:has-text("Show"), button:has-text("Reveal"), button:has-text("Copy")').first();
+    if (await showBtn.isVisible().catch(() => false)) {
+      await showBtn.click();
+      await page.waitForTimeout(1000);
+    }
+
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/tvly-[A-Za-z0-9_-]{20,}/);
+    if (match) {
+      await saveAPIKeyToAirtable('Tavily', match[0], loginId);
+    } else {
+      console.warn('  ⚠️ Tavily: key not found on page');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ Tavily key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+async function captureXAIKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → xAI: navigating to API keys page...');
+    await page.goto('https://console.x.ai/team/default/api-keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(4000);
+
+    // Click "Create API Key" button
+    const createBtn = page.locator('button:has-text("Create"), button:has-text("New"), button:has-text("Generate")').first();
+    if (await createBtn.isVisible().catch(() => false)) {
+      await createBtn.click();
+      await page.waitForTimeout(2000);
+
+      // Fill name if prompted
+      const nameInput = page.locator('input[placeholder*="name" i], input[placeholder*="key" i]').first();
+      if (await nameInput.isVisible().catch(() => false)) {
+        await nameInput.fill('Marie Auto Key');
+        const confirmBtn = page.locator('button:has-text("Create"), button[type="submit"]').first();
+        await confirmBtn.click();
+        await page.waitForTimeout(2000);
+      }
+    }
+
+    // xAI shows key starting with "xai-"
+    const keyEl = page.locator('input[value^="xai-"], code:has-text("xai-"), [class*="key"] input').first();
+    if (await keyEl.isVisible().catch(() => false)) {
+      const key = (await keyEl.inputValue().catch(() => keyEl.textContent())).trim();
+      if (key && key.startsWith('xai-')) {
+        await saveAPIKeyToAirtable('Grok / xAI', key, loginId);
+        return;
+      }
+    }
+
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/xai-[A-Za-z0-9_-]{40,}/);
+    if (match) {
+      await saveAPIKeyToAirtable('Grok / xAI', match[0], loginId);
+    } else {
+      console.warn('  ⚠️ xAI: key not found on page');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ xAI key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+async function captureTMDBKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → TMDB: navigating to API settings...');
+    await page.goto('https://www.themoviedb.org/settings/api', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // TMDB shows API key (v3 auth) and Read Access Token (v4)
+    const keyEl = page.locator('input#api_key, [id*="api_key"], input[name="api_key"]').first();
+    if (await keyEl.isVisible().catch(() => false)) {
+      const key = (await keyEl.inputValue()).trim();
+      if (key && key.length === 32) {
+        await saveAPIKeyToAirtable('TMDB', key, loginId);
+        return;
+      }
+    }
+
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/[a-f0-9]{32}/);
+    if (match) {
+      await saveAPIKeyToAirtable('TMDB', match[0], loginId);
+    } else {
+      console.warn('  ⚠️ TMDB: key not found on page');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ TMDB key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+async function captureRapidAPIKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → RapidAPI: navigating to developer apps...');
+    await page.goto('https://rapidapi.com/developer/apps', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(4000);
+
+    // Click first app to see its key
+    const appItem = page.locator('[class*="app-item"], [class*="application"]').first();
+    if (await appItem.isVisible().catch(() => false)) {
+      await appItem.click();
+      await page.waitForTimeout(2000);
+    }
+
+    // Find the API key (RapidAPI shows it as a long alphanumeric string)
+    const keyEl = page.locator('input[value^="rapid"], input[value*="api-key"], [class*="key"] input, [data-testid*="key"] input').first();
+    if (await keyEl.isVisible().catch(() => false)) {
+      const key = (await keyEl.inputValue()).trim();
+      if (key && key.length > 20) {
+        await saveAPIKeyToAirtable('RapidAPI', key, loginId);
+        return;
+      }
+    }
+
+    // Try broader text scan for UUID-like or long alphanumeric key
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/[a-f0-9]{32,}/);
+    if (match) {
+      await saveAPIKeyToAirtable('RapidAPI', match[0], loginId);
+    } else {
+      console.warn('  ⚠️ RapidAPI: key not found on page');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ RapidAPI key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+async function captureGroqKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → Groq: navigating to API keys page...');
+    await page.goto('https://console.groq.com/keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // Click "Create API Key"
+    const createBtn = page.locator('button:has-text("Create API Key"), button:has-text("New Key"), button:has-text("Generate")').first();
+    if (await createBtn.isVisible().catch(() => false)) {
+      await createBtn.click();
+      await page.waitForTimeout(2000);
+
+      // Fill name if prompted
+      const nameInput = page.locator('input[placeholder*="name" i], input[placeholder*="key" i]').first();
+      if (await nameInput.isVisible().catch(() => false)) {
+        await nameInput.fill('Marie Auto Key');
+        const confirmBtn = page.locator('button:has-text("Submit"), button:has-text("Create"), button[type="submit"]').first();
+        await confirmBtn.click();
+        await page.waitForTimeout(2000);
+      }
+    }
+
+    // Groq keys start with gsk_
+    const keyEl = page.locator('input[value^="gsk_"], code:has-text("gsk_"), [class*="key"] input').first();
+    if (await keyEl.isVisible().catch(() => false)) {
+      const key = (await keyEl.inputValue().catch(() => keyEl.textContent())).trim();
+      if (key && key.startsWith('gsk_')) {
+        await saveAPIKeyToAirtable('Groq', key, loginId);
+        return;
+      }
+    }
+
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/gsk_[A-Za-z0-9]{40,}/);
+    if (match) {
+      await saveAPIKeyToAirtable('Groq', match[0], loginId);
+    } else {
+      console.warn('  ⚠️ Groq: key not found on page');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ Groq key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+async function captureLastFMKey(context, loginId) {
+  const page = await context.newPage();
+  try {
+    console.log('  → Last FM: navigating to API account page...');
+    await page.goto('https://www.last.fm/api/account/create', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // Fill application name
+    const appNameInput = page.locator('input[name="app_name"], input[id*="name"]').first();
+    if (await appNameInput.isVisible().catch(() => false)) {
+      await appNameInput.fill('Rascals Inc');
+      const descInput = page.locator('textarea[name*="desc"], textarea[id*="desc"]').first();
+      if (await descInput.isVisible().catch(() => false)) {
+        await descInput.fill('Internal music data integration');
+      }
+      const submitBtn = page.locator('button[type="submit"], input[type="submit"]').first();
+      await submitBtn.click();
+      await page.waitForTimeout(3000);
+    }
+
+    // Key appears after creation
+    const bodyText = await page.locator('body').innerText();
+    const match = bodyText.match(/[a-f0-9]{32}/);
+    if (match) {
+      await saveAPIKeyToAirtable('Last FM', match[0], loginId);
+    } else {
+      console.warn('  ⚠️ Last FM: key not found — may need to register app manually at last.fm/api/account/create');
+    }
+  } catch (err) {
+    console.warn(`  ⚠️ Last FM key capture failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
+}
+
+/**
+ * Dispatcher: routes to the right capture function based on site name.
+ * Returns without error for sites that don't have API keys to capture.
+ */
+async function captureAPIKey(context, siteName, loginId) {
+  const name = (siteName || '').toLowerCase();
+  if (name.includes('openrouter'))    return captureOpenRouterKey(context, loginId);
+  if (name.includes('deepseek'))      return captureDeepSeekKey(context, loginId);
+  if (name.includes('tavily'))        return captureTavilyKey(context, loginId);
+  if (name === 'groq')                return captureGroqKey(context, loginId);
+  if (name.includes('xai') || (name.includes('grok') && !name.includes('groq'))) return captureXAIKey(context, loginId);
+  if (name.includes('tmdb'))          return captureTMDBKey(context, loginId);
+  if (name.includes('rapidapi'))      return captureRapidAPIKey(context, loginId);
+  if (name.includes('last fm') || name.includes('lastfm')) return captureLastFMKey(context, loginId);
+  // MusicBrainz, Socialcrawl, Qwen: no automated key capture — skip silently
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 //
 // Architecture:
@@ -910,6 +1288,7 @@ async function main() {
           needsVerification: !!result.needsVerification,
           isOMDB: siteName === 'OMDB',
           isRapidAPI: siteName === 'RapidAPI',
+          isRepeatable: !!site.fields['Repeatable'],
         });
       }
     } catch (err) {
@@ -1018,15 +1397,28 @@ async function main() {
     const notes    = item.site.fields['Notes'] || '';
 
     try {
+      let loginId = null;
       if (!item.isOMDB) {
         // OMDB credentials saved separately (API key, not password)
-        await saveToAirtable(siteName, batchEmail, SIGNUP_PASSWORD, notes);
+        loginId = await saveToAirtable(siteName, batchEmail, SIGNUP_PASSWORD, notes);
       }
 
-      await updateSignupStatus(item.site.id, 'Done', {
+      // Attempt to capture API key from the site dashboard
+      if (loginId) {
+        try {
+          await captureAPIKey(context, siteName, loginId);
+        } catch (keyErr) {
+          console.warn(`  ⚠️ API key capture failed for ${siteName}: ${keyErr.message}`);
+        }
+      }
+
+      // Repeatable sites (e.g. RapidAPI) reset to Pending so each run creates a fresh account
+      const nextStatus = item.isRepeatable ? 'Pending' : 'Done';
+      await updateSignupStatus(item.site.id, nextStatus, {
         'Email Used': batchEmail,
         'Completed At': new Date().toISOString(),
       });
+      if (item.isRepeatable) console.log(`  ↻ ${siteName} is Repeatable — reset to Pending for next run`);
 
       results.done.push({ name: siteName, email: batchEmail });
       console.log(`  ✅ ${siteName}`);
