@@ -1,11 +1,12 @@
 /**
  * Marie — Account Creator
  *
- * Architecture: ONE temp email per run (via Temp Mail API / Privatix).
- * All sites sign up with that address. After Phase 1 (all forms submitted),
- * Phase 2 polls the shared temp inbox for every email that arrived and clicks
- * all verification links in one pass. Phase 3 subscribes to curated RapidAPI
- * APIs while the browser session is still live. Phase 4 saves credentials.
+ * Architecture: PER-SITE temp emails (via Temp Mail API / Privatix).
+ * Each site signs up with its own randomly-chosen domain address, increasing
+ * the chance that at least one domain delivers verification mail. After Phase 1
+ * (all forms submitted), Phase 2 polls every unique inbox in parallel and clicks
+ * all verification links. Phase 3 subscribes to curated RapidAPI APIs while the
+ * browser session is still live. Phase 4 saves credentials.
  *
  * Secrets required:
  *   RAPIDAPI_KEY  (used for both Temp Mail and RapidAPI)
@@ -875,9 +876,10 @@ async function signUpLastFM(page, site, email, password) {
   if (/captcha|robot|not a human/i.test(text)) {
     return { success: false, reason: 'Last FM: CAPTCHA challenge — needs manual signup' };
   }
-  const hasError = /error|invalid|already (registered|exists|taken)|try again/i.test(text);
+  // Tightened regex — avoids false positive from nav links like "Already have an account?"
+  const hasError = /\b(error|invalid)\b.{0,60}\b(email|password|username|field)\b|\b(already (registered|exists|taken))\b|try again later/i.test(text);
   if (hasError) {
-    const m = text.match(/(error|invalid|already)[^\n]{0,100}/i);
+    const m = text.match(/(error|invalid|already (registered|exists|taken))[^\n]{0,100}/i);
     return { success: false, reason: m?.[0] || 'Error detected on page' };
   }
   return { success: true, needsVerification: true };
@@ -895,7 +897,36 @@ async function signUpRapidAPI(page, site, email, password) {
 
   // RapidAPI may have a terms checkbox — already handled by fillStandardForm
   // Use Playwright click for the submit (handles React SPAs better)
-  const submitted = await playwrightClickSubmit(page);
+  let submitted = await playwrightClickSubmit(page);
+
+  // Extra fallbacks — RapidAPI has used divs/anchors styled as buttons
+  if (!submitted) {
+    const rapidSelectors = [
+      '[role="button"]:has-text("Sign Up")',
+      '[role="button"]:has-text("Create")',
+      '[role="button"]:has-text("Register")',
+      '[role="button"]:has-text("Get Started")',
+      'a:has-text("Sign Up")',
+      'a:has-text("Create Account")',
+      'a:has-text("Get Started")',
+      'button:has-text("Sign Up Free")',
+      'button:has-text("Try It Free")',
+      // Last resort: any visible button that's not a social-auth button
+      'form button',
+    ];
+    for (const sel of rapidSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 2000 })) {
+          await el.click({ timeout: 3000 });
+          submitted = true;
+          console.log(`  RapidAPI: clicked fallback submit: ${sel}`);
+          break;
+        }
+      } catch { /* try next */ }
+    }
+  }
+
   if (!submitted) return { success: false, reason: 'Submit button not found' };
 
   await page.waitForTimeout(5000);
@@ -1353,9 +1384,9 @@ async function main() {
     return;
   }
 
-  // Generate ONE temp email for the entire batch
-  const batchEmail = await generateTempEmail('rascals');
-  console.log(`\nBatch email for this run: ${batchEmail}`);
+  // Per-site email strategy: each site gets its own temp email from a random domain.
+  // This maximises the chance that at least some domains deliver verification mail.
+  console.log('\nPer-site email strategy — each site gets its own temp email address');
 
   const browser = await chromium.launch({
     args: [
@@ -1393,7 +1424,11 @@ async function main() {
 
     const page = await context.newPage();
     try {
-      const result = await signUp(page, site, batchEmail, SIGNUP_PASSWORD);
+      // Each site gets its own email from a randomly-chosen domain
+      const siteEmail = await generateTempEmail(siteName);
+      console.log(`  Email: ${siteEmail}`);
+
+      const result = await signUp(page, site, siteEmail, SIGNUP_PASSWORD);
 
       if (!result.success) {
         console.log(`  ❌ Signup failed: ${result.reason}`);
@@ -1403,6 +1438,7 @@ async function main() {
         console.log(`  ✅ Submitted`);
         submitted.push({
           site,
+          email: siteEmail,
           needsVerification: !!result.needsVerification,
           isOMDB: siteName === 'OMDB',
           isRapidAPI: siteName === 'RapidAPI',
@@ -1422,35 +1458,48 @@ async function main() {
   if (submitted.length === 0) {
     console.log('\nNo sites submitted successfully — skipping verification.');
     await browser.close();
-    await postSlackSummary(results, batchEmail);
+    await postSlackSummary(results);
     return;
   }
 
-  // ── Phase 2: Batch inbox poll — click ALL verification links ─────────────
+  // ── Phase 2: Parallel inbox poll — each site's own inbox ────────────────
   const needVerify = submitted.filter(s => s.needsVerification || s.isOMDB);
   if (needVerify.length > 0) {
     console.log(`\n${'═'.repeat(60)}`);
-    console.log(`Phase 2 — Batch verifying ${needVerify.length} account(s) from shared inbox`);
+    console.log(`Phase 2 — Verifying ${needVerify.length} account(s) via per-site inboxes`);
     console.log('═'.repeat(60));
 
-    // Poll temp mail inbox — 10 min timeout to give slow senders time to deliver
-    const messages = await pollInbox(batchEmail, 600000);
-    console.log(`  Found ${messages.length} message(s) in inbox`);
+    // Collect unique emails that need polling
+    const uniqueEmails = [...new Set(needVerify.map(s => s.email))];
+    console.log(`  Polling ${uniqueEmails.length} unique inbox(es) in parallel (10 min timeout each)...`);
+
+    // Poll all inboxes simultaneously — 10 min timeout each
+    const pollResults = await Promise.all(
+      uniqueEmails.map(email =>
+        pollInbox(email, 600000)
+          .then(msgs => msgs.map(m => ({ ...m, _toEmail: email })))
+          .catch(err => { console.warn(`  Poll error for ${email}: ${err.message}`); return []; })
+      )
+    );
+
+    const allMessages = pollResults.flat();
+    console.log(`  Found ${allMessages.length} total message(s) across all inboxes`);
 
     const omdbItem = submitted.find(s => s.isOMDB);
 
-    for (const msg of messages) {
+    for (const msg of allMessages) {
       const subject  = msg.mail_subject || '(no subject)';
       const from     = msg.mail_from    || '';
       const body     = msg.mail_text_only || msg.mail_html || '';
-      console.log(`\n  Message: "${subject}" from ${from}`);
+      const toEmail  = msg._toEmail;
+      console.log(`\n  Message: "${subject}" from ${from} → ${toEmail}`);
 
       // OMDB sends API key (not a link) — extract it
-      if (omdbItem && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
+      if (omdbItem && toEmail === omdbItem.email && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
         const keyMatch = body.match(/\b([a-f0-9]{8})\b/i);
         if (keyMatch) {
           console.log(`  OMDB API key: ${keyMatch[1]}`);
-          await saveOMDBApiKey(batchEmail, keyMatch[1]);
+          await saveOMDBApiKey(omdbItem.email, keyMatch[1]);
           omdbItem.omdbDone = true;
         }
         continue;
@@ -1479,8 +1528,8 @@ async function main() {
       }
     }
 
-    if (messages.length === 0) {
-      console.warn('  ⚠️ Inbox empty — verification emails may still be in transit');
+    if (allMessages.length === 0) {
+      console.warn('  ⚠️ All inboxes empty — verification emails may still be in transit or domains are blocked');
     }
   }
 
@@ -1515,10 +1564,11 @@ async function main() {
     const notes    = item.site.fields['Notes'] || '';
 
     try {
+      const siteEmail = item.email;
       let loginId = null;
       if (!item.isOMDB) {
         // OMDB credentials saved separately (API key, not password)
-        loginId = await saveToAirtable(siteName, batchEmail, SIGNUP_PASSWORD, notes);
+        loginId = await saveToAirtable(siteName, siteEmail, SIGNUP_PASSWORD, notes);
       }
 
       // Attempt to capture API key from the site dashboard
@@ -1533,12 +1583,12 @@ async function main() {
       // Repeatable sites (e.g. RapidAPI) reset to Pending so each run creates a fresh account
       const nextStatus = item.isRepeatable ? 'Pending' : 'Done';
       await updateSignupStatus(item.site.id, nextStatus, {
-        'Email Used': batchEmail,
+        'Email Used': siteEmail,
         'Completed At': new Date().toISOString(),
       });
       if (item.isRepeatable) console.log(`  ↻ ${siteName} is Repeatable — reset to Pending for next run`);
 
-      results.done.push({ name: siteName, email: batchEmail });
+      results.done.push({ name: siteName, email: siteEmail });
       console.log(`  ✅ ${siteName}`);
     } catch (err) {
       console.warn(`  ⚠️ Save failed for ${siteName}: ${err.message}`);
@@ -1547,15 +1597,19 @@ async function main() {
   }
 
   await browser.close();
-  await postSlackSummary(results, batchEmail);
+  await postSlackSummary(results);
   console.log(`\n✅ Done. Created: ${results.done.length} | Failed: ${results.failed.length}`);
 }
 
-async function postSlackSummary(results, batchEmail) {
-  const lines = [`🔐 *Kondo — Account Creator Summary*`, `_Batch email: ${batchEmail}_`];
+async function postSlackSummary(results) {
+  const uniqueEmails = [...new Set((results.done || []).map(r => r.email).filter(Boolean))];
+  const emailNote = uniqueEmails.length > 0
+    ? `_${uniqueEmails.length} unique temp email(s) used (per-site strategy)_`
+    : `_No accounts created_`;
+  const lines = [`🔐 *Marie — Account Creator Summary*`, emailNote];
   if (results.done.length) {
     lines.push(`\n✅ *Created (${results.done.length}):*`);
-    results.done.forEach(r => lines.push(`• ${r.name}`));
+    results.done.forEach(r => lines.push(`• ${r.name} — ${r.email}`));
   }
   if (results.failed.length) {
     lines.push(`\n❌ *Failed (${results.failed.length}):*`);
