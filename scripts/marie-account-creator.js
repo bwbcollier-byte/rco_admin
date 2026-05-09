@@ -191,12 +191,16 @@ async function createFlashMailbox() {
 }
 
 /**
- * GET /mailbox/emails — polls the Flash mailbox until messages arrive.
- * No timestamp filter needed — mailbox is freshly created each run.
+ * GET /mailbox/emails-html — polls the Flash mailbox until messages arrive.
+ * Continues polling for SETTLE_MS after first messages arrive to catch late senders.
  */
 async function pollFlashInbox(email, timeoutMs = 600000) {
   console.log(`  Polling Flash Mail inbox for ${email}...`);
+  const SETTLE_MS = 120000; // keep polling 2 min after first message to catch late arrivals
   const start = Date.now();
+  let allMessages = [];
+  let firstMessageAt = null;
+
   while (Date.now() - start < timeoutMs) {
     await new Promise(r => setTimeout(r, 10000));
     try {
@@ -212,14 +216,26 @@ async function pollFlashInbox(email, timeoutMs = 600000) {
         : Array.isArray(res.data?.emails)   ? res.data.emails
         : Array.isArray(res.data?.messages) ? res.data.messages
         : [];
-      if (messages.length > 0) {
-        console.log(`  Got ${messages.length} message(s) in Flash Mail inbox`);
-        // Log first message structure so we know field names
-        console.log(`  Flash msg keys: ${Object.keys(messages[0]).join(', ')}`);
-        console.log(`  Flash msg sample: ${JSON.stringify(messages[0]).slice(0, 500)}`);
-        return messages;
+
+      if (messages.length > allMessages.length) {
+        console.log(`  Inbox: ${messages.length} message(s) (+${messages.length - allMessages.length} new)`);
+        if (!firstMessageAt) {
+          firstMessageAt = Date.now();
+          // Log structure once so we know field names
+          console.log(`  Flash msg keys: ${Object.keys(messages[0]).join(', ')}`);
+        }
+        allMessages = messages;
+      } else if (messages.length > 0) {
+        console.log(`  Inbox: ${messages.length} message(s) — no new arrivals`);
+      } else {
+        console.log(`  No messages yet...`);
       }
-      console.log(`  No messages yet...`);
+
+      // Return once settle time has passed after first message
+      if (firstMessageAt && Date.now() - firstMessageAt >= SETTLE_MS) {
+        console.log(`  Settle window complete — processing ${allMessages.length} message(s)`);
+        return allMessages;
+      }
     } catch (err) {
       if (err.response?.status === 404) {
         console.log(`  Inbox empty (404), waiting...`);
@@ -228,7 +244,8 @@ async function pollFlashInbox(email, timeoutMs = 600000) {
       }
     }
   }
-  return [];
+  console.log(`  Poll timeout — returning ${allMessages.length} message(s)`);
+  return allMessages;
 }
 
 // ─── Email provider router ────────────────────────────────────────────────────
