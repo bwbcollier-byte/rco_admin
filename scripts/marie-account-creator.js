@@ -530,20 +530,42 @@ async function signUpMultiStep(page, site, email, password) {
   // Step -1: Dismiss cookie consent banner if present (e.g. CookieYes on WorkOS pages)
   const cookieDismiss = [
     '#cookieyes-accept', 'button.cky-btn-accept',
+    'button[id*="accept"]', 'button[class*="accept"]',
     'button:has-text("Accept All")', 'button:has-text("Accept all")',
     'button:has-text("Accept")', 'button:has-text("I Accept")',
     'button:has-text("Allow All")', 'button:has-text("Allow all")',
     'button:has-text("Got it")', 'button:has-text("Agree")',
     'button:has-text("OK")',
   ];
+  let cookieDismissed = false;
   for (const sel of cookieDismiss) {
     try {
-      await page.waitForSelector(sel, { state: 'visible', timeout: 1500 });
+      await page.waitForSelector(sel, { state: 'visible', timeout: 5000 });
       await page.click(sel);
       console.log(`  Dismissed cookie consent: ${sel}`);
       await page.waitForTimeout(2000);
+      cookieDismissed = true;
       break;
     } catch {}
+  }
+  // Fallback: remove CookieYes banner elements via JS
+  if (!cookieDismissed) {
+    const removed = await page.evaluate(() => {
+      const selectors = [
+        '.cky-consent-container', '.cky-overlay', '#cookieyes-root',
+        '[class*="cookieyes"]', '[id*="cookieyes"]', '[class*="cookie-consent"]',
+      ];
+      let found = false;
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) { el.remove(); found = true; }
+      }
+      return found;
+    });
+    if (removed) {
+      console.log('  Removed cookie banner via JS');
+      await page.waitForTimeout(1000);
+    }
   }
 
   // Step 0: Some pages (WorkOS/Cerebras) show auth method options first.
