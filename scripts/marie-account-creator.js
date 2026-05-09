@@ -117,26 +117,44 @@ async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
 /**
  * GET /message — fetches full body of a single Gmail message by its mid.
  * The inbox endpoint only returns metadata; this gets the actual content.
+ * Tries several param combinations since the API docs are sparse.
  */
-async function fetchGmailMessageBody(mid) {
-  try {
-    const res = await axios.get('https://temp-gmail.p.rapidapi.com/message', {
-      params: { mid },
-      headers: {
-        'x-rapidapi-key': RAPIDAPI_KEY,
-        'x-rapidapi-host': TEMPGMAIL_HOST,
-        'Content-Type': 'application/json',
-      },
-    });
-    console.log(`  Message body response keys: ${Object.keys(res.data || {}).join(', ')}`);
-    // Body may be in various fields depending on API version
-    return res.data?.textBody || res.data?.htmlBody || res.data?.body
-        || res.data?.text || res.data?.html || res.data?.content
-        || JSON.stringify(res.data);
-  } catch (err) {
-    console.warn(`  Could not fetch message body for mid ${mid}: ${err.response?.status} ${err.message}`);
-    return '';
+async function fetchGmailMessageBody(mid, email) {
+  // Try param combinations most likely to work given the /inbox pattern
+  const attempts = [
+    { mid, email, password: TEMPGMAIL_PASS },
+    { mid, email },
+    { mid },
+  ];
+
+  for (const params of attempts) {
+    try {
+      const res = await axios.get('https://temp-gmail.p.rapidapi.com/message', {
+        params,
+        headers: {
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-host': TEMPGMAIL_HOST,
+          'Content-Type': 'application/json',
+        },
+      });
+      console.log(`  Message body keys: ${Object.keys(res.data || {}).join(', ')}`);
+      const body = res.data?.textBody || res.data?.htmlBody || res.data?.body
+                || res.data?.text    || res.data?.html     || res.data?.content
+                || res.data?.message || res.data?.snippet;
+      if (body) return body;
+      // Log full response if we can't find a body field
+      console.log(`  Full message response: ${JSON.stringify(res.data).slice(0, 400)}`);
+      return JSON.stringify(res.data);
+    } catch (err) {
+      if (err.response?.status !== 422 && err.response?.status !== 400) {
+        console.warn(`  Could not fetch message body for mid ${mid}: ${err.response?.status} ${err.message}`);
+        return '';
+      }
+      // 422/400 = wrong params, try next combination
+    }
   }
+  console.warn(`  All param combinations failed for mid ${mid}`);
+  return '';
 }
 
 // ─── Flash Temp Mail API (flash-temp-mail.p.rapidapi.com) — fallback ─────────
@@ -1366,6 +1384,13 @@ async function captureLastFMKey(context, loginId) {
     await page.goto('https://www.last.fm/api/account/create', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
 
+    // Check we're on the API account page (not redirected to login)
+    const currentUrl = page.url();
+    if (!currentUrl.includes('/api/')) {
+      console.warn(`  ⚠️ Last FM: redirected to ${currentUrl} — not authenticated, skipping key capture`);
+      return;
+    }
+
     // Fill application name
     const appNameInput = page.locator('input[name="app_name"], input[id*="name"]').first();
     if (await appNameInput.isVisible().catch(() => false)) {
@@ -1374,10 +1399,15 @@ async function captureLastFMKey(context, loginId) {
       if (await descInput.isVisible().catch(() => false)) {
         await descInput.fill('Internal music data integration');
       }
-      // Avoid the site's search button — target the API form submit specifically
-      const submitBtn = page.locator('input[type="submit"][value*="Apply" i], input[type="submit"][value*="Create" i], input[type="submit"][value*="Submit" i], input[type="submit"]').first();
-      await submitBtn.click({ timeout: 10000 });
+      // Use getByRole to find the form submit button by text, avoiding the search button
+      const submitBtn = page.getByRole('button', { name: /apply|create|submit|save/i }).first();
+      const submitInput = page.locator('input[type="submit"]').first();
+      const btn = (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) ? submitBtn : submitInput;
+      await btn.click({ timeout: 8000 });
       await page.waitForTimeout(3000);
+    } else {
+      console.warn('  ⚠️ Last FM: API account form not found — session may not be authenticated');
+      return;
     }
 
     // Key appears after creation
@@ -1537,8 +1567,8 @@ async function main() {
 
       console.log(`\n  Message: "${subject}" from ${from} (mid: ${mid})`);
 
-      // Fetch full body — inbox only returns metadata
-      const body = mid ? await fetchGmailMessageBody(mid) : '';
+      // Fetch full body — inbox only returns metadata; pass email for auth
+      const body = mid ? await fetchGmailMessageBody(mid, batchEmail) : '';
 
       // OMDB sends API key in email body (not a verification link)
       if (omdbItem && (from.includes('omdb') || subject.toLowerCase().includes('omdb'))) {
