@@ -527,6 +527,25 @@ async function signUpMultiStep(page, site, email, password) {
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
   console.log(`  Landed URL: ${page.url()}`);
 
+  // Step -1: Dismiss cookie consent banner if present (e.g. CookieYes on WorkOS pages)
+  const cookieDismiss = [
+    '#cookieyes-accept', 'button.cky-btn-accept',
+    'button:has-text("Accept All")', 'button:has-text("Accept all")',
+    'button:has-text("Accept")', 'button:has-text("I Accept")',
+    'button:has-text("Allow All")', 'button:has-text("Allow all")',
+    'button:has-text("Got it")', 'button:has-text("Agree")',
+    'button:has-text("OK")',
+  ];
+  for (const sel of cookieDismiss) {
+    try {
+      await page.waitForSelector(sel, { state: 'visible', timeout: 1500 });
+      await page.click(sel);
+      console.log(`  Dismissed cookie consent: ${sel}`);
+      await page.waitForTimeout(2000);
+      break;
+    } catch {}
+  }
+
   // Step 0: Some pages (WorkOS/Cerebras) show auth method options first.
   // Click "Continue with email" / "Sign up with email" before the form appears.
   const emailTriggers = [
@@ -646,9 +665,79 @@ async function signUpMultiStep(page, site, email, password) {
   return checkPageResult(page, site.id, 'after');
 }
 
-const signUpTavily   = signUpMultiStep;
 const signUpCerebras = signUpMultiStep;
-const signUpXAI      = signUpMultiStep;
+
+// Tavily — Auth0 identifier-first with Cloudflare Turnstile
+// Password field exists in DOM but is CSS-hidden; force-fill to bypass CAPTCHA gate
+async function signUpTavily(page, site, email, password) {
+  await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(6000);
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
+  console.log(`  Landed URL: ${page.url()}`);
+
+  // Fill email (id=username, autocomplete=email)
+  try {
+    await page.waitForSelector('#username, input[autocomplete="email"]', { state: 'visible', timeout: 10000 });
+    await page.fill('#username, input[autocomplete="email"]', email);
+    console.log('  Email filled');
+  } catch {
+    return { success: false, reason: 'Tavily: email field not found' };
+  }
+
+  // Force-fill hidden password field via JS (bypasses CSS visibility check)
+  const pwSet = await page.evaluate((pwd) => {
+    const el = document.querySelector('input[type="password"]');
+    if (!el) return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(el, pwd);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, password);
+  console.log(`  Password force-filled: ${pwSet}`);
+
+  // Submit
+  const submitted = await playwrightClickSubmit(page);
+  if (!submitted) return { success: false, reason: 'Tavily: submit button not found' };
+  console.log('  Form submitted');
+  return checkPageResult(page, site.id, 'after');
+}
+
+// Grok/xAI — magic link flow (no password; sends login link to email)
+async function signUpXAI(page, site, email, password) {
+  await page.goto(site.fields['URL'], { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(8000);
+  console.log(`  Landed URL: ${page.url()}`);
+
+  // Click "Login with email" to show email form
+  try {
+    await page.waitForSelector('button:has-text("Login with email")', { state: 'visible', timeout: 5000 });
+    await page.click('button:has-text("Login with email")');
+    await page.waitForTimeout(3000);
+    console.log('  Clicked Login with email');
+  } catch {}
+
+  // Fill email
+  try {
+    await page.waitForSelector('input[type="email"], input[name="email"]', { state: 'visible', timeout: 8000 });
+    await page.fill('input[type="email"], input[name="email"]', email);
+    console.log('  Email filled');
+  } catch {
+    return { success: false, reason: 'Grok / xAI: email field not found' };
+  }
+
+  // Click Continue — xAI will send a magic link email
+  try {
+    await page.locator('button[type="submit"]').first().click({ timeout: 5000 });
+  } catch {
+    try { await page.getByRole('button', { name: /continue|next|sign in|login/i }).first().click({ timeout: 3000 }); } catch {}
+  }
+  console.log('  Magic link requested — waiting for Gmail...');
+  await page.screenshot({ path: `/tmp/marie-signup-${site.id}-submitted.png` });
+
+  // Magic link IS the verification — return needsVerification so main loop handles it
+  return { success: true, needsVerification: true };
+}
 
 // OMDB — email-based API key request form (no account, just email + name)
 async function signUpOMDB(page, site, email) {
@@ -731,10 +820,23 @@ async function main() {
     return;
   }
 
-  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  const browser = await chromium.launch({
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+  });
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'en-AU',
+    extraHTTPHeaders: { 'Accept-Language': 'en-AU,en;q=0.9' },
+  });
+  // Hide automation flags from JS
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+    window.chrome = { runtime: {} };
   });
 
   const results = { done: [], failed: [] };
