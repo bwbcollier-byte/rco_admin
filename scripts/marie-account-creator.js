@@ -456,7 +456,7 @@ async function playwrightClickSubmit(page) {
     return true;
   } catch {
     // Fallback: find by text
-    const texts = ['Continue', 'Sign up', 'Register', 'Create account', 'Submit', 'Get started'];
+    const texts = ['Continue', 'Continue with email', 'Sign up', 'Register', 'Create account', 'Submit', 'Get started'];
     for (const text of texts) {
       try {
         await page.getByRole('button', { name: new RegExp(text, 'i') }).first().click({ timeout: 3000 });
@@ -490,11 +490,26 @@ async function signUpMultiStep(page, site, email, password) {
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
 
   // Step 1: fill email using Playwright's real fill()
-  try {
-    const emailSel = 'input[type="email"], input[name*="email" i], input[id*="email" i], input[placeholder*="email" i], input[autocomplete="email"]';
-    await page.waitForSelector(emailSel, { timeout: 15000 });
-    await page.fill(emailSel, email);
-  } catch {
+  // Try specific selectors first, then fall back to first visible text/email input
+  const emailSelectors = [
+    'input[type="email"]',
+    'input[autocomplete="email"]',
+    'input[name*="email" i]',
+    'input[id*="email" i]',
+    'input[placeholder*="email" i]',
+    'input[placeholder*="@" i]',
+    'input[type="text"]:visible',
+  ];
+  let emailFilled = false;
+  for (const sel of emailSelectors) {
+    try {
+      await page.waitForSelector(sel, { timeout: 3000 });
+      await page.fill(sel, email);
+      emailFilled = true;
+      break;
+    } catch { /* try next */ }
+  }
+  if (!emailFilled) {
     await page.screenshot({ path: `/tmp/marie-signup-${site.id}-email-not-found.png` });
     return { success: false, reason: `${site.fields['Name']}: email field not found` };
   }
