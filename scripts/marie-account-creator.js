@@ -60,11 +60,18 @@ function md5(str) {
   return crypto.createHash('md5').update(str).digest('hex');
 }
 
+// Domains known to be widely blacklisted by signup forms — skip these
+const BLOCKED_DOMAINS = ['cevipsa.com', 'maildrop.cc', 'mailnull.com', 'spamgourmet.com'];
+
 async function generateTempEmail(siteName) {
   const domains = await getTempMailDomains();
-  // Pick first available domain
-  const domain = domains[0];
-  // Username: lowercase site name + random suffix
+  console.log(`  Available temp mail domains: ${domains.slice(0, 6).join(', ')}...`);
+
+  // Filter out known-bad domains, pick randomly from the rest
+  const usable = domains.filter(d => !BLOCKED_DOMAINS.some(b => d.includes(b)));
+  const pool = usable.length > 0 ? usable : domains; // fallback to full list if all blocked
+  const domain = pool[Math.floor(Math.random() * pool.length)];
+
   const slug = siteName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
   const suffix = Math.random().toString(36).slice(2, 7);
   const email = `${slug}${suffix}${domain}`;
