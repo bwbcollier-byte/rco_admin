@@ -151,11 +151,13 @@ async function loginToRapidAPI(page, email, password) {
 
   // Wait for and dismiss cookie consent banner
   try {
-    await page.locator('button:has-text("Reject All"), button:has-text("Accept All")').first().waitFor({ state: 'visible', timeout: 5000 });
+    await page.locator('button:has-text("Reject All"), button:has-text("Accept All")').first().waitFor({ state: 'visible', timeout: 8000 });
     await page.locator('button:has-text("Reject All")').first().click();
     console.log('  Dismissed cookie banner');
     await page.waitForTimeout(1500);
-  } catch {}
+  } catch {
+    console.log('  No cookie banner (or already dismissed)');
+  }
 
   // Wait for email field to be visible
   const emailInput = page.locator('input[name="email"]').first();
