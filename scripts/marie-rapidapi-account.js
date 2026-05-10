@@ -214,6 +214,7 @@ async function clickNext(page, stepLabel) {
   return false;
 }
 
+// signUp returns the actual password used (may have '!' appended to meet requirements)
 async function signUp(page, email, password) {
   console.log(`\n  Navigating to RapidAPI signup...`);
   await page.goto('https://rapidapi.com/auth/sign-up', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -228,108 +229,78 @@ async function signUp(page, email, password) {
     await page.waitForTimeout(1500);
   } catch { console.log('  No cookie banner'); }
 
+  // RapidAPI signup form fields (all on one page — not multi-step):
+  //   Username *, Email *, Password *, Confirm Password *, Terms checkbox, Next button
+  //
+  // Password requirements: 8+ chars, upper+lower, digit, special char (@;!$.)
+
+  // Strip '+tag' — RapidAPI rejects plus-aliased emails
+  const signupEmail = email.replace(/\+[^@]+@/, '@');
+  if (signupEmail !== email) console.log(`  Stripped email for signup: ${signupEmail}`);
+
+  // Ensure password has a special character
+  const signupPass = /[@;!$._#%^&*()\-]/.test(password) ? password : password + '!';
+  if (signupPass !== password) console.log(`  Appended '!' to meet special-char requirement`);
+
+  // Generate username from email prefix (alphanumeric only, max 20 chars, random suffix)
+  const usernameStem = signupEmail.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').slice(0, 12);
+  const username = usernameStem + Math.floor(Math.random() * 9000 + 1000);
+  console.log(`  Username: ${username}`);
+
   await page.screenshot({ path: '/tmp/rapidapi-signup-before.png' }).catch(() => {});
 
-  // ── Step 1: Fill email → Next ──
-  // Strip '+tag' suffix — RapidAPI and many sites reject plus-aliased emails.
-  // Gmail still delivers to the same inbox either way.
-  const signupEmail = email.replace(/\+[^@]+@/, '@');
-  if (signupEmail !== email) console.log(`  Using stripped email for signup: ${signupEmail}`);
+  // ── Username ──
+  const userInput = page.locator('input[name="username"], input[placeholder*="username" i]').first();
+  if (await userInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await userInput.click();
+    await userInput.pressSequentially(username, { delay: 50 });
+    await userInput.press('Tab');
+    await page.waitForTimeout(400);
+  } else {
+    console.warn('  ⚠️ Username field not found');
+  }
 
+  // ── Email ──
   const emailInput = page.locator('input[type="email"], input[name="email"]').first();
-  if (!await emailInput.isVisible({ timeout: 8000 }).catch(() => false)) {
+  if (!await emailInput.isVisible({ timeout: 5000 }).catch(() => false)) {
     throw new Error('Email field not found on signup page');
   }
   await emailInput.click();
   await emailInput.pressSequentially(signupEmail, { delay: 60 });
+  await emailInput.press('Tab');
   await page.waitForTimeout(500);
 
-  // Tab out so React runs blur validation and enables the Next button
-  await emailInput.press('Tab');
-  await page.waitForTimeout(2000);
-
-  // Check for inline validation errors (e.g. "Invalid email" or "Already in use")
-  const emailErr = await page.evaluate(() => {
-    const msgs = [...document.querySelectorAll('[role="alert"], .error, [class*="error" i], [class*="invalid" i]')]
-      .map(el => el.textContent.trim()).filter(t => t);
-    return msgs.join(' | ');
-  }).catch(() => '');
-  if (emailErr) console.warn(`  ⚠️ Email validation message: ${emailErr}`);
-
-  await page.screenshot({ path: '/tmp/rapidapi-signup-email-filled.png' }).catch(() => {});
-
-  // Try clicking Next; if that fails, try pressing Enter
-  const step1ok = await clickNext(page, 'step1-email');
-  if (!step1ok) {
-    console.log('  clickNext failed — trying Enter key fallback...');
-    await emailInput.press('Enter');
-    await page.waitForTimeout(3000);
-  }
-
-  await page.screenshot({ path: '/tmp/rapidapi-signup-after-next.png' }).catch(() => {});
-
-  // Wait for password field to become VISIBLE (state:visible, not just in DOM)
-  // The password input exists in the DOM on step 1 too — we need it to be visible.
-  const pwAppeared = await page.waitForSelector('input[type="password"]', { timeout: 15000, state: 'visible' })
-    .then(() => true).catch(() => false);
-  if (!pwAppeared) {
-    // Log what's on screen to diagnose
-    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 500)).catch(() => '');
-    console.warn(`  Page text snippet: ${pageText}`);
-    await page.screenshot({ path: '/tmp/rapidapi-signup-nopw.png' }).catch(() => {});
-    throw new Error('Password field never appeared — check rapidapi-signup-after-next.png in artifacts');
-  }
-  console.log('  Password field appeared ✓');
-
-  await page.screenshot({ path: '/tmp/rapidapi-signup-step2.png' }).catch(() => {});
-
-  // ── Step 2: Fill password, name, terms → Next/Submit ──
+  // ── Password ──
   const passInput = page.locator('input[type="password"]').first();
   await passInput.click();
-  await passInput.pressSequentially(password, { delay: 60 });
-  await page.waitForTimeout(500);
-
-  // Tab out of password so React runs blur validation and enables Next
+  await passInput.pressSequentially(signupPass, { delay: 60 });
   await passInput.press('Tab');
-  await page.waitForTimeout(1500);
-
-  // Check for password validation errors
-  const passErr = await page.evaluate(() => {
-    const msgs = [...document.querySelectorAll('[role="alert"], .error, [class*="error" i], [class*="invalid" i], [class*="helper" i]')]
-      .map(el => el.textContent.trim()).filter(t => t);
-    return msgs.join(' | ');
-  }).catch(() => '');
-  if (passErr) console.warn(`  ⚠️ Password validation: ${passErr}`);
-
-  // Name fields (present on some RapidAPI signup variants)
-  const firstNameEl = page.locator('input[name="firstName"], input[placeholder*="first" i]').first();
-  if (await firstNameEl.isVisible({ timeout: 1000 }).catch(() => false)) {
-    await firstNameEl.pressSequentially(DEFAULTS.firstName, { delay: 40 });
-    await firstNameEl.press('Tab');
-    await page.waitForTimeout(300);
-  }
-  const lastNameEl = page.locator('input[name="lastName"], input[placeholder*="last" i]').first();
-  if (await lastNameEl.isVisible({ timeout: 1000 }).catch(() => false)) {
-    await lastNameEl.pressSequentially(DEFAULTS.lastName, { delay: 40 });
-    await lastNameEl.press('Tab');
-    await page.waitForTimeout(300);
-  }
-
-  // Terms checkbox
-  await page.locator('input[type="checkbox"]').first().check().catch(() => {});
   await page.waitForTimeout(500);
+
+  // ── Confirm Password ──
+  const confirmInput = page.locator('input[type="password"]').nth(1);
+  if (await confirmInput.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await confirmInput.click();
+    await confirmInput.pressSequentially(signupPass, { delay: 60 });
+    await confirmInput.press('Tab');
+    await page.waitForTimeout(500);
+    console.log('  Confirm password filled ✓');
+  }
+
+  // ── Terms checkbox ──
+  await page.locator('input[type="checkbox"]').first().check({ force: true }).catch(() => {});
+  await page.waitForTimeout(800);
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-filled.png' }).catch(() => {});
 
-  // Try clickNext; if button still reports disabled, also try Enter
-  const step2ok = await clickNext(page, 'step2-submit');
-  if (!step2ok) {
-    console.log('  step2 clickNext failed — trying Enter key...');
+  // ── Submit ──
+  const submitOk = await clickNext(page, 'submit');
+  if (!submitOk) {
+    console.log('  clickNext failed — trying Enter key...');
     await passInput.press('Enter');
-    await page.waitForTimeout(5000);
   }
 
-  await page.waitForTimeout(10000);
+  await page.waitForTimeout(12000);
   await page.screenshot({ path: '/tmp/rapidapi-signup-after.png' }).catch(() => {});
 
   // Verify session — success = URL moved away from /auth/
@@ -341,7 +312,8 @@ async function signUp(page, email, password) {
     console.warn(`  Visible buttons: ${btns.slice(0, 10).join(' | ')}`);
     throw new Error(`Signup may have failed — still on auth page: ${finalUrl}`);
   }
-  console.log(`  ✅ Signed up (${finalUrl})`);
+  console.log(`  ✅ Signed up as ${username} (${finalUrl})`);
+  return signupPass; // return actual password used (may differ from SIGNUP_PASSWORD)
 }
 
 // ─── Subscribe to one API ─────────────────────────────────────────────────────
@@ -465,7 +437,7 @@ async function main() {
 
     // 3. Sign up
     console.log('\n── Phase 1: Sign up ──────────────────────────────────────');
-    await signUp(page, email, SIGNUP_PASSWORD);
+    const actualPassword = await signUp(page, email, SIGNUP_PASSWORD);
     await page.close();
 
     // 4. Subscribe to all APIs
@@ -494,8 +466,8 @@ async function main() {
 
     // 5. Save to Airtable
     console.log('\n── Phase 3: Save to Airtable ────────────────────────────');
-    loginId = await saveLogin(email, SIGNUP_PASSWORD);
-    if (loginId) await saveCredential(email, SIGNUP_PASSWORD, loginId);
+    loginId = await saveLogin(email, actualPassword);
+    if (loginId) await saveCredential(email, actualPassword, loginId);
 
     // 6. Mark subscribed APIs + link login
     console.log(`\n  Linking ${subscribed.length} subscribed API(s) to login...`);
