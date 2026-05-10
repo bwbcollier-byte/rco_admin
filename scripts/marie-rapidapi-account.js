@@ -336,9 +336,11 @@ async function signUp(page, email, password) {
   await page.waitForTimeout(5000);
   await page.screenshot({ path: '/tmp/rapidapi-signup-after.png' }).catch(() => {});
 
-  // Check for "Verify your email" page — form submitted, magic link sent
-  const isVerifyPage = await page.locator('text=/verify your email/i, text=/magic link/i').first()
-    .isVisible({ timeout: 3000 }).catch(() => false);
+  // Check for "Verify your email" page — form submitted, magic link sent.
+  // URL stays on /auth/sign-up so we check page content instead.
+  const isVerifyPage = await page.getByText(/verify your email/i).isVisible().catch(() => false)
+    || await page.getByText(/magic link/i).isVisible().catch(() => false)
+    || await page.getByText(/we've sent/i).isVisible().catch(() => false);
   if (isVerifyPage) {
     console.log(`  ✅ Form submitted — magic link sent to ${signupEmail}`);
     return signupPass;
