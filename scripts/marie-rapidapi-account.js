@@ -168,7 +168,8 @@ async function markAPISubscribed(recordId, loginId) {
 
 async function clickNext(page, stepLabel) {
   // RapidAPI uses "Next" as the primary CTA on every signup step.
-  // Avoid 'form button' — it can match social login buttons (Google/GitHub).
+  // Avoid 'form button' — it matches social login buttons (Google/GitHub).
+  // Use force:true — overlays / loading spinners can intercept normal clicks.
   const sels = [
     'button:has-text("Next")',
     'button:has-text("Continue")',
@@ -177,22 +178,34 @@ async function clickNext(page, stepLabel) {
     'button:has-text("Get Started")',
     'button[type="submit"]',
   ];
+
   for (const sel of sels) {
     try {
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-        const txt = (await btn.textContent().catch(() => sel)).trim();
-        console.log(`  [${stepLabel}] Clicked: "${txt}"`);
-        await btn.click();
-        return true;
-      }
-    } catch {}
+      if (!await btn.isVisible({ timeout: 2000 }).catch(() => false)) continue;
+
+      // Skip disabled buttons — React often disables Next until field validates
+      const disabled = await btn.evaluate(el =>
+        el.disabled || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled')
+      ).catch(() => false);
+      if (disabled) { console.log(`  [${stepLabel}] "${sel}" is disabled — skipping`); continue; }
+
+      const txt = (await btn.textContent().catch(() => sel)).trim();
+      console.log(`  [${stepLabel}] Clicking: "${txt}" (force)`);
+      await btn.click({ force: true });   // bypass interception checks
+      await page.waitForTimeout(500);
+      console.log(`  [${stepLabel}] Clicked ✓`);
+      return true;
+    } catch (e) {
+      console.log(`  [${stepLabel}] Click error on "${sel}": ${e.message.split('\n')[0]}`);
+    }
   }
-  // Last resort: dump buttons so we can see what's there, then fail
+
+  // Nothing worked — dump visible buttons for diagnosis
   const btns = await page.evaluate(() =>
     [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null).map(b => b.textContent.trim()).filter(t => t)
   ).catch(() => []);
-  console.warn(`  [${stepLabel}] Visible buttons: ${btns.slice(0, 10).join(' | ')}`);
+  console.warn(`  [${stepLabel}] No clickable button found. Visible: ${btns.slice(0, 10).join(' | ')}`);
   return false;
 }
 
@@ -221,20 +234,41 @@ async function signUp(page, email, password) {
   await emailInput.pressSequentially(email, { delay: 60 });
   await page.waitForTimeout(500);
 
-  // Always click Next after email — RapidAPI's signup is always multi-step.
-  // Even if a password field appears to be in the DOM, it may belong to a
-  // hidden step. Clicking Next is always safe here.
+  // Tab out so React runs blur validation and enables the Next button
+  await emailInput.press('Tab');
+  await page.waitForTimeout(1500);
+
+  // Check for inline validation errors (e.g. "Invalid email" or "Already in use")
+  const emailErr = await page.evaluate(() => {
+    const msgs = [...document.querySelectorAll('[role="alert"], .error, [class*="error" i], [class*="invalid" i]')]
+      .map(el => el.textContent.trim()).filter(t => t);
+    return msgs.join(' | ');
+  }).catch(() => '');
+  if (emailErr) console.warn(`  ⚠️ Email validation message: ${emailErr}`);
+
+  await page.screenshot({ path: '/tmp/rapidapi-signup-email-filled.png' }).catch(() => {});
+
+  // Try clicking Next; if that fails, try pressing Enter
   const step1ok = await clickNext(page, 'step1-email');
-  if (!step1ok) throw new Error('Could not find Next button after filling email');
+  if (!step1ok) {
+    console.log('  clickNext failed — trying Enter key fallback...');
+    await emailInput.press('Enter');
+    await page.waitForTimeout(3000);
+  }
+
+  await page.screenshot({ path: '/tmp/rapidapi-signup-after-next.png' }).catch(() => {});
 
   // Wait for password field to appear (step 2)
-  try {
-    await page.waitForSelector('input[type="password"]', { timeout: 15000 });
-    console.log('  Password field appeared');
-  } catch {
+  const pwAppeared = await page.waitForSelector('input[type="password"]', { timeout: 15000 })
+    .then(() => true).catch(() => false);
+  if (!pwAppeared) {
+    // Log what's on screen to diagnose
+    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 500)).catch(() => '');
+    console.warn(`  Page text snippet: ${pageText}`);
     await page.screenshot({ path: '/tmp/rapidapi-signup-nopw.png' }).catch(() => {});
-    throw new Error('Password field never appeared after clicking Next on step 1');
+    throw new Error('Password field never appeared — check rapidapi-signup-after-next.png in artifacts');
   }
+  console.log('  Password field appeared ✓');
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-step2.png' }).catch(() => {});
 
