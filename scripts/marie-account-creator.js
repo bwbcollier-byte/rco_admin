@@ -1059,10 +1059,33 @@ async function signUpRapidAPI(page, site, email, password) {
   await page.waitForTimeout(5000);
   await page.screenshot({ path: `/tmp/marie-signup-${site.id}-before.png` });
 
-  // Fill standard fields — RapidAPI has email, password, first/last name
-  const filled = await fillStandardForm(page, email, password);
-  console.log(`  Filled ${filled} field(s)`);
-  if (filled === 0) return { success: false, reason: 'No fields found to fill' };
+  // RapidAPI uses React — must use pressSequentially (not JS value assignment) to trigger
+  // React's synthetic events, otherwise the form submits with empty fields.
+  const emailInput = page.locator('input[type="email"], input[name="email"]').first();
+  const passInput  = page.locator('input[type="password"]').first();
+
+  if (!await emailInput.isVisible().catch(() => false)) {
+    return { success: false, reason: 'RapidAPI signup: email field not found' };
+  }
+  await emailInput.click();
+  await emailInput.pressSequentially(email, { delay: 60 });
+  await page.waitForTimeout(300);
+
+  if (await passInput.isVisible().catch(() => false)) {
+    await passInput.click();
+    await passInput.pressSequentially(password, { delay: 60 });
+    await page.waitForTimeout(300);
+  }
+
+  // Also fill first/last name if present (some RapidAPI signup variants ask for it)
+  await page.locator('input[name="firstName"], input[placeholder*="first" i]').first().fill(DEFAULTS.firstName).catch(() => {});
+  await page.locator('input[name="lastName"],  input[placeholder*="last" i]').first().fill(DEFAULTS.lastName).catch(() => {});
+
+  // Tick terms checkbox
+  await page.locator('input[type="checkbox"]').first().check().catch(() => {});
+
+  const filled = 1; // we filled at least email
+  console.log(`  Filled email + password via pressSequentially`);
 
   // RapidAPI may have a terms checkbox — already handled by fillStandardForm
   // Use Playwright click for the submit (handles React SPAs better)
