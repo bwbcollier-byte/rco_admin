@@ -209,34 +209,36 @@ async function subscribeToAPI(page, link, name) {
   await page.goto(pricingUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await page.waitForTimeout(4000);
 
-  // Check if already subscribed — look for "Current Plan" badge or "You are subscribed" text
+  // Check if already subscribed — RapidAPI shows "Current Plan" button on the active tier
   const alreadySub = await page.locator(
     '[class*="CurrentPlan"], [class*="current-plan"], [class*="currentPlan"], ' +
     'button:has-text("Current Plan"), span:has-text("Current Plan"), ' +
-    'text=/current plan|already subscribed|you.re subscribed/i'
+    'button:has-text("Manage My Plan"), ' +
+    'text=/current plan|already subscribed|you.re subscribed|manage my plan/i'
   ).first().isVisible().catch(() => false);
   if (alreadySub) {
-    console.log(`  Already subscribed to ${name}`);
+    console.log(`  ✅ Already subscribed to ${name}`);
     return true;
   }
 
   // RapidAPI plan cards — find the Basic/Free plan and click its Subscribe button.
-  // Strategy: look for the cheapest plan card first, then any subscribe button.
+  // Actual button text observed on RapidAPI pricing pages (2025):
+  //   Free tier  → "Start Free Plan"
+  //   Paid tiers → "Choose This Plan"
+  //   Already subscribed → "Current Plan" (handled above)
   const planCardSelectors = [
-    // Free / Basic plan card subscribe buttons (most specific)
-    '[class*="PricingCard"]:has-text("Basic") button',
-    '[class*="PricingCard"]:has-text("Free") button',
-    '[class*="plan-card"]:has-text("Basic") button',
-    '[class*="plan-card"]:has-text("Free") button',
-    '[class*="PlanCard"]:has-text("Basic") button',
-    '[class*="PlanCard"]:has-text("Free") button',
-    // Generic subscribe buttons — prefer ones with "Subscribe" text
+    // Most specific — free plan button (what we always want)
+    'button:has-text("Start Free Plan")',
+    'a:has-text("Start Free Plan")',
+    // Fallbacks in case text varies
     'button:has-text("Subscribe to Test")',
     'button:has-text("Subscribe")',
     'button:has-text("Select Plan")',
     'button:has-text("Start Free Trial")',
-    'a[class*="subscribe"], a[class*="Subscribe"]',
+    'button:has-text("Get Started")',
     'a:has-text("Subscribe")',
+    // Last resort: first "Choose This Plan" button (lowest tier)
+    'button:has-text("Choose This Plan")',
   ];
 
   let clicked = false;
