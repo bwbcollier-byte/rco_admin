@@ -441,7 +441,7 @@ async function main() {
 
   // 2. Launch browser
   const browser = await chromium.launch({
-    headless: true,
+    headless: process.env.HEADLESS !== 'false',
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-blink-features=AutomationControlled',
