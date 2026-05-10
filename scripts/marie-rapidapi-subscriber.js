@@ -225,8 +225,9 @@ async function subscribeToAPI(page, link, name) {
   const alreadySub = await page.locator(
     '[class*="CurrentPlan"], [class*="current-plan"], [class*="currentPlan"], ' +
     'button:has-text("Current Plan"), span:has-text("Current Plan"), ' +
-    'button:has-text("Manage My Plan"), ' +
-    'text=/current plan|already subscribed|you.re subscribed|manage my plan/i'
+    'button:has-text("Manage My Plan"), button:has-text("Manage Plan"), ' +
+    '[class*="active"][class*="plan"], [class*="plan"][class*="selected"], ' +
+    'text=/current plan|already subscribed|you.re subscribed|manage my plan|manage plan/i'
   ).first().isVisible().catch(() => false);
   if (alreadySub) {
     console.log(`  ✅ Already subscribed to ${name}`);
@@ -279,11 +280,15 @@ async function subscribeToAPI(page, link, name) {
     return true;
   }
 
-  // Still not found — take a screenshot for debugging and log page text snippet
+  // Still not found — log all visible button texts to understand what RapidAPI is showing
+  const visibleBtns = await page.evaluate(() =>
+    [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null).map(b => b.textContent.trim()).filter(t => t)
+  ).catch(() => []);
   console.warn(`  ⚠️ Could not find subscribe button for ${name}`);
+  if (visibleBtns.length) console.warn(`    Visible buttons: ${visibleBtns.slice(0, 10).join(' | ')}`);
+
   const screenshotPath = `/tmp/rapidapi-sub-fail-${Date.now()}.png`;
   await page.screenshot({ path: screenshotPath }).catch(() => {});
-  console.warn(`    Screenshot: ${screenshotPath}`);
   return false;
 }
 
