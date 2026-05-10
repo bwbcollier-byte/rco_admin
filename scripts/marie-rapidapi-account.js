@@ -73,6 +73,11 @@ const DEFAULTS = { firstName: 'Ben', lastName: 'Collier', company: 'Rascals Inc'
 // ─── Temp Gmail ───────────────────────────────────────────────────────────────
 
 async function getGmailAddress() {
+  // Allow overriding for local debugging — skip the temp-gmail API call
+  if (process.env.SIGNUP_EMAIL) {
+    console.log(`  Using provided email: ${process.env.SIGNUP_EMAIL}`);
+    return process.env.SIGNUP_EMAIL;
+  }
   const res = await axios.get('https://temp-gmail.p.rapidapi.com/random', {
     params: { type: 'alias', password: TEMPGMAIL_PASS },
     headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPGMAIL_HOST },
