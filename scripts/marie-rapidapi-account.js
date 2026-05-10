@@ -288,7 +288,40 @@ async function signUp(page, email, password) {
   }
 
   // ── Terms checkbox ──
-  await page.locator('input[type="checkbox"]').first().check({ force: true }).catch(() => {});
+  // RapidAPI uses a custom styled checkbox — clicking the label is more reliable
+  // than check() on the hidden <input>, which React doesn't register.
+  let checked = false;
+  // Try clicking the label that wraps or follows the checkbox
+  for (const sel of [
+    'label:has(input[type="checkbox"])',
+    'label:has-text("Terms")',
+    'label:has-text("agree")',
+    'label:has-text("Privacy")',
+    '[class*="checkbox" i] label',
+    '[class*="checkbox" i]',
+  ]) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await el.click();
+        checked = true;
+        console.log(`  Terms checkbox clicked via: ${sel}`);
+        break;
+      }
+    } catch {}
+  }
+  // Fallback: force-check the raw input + dispatch change event via JS
+  if (!checked) {
+    await page.evaluate(() => {
+      const cb = document.querySelector('input[type="checkbox"]');
+      if (cb) {
+        cb.checked = true;
+        cb.dispatchEvent(new MouseEvent('click',  { bubbles: true }));
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+    console.log('  Terms checkbox clicked via JS evaluate fallback');
+  }
   await page.waitForTimeout(800);
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-filled.png' }).catch(() => {});
