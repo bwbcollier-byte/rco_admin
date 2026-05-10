@@ -207,7 +207,19 @@ async function subscribeToAPI(page, link, name) {
   const pricingUrl = link.includes('/pricing') ? link : link.replace(/\/?$/, '') + '/pricing';
   console.log(`  → Subscribing: ${pricingUrl}`);
   await page.goto(pricingUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
-  await page.waitForTimeout(4000);
+
+  // Wait for plan cards to render (React SPA — buttons appear after JS hydration)
+  try {
+    await page.waitForSelector(
+      'button:has-text("Start Free Plan"), button:has-text("Current Plan"), ' +
+      'button:has-text("Choose This Plan"), button:has-text("Manage My Plan"), ' +
+      'button:has-text("Subscribe")',
+      { timeout: 12000 }
+    );
+  } catch {
+    // Selector timeout — page may have an unusual layout; proceed anyway
+    await page.waitForTimeout(3000);
+  }
 
   // Check if already subscribed — RapidAPI shows "Current Plan" button on the active tier
   const alreadySub = await page.locator(
