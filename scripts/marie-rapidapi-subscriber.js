@@ -1,14 +1,14 @@
 /**
  * Marie — RapidAPI Subscriber & Enricher
  *
- * 1. Reads the most recent active RapidAPI login from Airtable Logins
- * 2. Logs into RapidAPI with those credentials
- * 3. For every API in the APIs table where {Subscribe via Kondo} is checked:
- *    - Subscribes to the free / basic plan (if not already subscribed)
- *    - Scrapes: About, Category, Provider, full endpoint list with curl + response
- *    - Checks for MCP URL
- *    - Updates the Airtable APIs record with everything gathered
- *    - Links the RapidAPI Login record in "Subscribed Accounts"
+ * 1. Reads ALL active RapidAPI logins from Airtable Logins
+ * 2. For each account:
+ *    - Logs into RapidAPI with those credentials
+ *    - For every API in the APIs table where {Subscribe via Kondo} is checked:
+ *      - Subscribes to the free / basic plan (if not already subscribed)
+ *      - On the first account: scrapes About, Category, Provider, endpoints, MCP URL
+ *      - Updates the Airtable APIs record with everything gathered
+ *      - Appends the RapidAPI Login record to "Subscribed Accounts" (never replaces)
  *
  * Airtable APIs table — new fields to add before running:
  *   About          (Long text)
@@ -53,7 +53,7 @@ const API_FIELD = {
 
 // ─── Airtable ─────────────────────────────────────────────────────────────────
 
-async function getMostRecentRapidAPILogin() {
+async function getAllRapidAPILogins() {
   const res = await axios.get(
     `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_LOGINS}`,
     {
@@ -63,16 +63,15 @@ async function getMostRecentRapidAPILogin() {
   );
   const records = (res.data.records || [])
     .filter(r => r.fields[LOGIN_FIELD.siteName] === 'RapidAPI')
-    .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+    .sort((a, b) => new Date(a.createdTime) - new Date(b.createdTime)); // oldest first
 
-  if (!records.length) throw new Error('No RapidAPI login found in Airtable Logins table');
-  const r = records[0];
-  console.log(`  Using RapidAPI login: ${r.fields[LOGIN_FIELD.email]} (created ${r.createdTime.slice(0, 10)})`);
-  return {
+  if (!records.length) throw new Error('No RapidAPI logins found in Airtable Logins table');
+  console.log(`  Found ${records.length} RapidAPI account(s)`);
+  return records.map(r => ({
     email:    r.fields[LOGIN_FIELD.email],
     password: r.fields[LOGIN_FIELD.password],
     loginId:  r.id,
-  };
+  }));
 }
 
 async function getAPIsToProcess() {
@@ -91,15 +90,29 @@ async function getAPIsToProcess() {
 
 async function updateAPIRecord(recordId, data, loginId) {
   if (DRY_RUN) {
-    console.log(`  [DRY RUN] Would update API record ${recordId}:`, Object.keys(data).join(', '));
+    console.log(`  [DRY RUN] Would update API record ${recordId}:`, Object.keys(data).join(', '), loginId ? `+ link loginId ${loginId}` : '');
     return;
   }
+
   const fields = {
     [API_FIELD.subscribed]: true,
     ...data,
   };
-  // Link to the RapidAPI login account
-  if (loginId) fields[API_FIELD.subscribedAccounts] = [loginId];
+
+  // Append loginId to Subscribed Accounts — never replace existing links
+  if (loginId) {
+    let existingLinks = [];
+    try {
+      const current = await axios.get(
+        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`,
+        { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } }
+      );
+      existingLinks = current.data.fields?.[API_FIELD.subscribedAccounts] || [];
+    } catch {}
+    if (!existingLinks.includes(loginId)) {
+      fields[API_FIELD.subscribedAccounts] = [...existingLinks, loginId];
+    }
+  }
 
   await axios.patch(
     `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`,
@@ -423,10 +436,10 @@ async function scrapeEndpointDetail(page, endpointItem) {
 
 // ─── Process one API ──────────────────────────────────────────────────────────
 
-async function processAPI(context, apiRecord, loginId) {
+// doScrape = true on the first account pass; false for subsequent accounts (subscribe-only)
+async function processAPI(context, apiRecord, loginId, doScrape = true) {
   const name = apiRecord.fields['Name'] || apiRecord.id;
   const link = apiRecord.fields['Link'];
-  const alreadyHasAbout = !!(apiRecord.fields['About']);
 
   if (!link) {
     console.warn(`  ⚠️ ${name}: no Link field — skipping`);
@@ -434,7 +447,7 @@ async function processAPI(context, apiRecord, loginId) {
   }
 
   console.log(`\n${'─'.repeat(50)}`);
-  console.log(`API: ${name}  |  ${link}`);
+  console.log(`API: ${name}  |  ${link}${doScrape ? '' : '  (subscribe-only)'}`);
 
   const page = await context.newPage();
   const result = { name, status: 'ok', fieldsUpdated: [] };
@@ -447,43 +460,43 @@ async function processAPI(context, apiRecord, loginId) {
       result.reason = 'Subscribe button not found';
     }
 
-    // 2. Scrape overview (skip if About already filled)
-    const overview = await scrapeAPIOverview(page, link);
-    console.log(`  About: ${overview.about.slice(0, 80) || '(none found)'}...`);
-    console.log(`  Category: ${overview.category || '(none)'}, Provider: ${overview.provider || '(none)'}`);
-    console.log(`  MCP URL: ${overview.mcpUrl}`);
-
-    // 3. Scrape endpoints
-    const endpoints = await scrapeEndpoints(page);
-    console.log(`  Endpoints found: ${endpoints.length}`);
-
-    // 4. For first 10 endpoints, get curl + response detail
-    const enrichedEndpoints = [];
-    for (const ep of endpoints.slice(0, 10)) {
-      const detail = await scrapeEndpointDetail(page, ep);
-      enrichedEndpoints.push({ ...ep, ...detail });
-      if (detail.curl) console.log(`    ${ep.method} ${ep.path} — curl captured`);
-    }
-    // Add remaining endpoints without curl/response
-    for (const ep of endpoints.slice(10)) {
-      enrichedEndpoints.push(ep);
-    }
-
-    // 5. Build Airtable update payload (using field names for new fields)
     const updateFields = {};
-    if (overview.about)       { updateFields['About']        = overview.about;       result.fieldsUpdated.push('About'); }
-    if (overview.category)    { updateFields['Category']     = overview.category;    result.fieldsUpdated.push('Category'); }
-    if (overview.provider)    { updateFields['Provider']     = overview.provider;    result.fieldsUpdated.push('Provider'); }
-    if (overview.mcpUrl)      { updateFields['MCP URL']      = overview.mcpUrl;      result.fieldsUpdated.push('MCP URL'); }
-    if (overview.pricingTier) { updateFields['Pricing Tier'] = overview.pricingTier; result.fieldsUpdated.push('Pricing Tier'); }
-    if (enrichedEndpoints.length > 0) {
-      updateFields['Endpoints'] = JSON.stringify(enrichedEndpoints, null, 2).slice(0, 99000);
-      result.fieldsUpdated.push(`Endpoints (${enrichedEndpoints.length})`);
+
+    if (doScrape) {
+      // 2. Scrape overview
+      const overview = await scrapeAPIOverview(page, link);
+      console.log(`  About: ${overview.about.slice(0, 80) || '(none found)'}...`);
+      console.log(`  Category: ${overview.category || '(none)'}, Provider: ${overview.provider || '(none)'}`);
+      console.log(`  MCP URL: ${overview.mcpUrl}`);
+
+      // 3. Scrape endpoints
+      const endpoints = await scrapeEndpoints(page);
+      console.log(`  Endpoints found: ${endpoints.length}`);
+
+      // 4. For first 10 endpoints, get curl + response detail
+      const enrichedEndpoints = [];
+      for (const ep of endpoints.slice(0, 10)) {
+        const detail = await scrapeEndpointDetail(page, ep);
+        enrichedEndpoints.push({ ...ep, ...detail });
+        if (detail.curl) console.log(`    ${ep.method} ${ep.path} — curl captured`);
+      }
+      for (const ep of endpoints.slice(10)) enrichedEndpoints.push(ep);
+
+      // 5. Build Airtable payload
+      if (overview.about)       { updateFields['About']        = overview.about;       result.fieldsUpdated.push('About'); }
+      if (overview.category)    { updateFields['Category']     = overview.category;    result.fieldsUpdated.push('Category'); }
+      if (overview.provider)    { updateFields['Provider']     = overview.provider;    result.fieldsUpdated.push('Provider'); }
+      if (overview.mcpUrl)      { updateFields['MCP URL']      = overview.mcpUrl;      result.fieldsUpdated.push('MCP URL'); }
+      if (overview.pricingTier) { updateFields['Pricing Tier'] = overview.pricingTier; result.fieldsUpdated.push('Pricing Tier'); }
+      if (enrichedEndpoints.length > 0) {
+        updateFields['Endpoints'] = JSON.stringify(enrichedEndpoints, null, 2).slice(0, 99000);
+        result.fieldsUpdated.push(`Endpoints (${enrichedEndpoints.length})`);
+      }
     }
 
-    // 6. Update Airtable
+    // 6. Update Airtable (always — marks subscribed + appends to Subscribed Accounts)
     await updateAPIRecord(apiRecord.id, updateFields, loginId);
-    console.log(`  ✅ Airtable updated: ${result.fieldsUpdated.join(', ') || 'Subscribed only'}`);
+    console.log(`  ✅ Airtable updated: ${result.fieldsUpdated.join(', ') || 'Subscribed + linked account'}`);
 
   } catch (err) {
     console.warn(`  ❌ ${name}: ${err.message}`);
@@ -519,9 +532,9 @@ async function main() {
 
   if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
 
-  // 1. Get credentials
-  console.log('\nFetching RapidAPI credentials from Airtable...');
-  const credentials = await getMostRecentRapidAPILogin();
+  // 1. Get ALL RapidAPI accounts
+  console.log('\nFetching RapidAPI accounts from Airtable...');
+  const allLogins = await getAllRapidAPILogins();
 
   // 2. Get APIs to process
   const apis = await getAPIsToProcess();
@@ -531,70 +544,100 @@ async function main() {
     return;
   }
 
-  // 3. Launch browser
-  const browser = await chromium.launch({
-    args: [
-      '--no-sandbox', '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-    ],
-  });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale: 'en-AU',
-  });
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    window.chrome = { runtime: {} };
-  });
+  const allAccountResults = [];
 
-  // 4. Log in
-  const loginPage = await context.newPage();
-  try {
-    await loginToRapidAPI(loginPage, credentials.email, credentials.password);
-  } finally {
-    await loginPage.close();
+  // 3. Loop over every RapidAPI account
+  for (let i = 0; i < allLogins.length; i++) {
+    const credentials = allLogins[i];
+    const isFirst = i === 0;
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`Account ${i + 1} / ${allLogins.length}: ${credentials.email}`);
+    console.log(isFirst ? '  (will subscribe + scrape/enrich)' : '  (will subscribe-only + link account)');
+    console.log('='.repeat(60));
+
+    // Launch a fresh browser for each account (clean session)
+    const browser = await chromium.launch({
+      args: [
+        '--no-sandbox', '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+      ],
+    });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale: 'en-AU',
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      window.chrome = { runtime: {} };
+    });
+
+    let accountOk = true;
+    const results = { ok: [], warn: [], error: [], skip: [] };
+
+    // Log in
+    const loginPage = await context.newPage();
+    try {
+      await loginToRapidAPI(loginPage, credentials.email, credentials.password);
+    } catch (loginErr) {
+      console.error(`  ❌ Login failed for ${credentials.email}: ${loginErr.message}`);
+      await loginPage.screenshot({ path: `/tmp/rapidapi-login-fail-${i}.png` }).catch(() => {});
+      accountOk = false;
+    } finally {
+      await loginPage.close();
+    }
+
+    if (accountOk) {
+      // Process each API for this account
+      for (const api of apis) {
+        // First account gets full scrape; subsequent accounts subscribe-only
+        const doScrape = isFirst;
+        const result = await processAPI(context, api, credentials.loginId, doScrape);
+        (results[result.status] || results.error).push(result);
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
+    await browser.close();
+
+    allAccountResults.push({ email: credentials.email, results, accountOk });
+
+    // Brief pause between accounts
+    if (i < allLogins.length - 1) {
+      console.log('\n  Pausing 5s before next account...');
+      await new Promise(r => setTimeout(r, 5000));
+    }
   }
 
-  // 5. Process each API
-  const results = { ok: [], warn: [], error: [], skip: [] };
-
-  for (const api of apis) {
-    const result = await processAPI(context, api, credentials.loginId);
-    (results[result.status] || results.error).push(result);
-    await new Promise(r => setTimeout(r, 2000)); // brief pause between APIs
-  }
-
-  await browser.close();
-
-  // 6. Summary
+  // 4. Summary
   console.log('\n' + '='.repeat(60));
-  console.log('Summary');
+  console.log('Summary — All Accounts');
   console.log('='.repeat(60));
-  console.log(`✅ Done:    ${results.ok.length}`);
-  console.log(`⚠️  Warning: ${results.warn.length}`);
-  console.log(`❌ Error:   ${results.error.length}`);
-  console.log(`⏭  Skipped: ${results.skip.length}`);
 
-  if (results.warn.length) results.warn.forEach(r => console.log(`  ⚠️  ${r.name}: ${r.reason}`));
-  if (results.error.length) results.error.forEach(r => console.log(`  ❌ ${r.name}: ${r.reason}`));
+  const slackLines = [`🔌 *Marie — RapidAPI Subscriber & Enricher*`];
 
-  // Slack summary
-  const lines = [
-    `🔌 *Marie — RapidAPI Subscriber & Enricher*`,
-    `_Account: ${credentials.email}_`,
-    `\n✅ *Subscribed & enriched (${results.ok.length}):*`,
-    ...results.ok.map(r => `• ${r.name} — ${r.fieldsUpdated?.join(', ') || 'subscribed'}`),
-  ];
-  if (results.warn.length) {
-    lines.push(`\n⚠️ *Warnings (${results.warn.length}):*`);
-    results.warn.forEach(r => lines.push(`• ${r.name}: ${r.reason}`));
+  for (const { email, results, accountOk } of allAccountResults) {
+    console.log(`\nAccount: ${email}${accountOk ? '' : ' ❌ LOGIN FAILED'}`);
+    if (!accountOk) {
+      slackLines.push(`\n❌ *${email}* — login failed`);
+      continue;
+    }
+    console.log(`  ✅ ${results.ok.length}  ⚠️  ${results.warn.length}  ❌ ${results.error.length}  ⏭ ${results.skip.length}`);
+    if (results.warn.length)  results.warn.forEach(r  => console.log(`  ⚠️  ${r.name}: ${r.reason}`));
+    if (results.error.length) results.error.forEach(r => console.log(`  ❌ ${r.name}: ${r.reason}`));
+
+    const total = results.ok.length + results.warn.length + results.error.length;
+    slackLines.push(`\n*${email}* — ${results.ok.length}/${total} ok`);
+    if (results.ok.length) {
+      results.ok.slice(0, 10).forEach(r => slackLines.push(`  • ${r.name}${r.fieldsUpdated?.length ? ' — ' + r.fieldsUpdated.join(', ') : ''}`));
+      if (results.ok.length > 10) slackLines.push(`  • …and ${results.ok.length - 10} more`);
+    }
+    if (results.error.length) {
+      results.error.forEach(r => slackLines.push(`  ❌ ${r.name}: ${r.reason}`));
+    }
   }
-  if (results.error.length) {
-    lines.push(`\n❌ *Errors (${results.error.length}):*`);
-    results.error.forEach(r => lines.push(`• ${r.name}: ${r.reason}`));
-  }
-  await postToSlack(lines.join('\n'));
 
+  await postToSlack(slackLines.join('\n'));
   console.log('\n✅ Done.');
 }
 
