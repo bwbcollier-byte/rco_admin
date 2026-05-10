@@ -465,6 +465,28 @@ async function markRapidAPISubscribed(recordId) {
   );
 }
 
+async function linkLoginToSubscribedAPIs(subscribedApiRecordIds, loginId) {
+  // Called in Phase 4 after the RapidAPI Login record is created.
+  // Stamps each subscribed API row with the linked Login so we know which
+  // RapidAPI account is tied to each subscription.
+  if (DRY_RUN) {
+    console.log(`  [DRY RUN] Would link login ${loginId} to ${subscribedApiRecordIds.length} API record(s)`);
+    return;
+  }
+  for (const recordId of subscribedApiRecordIds) {
+    try {
+      await axios.patch(
+        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`,
+        { fields: { 'Subscribed Accounts': [loginId] } },
+        { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
+      );
+    } catch (err) {
+      console.warn(`  ⚠️ Could not link login to API record ${recordId}: ${err.response?.data?.error || err.message}`);
+    }
+  }
+  console.log(`  ✅ Linked RapidAPI login to ${subscribedApiRecordIds.length} subscribed API record(s)`);
+}
+
 // ─── Slack ────────────────────────────────────────────────────────────────────
 
 async function postToSlack(text) {
@@ -571,7 +593,7 @@ async function playwrightClickSubmit(page) {
 
 async function checkPageResult(page, siteId, label) {
   await page.waitForTimeout(4000);
-  await page.screenshot({ path: `/tmp/marie-signup-${siteId}-${label}.png` });
+  try { await page.screenshot({ path: `/tmp/marie-signup-${siteId}-${label}.png` }); } catch {}
   const text = await page.evaluate(() => document.body.innerText);
   const hasError = /error|invalid|already exists|already registered|try again/i.test(text);
   if (hasError) {
@@ -865,7 +887,7 @@ async function subscribeToRapidAPIs(context) {
   }
   console.log(`  Subscribing to ${apis.length} RapidAPI API(s)...`);
 
-  const subscribed = [];
+  const subscribed = []; // { name, recordId }
   const failed = [];
 
   for (const api of apis) {
@@ -913,7 +935,7 @@ async function subscribeToRapidAPIs(context) {
         if (alreadySub) {
           console.log(`    Already subscribed to ${name}`);
           await markRapidAPISubscribed(api.id);
-          subscribed.push(name);
+          subscribed.push({ name, recordId: api.id });
         } else {
           await page.screenshot({ path: `/tmp/rapidapi-${api.id}-no-btn.png` });
           failed.push({ name, reason: 'Subscribe button not found' });
@@ -936,7 +958,7 @@ async function subscribeToRapidAPIs(context) {
       if (success || clicked) {
         console.log(`    ✅ Subscribed to ${name}`);
         await markRapidAPISubscribed(api.id);
-        subscribed.push(name);
+        subscribed.push({ name, recordId: api.id });
       } else {
         await page.screenshot({ path: `/tmp/rapidapi-${api.id}-unsure.png` });
         failed.push({ name, reason: 'Could not confirm subscription' });
@@ -1507,7 +1529,9 @@ async function captureGroqKey(context, loginId, mailConfig) {
           const body = inlineBody || (mid ? await fetchGmailMessageBody(mid, mailConfig.email) : '');
           const subj = msg.subject || msg.textSubject || '';
           if (body && (subj.toLowerCase().includes('groq') || body.toLowerCase().includes('groq') || body.toLowerCase().includes('stytch'))) {
-            const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:magic|token|redirect|stytch)[^\s"'<>]*/i)
+            const linkMatch = body.match(/https?:\/\/stytch\.com\/v1\/magic_links\/[^\s"'<>]+/i)
+                           || body.match(/https?:\/\/[^\s"'<>]+\/v1\/magic_links\/[^\s"'<>]+/i)
+                           || body.match(/https?:\/\/[^\s"'<>]+(?:magic_link|magiclink)[^\s"'<>]*/i)
                            || body.match(/https?:\/\/[^\s"'<>]{60,}/);
             if (linkMatch) {
               const link = linkMatch[0].replace(/&amp;/g, '&');
@@ -1880,6 +1904,13 @@ async function main() {
         } catch (keyErr) {
           console.warn(`  ⚠️ API key capture failed for ${siteName}: ${keyErr.message}`);
         }
+      }
+
+      // If this is the RapidAPI login, link it back to all APIs we subscribed to in Phase 3
+      if (item.isRapidAPI && loginId && item.subResults?.subscribed?.length) {
+        const subscribedIds = item.subResults.subscribed.map(s => s.recordId);
+        console.log(`  → Linking RapidAPI login to ${subscribedIds.length} subscribed API(s)...`);
+        await linkLoginToSubscribedAPIs(subscribedIds, loginId);
       }
 
       // Repeatable sites (e.g. RapidAPI) reset to Pending so each run creates a fresh account
