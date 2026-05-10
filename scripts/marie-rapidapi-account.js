@@ -333,10 +333,18 @@ async function signUp(page, email, password) {
     await passInput.press('Enter');
   }
 
-  await page.waitForTimeout(12000);
+  await page.waitForTimeout(5000);
   await page.screenshot({ path: '/tmp/rapidapi-signup-after.png' }).catch(() => {});
 
-  // Verify session — success = URL moved away from /auth/
+  // Check for "Verify your email" page — form submitted, magic link sent
+  const isVerifyPage = await page.locator('text=/verify your email/i, text=/magic link/i').first()
+    .isVisible({ timeout: 3000 }).catch(() => false);
+  if (isVerifyPage) {
+    console.log(`  ✅ Form submitted — magic link sent to ${signupEmail}`);
+    return signupPass;
+  }
+
+  // Otherwise check URL moved off /auth/
   const finalUrl = page.url();
   if (finalUrl.includes('/auth/')) {
     const btns = await page.evaluate(() =>
@@ -345,8 +353,92 @@ async function signUp(page, email, password) {
     console.warn(`  Visible buttons: ${btns.slice(0, 10).join(' | ')}`);
     throw new Error(`Signup may have failed — still on auth page: ${finalUrl}`);
   }
-  console.log(`  ✅ Signed up as ${username} (${finalUrl})`);
-  return signupPass; // return actual password used (may differ from SIGNUP_PASSWORD)
+  console.log(`  ✅ Signed up as ${username} — session active (${finalUrl})`);
+  return signupPass;
+}
+
+// ─── Poll temp-gmail for RapidAPI magic link and click it ─────────────────────
+
+async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 360000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await new Promise(r => setTimeout(r, 10000));
+    try {
+      const res = await axios.get('https://temp-gmail.p.rapidapi.com/inbox', {
+        params: { email, timestamp: sinceTimestamp },
+        headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPGMAIL_HOST },
+      });
+      const messages = Array.isArray(res.data) ? res.data
+        : Array.isArray(res.data?.messages) ? res.data.messages
+        : Array.isArray(res.data?.emails)   ? res.data.emails : [];
+      if (messages.length) return messages;
+      console.log(`  Inbox empty — waiting... (${Math.round((Date.now()-start)/1000)}s)`);
+    } catch (err) {
+      if (err.response?.status !== 404) console.warn(`  Poll error: ${err.message}`);
+      else console.log(`  Inbox empty (404) — waiting...`);
+    }
+  }
+  return [];
+}
+
+async function fetchMessageBody(mid, email) {
+  for (const params of [{ email, mid }, { mid }]) {
+    try {
+      const res = await axios.get('https://temp-gmail.p.rapidapi.com/message', {
+        params,
+        headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPGMAIL_HOST },
+      });
+      const body = res.data?.textBody || res.data?.htmlBody || res.data?.body
+                || res.data?.text    || res.data?.html     || res.data?.content || '';
+      if (body) return body;
+    } catch (err) {
+      if (err.response?.status !== 422 && err.response?.status !== 400) return '';
+    }
+  }
+  return '';
+}
+
+async function clickMagicLink(context, email) {
+  // Local testing (SIGNUP_EMAIL) — no temp-gmail access, skip automatically
+  if (process.env.SIGNUP_EMAIL) {
+    console.log('  [Local test] No inbox access — skipping magic link. Click it manually if needed.');
+    return false;
+  }
+
+  const sinceTs = Math.floor(Date.now() / 1000) - 30;
+  console.log(`  Polling inbox for magic link (up to 6 min)...`);
+  const messages = await pollGmailInbox(email, sinceTs, 360000);
+
+  for (const msg of messages) {
+    const mid = msg.mid || msg.id || msg.messageId;
+    const inlineBody = msg.textBody || msg.htmlBody || msg.body || msg.text || msg.html || '';
+    const body = inlineBody || (mid ? await fetchMessageBody(mid, email) : '');
+
+    // Find magic link — RapidAPI sends a link containing 'auth' and a token
+    const linkMatch = body.match(/https?:\/\/rapidapi\.com\/[^\s"'<>]+/gi)
+                   || body.match(/href="(https?:\/\/rapidapi\.com[^"]+)"/gi);
+    if (!linkMatch) continue;
+
+    const link = (linkMatch[0].startsWith('href=') ? linkMatch[0].replace(/href="([^"]+)"/, '$1') : linkMatch[0]).trim();
+    console.log(`  Magic link: ${link.slice(0, 80)}...`);
+
+    const verifyPage = await context.newPage();
+    await verifyPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await verifyPage.waitForTimeout(8000);
+    const landedUrl = verifyPage.url();
+    console.log(`  After magic link: ${landedUrl}`);
+    await verifyPage.close();
+
+    if (!landedUrl.includes('/auth/')) {
+      console.log('  ✅ Email verified — session active');
+      return true;
+    }
+    console.warn('  ⚠️ Magic link redirected back to auth page');
+    return false;
+  }
+
+  console.warn('  ⚠️ No magic link found in inbox');
+  return false;
 }
 
 // ─── Subscribe to one API ─────────────────────────────────────────────────────
@@ -472,6 +564,10 @@ async function main() {
     console.log('\n── Phase 1: Sign up ──────────────────────────────────────');
     const actualPassword = await signUp(page, email, SIGNUP_PASSWORD);
     await page.close();
+
+    // 3b. Click magic link from verification email
+    console.log('\n── Phase 1b: Verify email via magic link ─────────────────');
+    await clickMagicLink(context, email);
 
     // 4. Subscribe to all APIs
     console.log('\n── Phase 2: Subscribe to all APIs ───────────────────────');
