@@ -115,31 +115,42 @@ async function updateAPIRecord(recordId, data, loginId) {
     return;
   }
 
-  const fields = {
-    [API_FIELD.subscribed]: true,
-    ...data,
-  };
+  const headers = { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' };
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`;
 
-  // Append loginId to Subscribed Accounts — never replace existing links
+  // ── Step 1: Always mark Subscribed (core — must succeed) ──────────────────
+  await axios.patch(url, { fields: { [API_FIELD.subscribed]: true } }, { headers });
+
+  // ── Step 2: Append loginId to Subscribed Accounts (best-effort) ───────────
   if (loginId) {
-    let existingLinks = [];
     try {
-      const current = await axios.get(
-        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`,
-        { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } }
-      );
-      existingLinks = current.data.fields?.[API_FIELD.subscribedAccounts] || [];
-    } catch {}
-    if (!existingLinks.includes(loginId)) {
-      fields[API_FIELD.subscribedAccounts] = [...existingLinks, loginId];
+      const current = await axios.get(url, { headers });
+      const existingLinks = current.data.fields?.[API_FIELD.subscribedAccounts] || [];
+      if (!existingLinks.includes(loginId)) {
+        await axios.patch(
+          url,
+          { fields: { [API_FIELD.subscribedAccounts]: [...existingLinks, loginId] } },
+          { headers }
+        );
+      }
+    } catch (e) {
+      console.warn(`  ⚠️ Could not update Subscribed Accounts link: ${e.response?.status || e.message} (field may not exist yet)`);
     }
   }
 
-  await axios.patch(
-    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`,
-    { fields },
-    { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
-  );
+  // ── Step 3: Write enrichment fields one-by-one (best-effort, skip missing) ─
+  for (const [fieldName, value] of Object.entries(data)) {
+    if (!value && value !== false) continue;  // skip empty/null
+    try {
+      await axios.patch(url, { fields: { [fieldName]: value } }, { headers });
+    } catch (e) {
+      if (e.response?.status === 422) {
+        console.warn(`  ⚠️ Field "${fieldName}" not found in Airtable — skipping (add it to the APIs table)`);
+      } else {
+        throw e;
+      }
+    }
+  }
 }
 
 // ─── RapidAPI Login ───────────────────────────────────────────────────────────
@@ -198,27 +209,44 @@ async function subscribeToAPI(page, link, name) {
   await page.goto(pricingUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await page.waitForTimeout(4000);
 
-  // Check if already subscribed
+  // Check if already subscribed — look for "Current Plan" badge or "You are subscribed" text
   const alreadySub = await page.locator(
-    'text=/current plan|already subscribed|you.re subscribed|subscribed/i'
+    '[class*="CurrentPlan"], [class*="current-plan"], [class*="currentPlan"], ' +
+    'button:has-text("Current Plan"), span:has-text("Current Plan"), ' +
+    'text=/current plan|already subscribed|you.re subscribed/i'
   ).first().isVisible().catch(() => false);
   if (alreadySub) {
     console.log(`  Already subscribed to ${name}`);
     return true;
   }
 
-  // Try subscribe buttons
-  const selectors = [
+  // RapidAPI plan cards — find the Basic/Free plan and click its Subscribe button.
+  // Strategy: look for the cheapest plan card first, then any subscribe button.
+  const planCardSelectors = [
+    // Free / Basic plan card subscribe buttons (most specific)
+    '[class*="PricingCard"]:has-text("Basic") button',
+    '[class*="PricingCard"]:has-text("Free") button',
+    '[class*="plan-card"]:has-text("Basic") button',
+    '[class*="plan-card"]:has-text("Free") button',
+    '[class*="PlanCard"]:has-text("Basic") button',
+    '[class*="PlanCard"]:has-text("Free") button',
+    // Generic subscribe buttons — prefer ones with "Subscribe" text
     'button:has-text("Subscribe to Test")',
     'button:has-text("Subscribe")',
     'button:has-text("Select Plan")',
+    'button:has-text("Start Free Trial")',
+    'a[class*="subscribe"], a[class*="Subscribe"]',
     'a:has-text("Subscribe")',
   ];
+
   let clicked = false;
-  for (const sel of selectors) {
+  for (const sel of planCardSelectors) {
     try {
+      // Use first() — if there are multiple plan tiers the first is typically the free one
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 3000 })) {
+      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const btnText = (await btn.textContent().catch(() => '')).trim();
+        console.log(`    Clicking: "${btnText}" (selector: ${sel.slice(0, 60)})`);
         await btn.click();
         await page.waitForTimeout(3000);
         clicked = true;
@@ -230,15 +258,18 @@ async function subscribeToAPI(page, link, name) {
   if (clicked) {
     // Confirm modal if it appears
     try {
-      await page.locator('button:has-text("Confirm"), button:has-text("Yes")').first().click({ timeout: 4000 });
+      await page.locator('button:has-text("Confirm"), button:has-text("Yes"), button:has-text("Subscribe")').first().click({ timeout: 4000 });
       await page.waitForTimeout(2000);
     } catch {}
     console.log(`  ✅ Subscribed to ${name}`);
     return true;
   }
 
+  // Still not found — take a screenshot for debugging and log page text snippet
   console.warn(`  ⚠️ Could not find subscribe button for ${name}`);
-  await page.screenshot({ path: `/tmp/rapidapi-sub-${Date.now()}.png` }).catch(() => {});
+  const screenshotPath = `/tmp/rapidapi-sub-fail-${Date.now()}.png`;
+  await page.screenshot({ path: screenshotPath }).catch(() => {});
+  console.warn(`    Screenshot: ${screenshotPath}`);
   return false;
 }
 
@@ -247,7 +278,7 @@ async function subscribeToAPI(page, link, name) {
 async function scrapeAPIOverview(page, link) {
   // Navigate to the main API page (not pricing)
   const baseUrl = link.replace(/\/pricing\/?$/, '').replace(/\/$/, '');
-  await page.goto(baseUrl, { waitUntil: 'networkidle', timeout: 40000 });
+  await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await page.waitForTimeout(4000);
 
   const overview = { about: '', category: '', provider: '', pricingTier: '', mcpUrl: '' };
