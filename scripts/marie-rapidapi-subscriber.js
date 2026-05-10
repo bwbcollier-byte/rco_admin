@@ -1,0 +1,604 @@
+/**
+ * Marie — RapidAPI Subscriber & Enricher
+ *
+ * 1. Reads the most recent active RapidAPI login from Airtable Logins
+ * 2. Logs into RapidAPI with those credentials
+ * 3. For every API in the APIs table where {Subscribe via Kondo} is checked:
+ *    - Subscribes to the free / basic plan (if not already subscribed)
+ *    - Scrapes: About, Category, Provider, full endpoint list with curl + response
+ *    - Checks for MCP URL
+ *    - Updates the Airtable APIs record with everything gathered
+ *    - Links the RapidAPI Login record in "Subscribed Accounts"
+ *
+ * Airtable APIs table — new fields to add before running:
+ *   About          (Long text)
+ *   Category       (Single line text)
+ *   Provider       (Single line text)
+ *   Endpoints      (Long text — stores JSON array)
+ *   MCP URL        (URL)
+ *   Pricing Tier   (Single line text)
+ *
+ * Secrets required (same as marie-signup):
+ *   AIRTABLE_API_KEY
+ *   SLACK_BOT_TOKEN, SLACK_CHANNEL_AI_ENGINEERING  (optional — for summary)
+ */
+
+const { chromium } = require('playwright');
+const axios = require('axios');
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
+const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
+const AIRTABLE_LOGINS  = process.env.AIRTABLE_LOGINS;
+const AIRTABLE_APIS    = process.env.AIRTABLE_APIS;
+
+const SLACK_BOT_TOKEN  = process.env.SLACK_BOT_TOKEN;
+const SLACK_CHANNEL    = process.env.SLACK_CHANNEL_AI_ENGINEERING;
+const DRY_RUN          = process.env.DRY_RUN === 'true';
+
+// Logins table field IDs — set via GitHub repo variables
+const LOGIN_FIELD = {
+  siteName: process.env.FIELD_LOGIN_SITE_NAME,
+  email:    process.env.FIELD_LOGIN_EMAIL,
+  password: process.env.FIELD_LOGIN_PASSWORD,
+  status:   process.env.FIELD_LOGIN_STATUS,
+};
+
+// APIs table field IDs — set via GitHub repo variables
+const API_FIELD = {
+  subscribed:         process.env.FIELD_API_SUBSCRIBED,
+  subscribedAccounts: 'Subscribed Accounts',  // Linked records (use name)
+};
+
+// ─── Airtable ─────────────────────────────────────────────────────────────────
+
+async function getMostRecentRapidAPILogin() {
+  const res = await axios.get(
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_LOGINS}`,
+    {
+      params: { returnFieldsByFieldId: true, maxRecords: 100 },
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+    }
+  );
+  const records = (res.data.records || [])
+    .filter(r => r.fields[LOGIN_FIELD.siteName] === 'RapidAPI')
+    .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+
+  if (!records.length) throw new Error('No RapidAPI login found in Airtable Logins table');
+  const r = records[0];
+  console.log(`  Using RapidAPI login: ${r.fields[LOGIN_FIELD.email]} (created ${r.createdTime.slice(0, 10)})`);
+  return {
+    email:    r.fields[LOGIN_FIELD.email],
+    password: r.fields[LOGIN_FIELD.password],
+    loginId:  r.id,
+  };
+}
+
+async function getAPIsToProcess() {
+  const res = await axios.get(
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}`,
+    {
+      params: {
+        filterByFormula: `{Subscribe via Kondo}`,
+        fields: ['Name', 'Link', 'Subscribed', 'Subscribe via Kondo', 'About'],
+      },
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+    }
+  );
+  return res.data.records || [];
+}
+
+async function updateAPIRecord(recordId, data, loginId) {
+  if (DRY_RUN) {
+    console.log(`  [DRY RUN] Would update API record ${recordId}:`, Object.keys(data).join(', '));
+    return;
+  }
+  const fields = {
+    [API_FIELD.subscribed]: true,
+    ...data,
+  };
+  // Link to the RapidAPI login account
+  if (loginId) fields[API_FIELD.subscribedAccounts] = [loginId];
+
+  await axios.patch(
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`,
+    { fields },
+    { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+// ─── RapidAPI Login ───────────────────────────────────────────────────────────
+
+async function loginToRapidAPI(page, email, password) {
+  console.log(`\n  Logging in to RapidAPI as ${email}...`);
+  await page.goto('https://rapidapi.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(4000);
+
+  // Fill email
+  const emailInput = page.locator('input[type="email"], input[name="email"], input[autocomplete="email"]').first();
+  if (!await emailInput.isVisible().catch(() => false)) {
+    throw new Error('RapidAPI login: email field not found');
+  }
+  await emailInput.fill(email);
+  await page.waitForTimeout(500);
+
+  // Fill password
+  const passInput = page.locator('input[type="password"]').first();
+  if (!await passInput.isVisible().catch(() => false)) {
+    throw new Error('RapidAPI login: password field not found');
+  }
+  await passInput.fill(password);
+  await page.waitForTimeout(500);
+
+  // Submit
+  await page.locator('button[type="submit"], button:has-text("Log In"), button:has-text("Sign In")').first().click();
+  await page.waitForTimeout(6000);
+
+  // Verify login
+  const isLoggedIn = await page.locator(
+    '[data-testid="user-menu"], .user-avatar, [aria-label*="account" i], img[alt*="avatar" i], [class*="userAvatar"]'
+  ).first().isVisible().catch(() => false);
+
+  if (!isLoggedIn) {
+    await page.screenshot({ path: '/tmp/rapidapi-login-failed.png' }).catch(() => {});
+    throw new Error(`RapidAPI login failed — landed on: ${page.url()}`);
+  }
+  console.log('  ✅ Logged in to RapidAPI');
+}
+
+// ─── Subscribe ────────────────────────────────────────────────────────────────
+
+async function subscribeToAPI(page, link, name) {
+  const pricingUrl = link.includes('/pricing') ? link : link.replace(/\/?$/, '') + '/pricing';
+  console.log(`  → Subscribing: ${pricingUrl}`);
+  await page.goto(pricingUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+  await page.waitForTimeout(4000);
+
+  // Check if already subscribed
+  const alreadySub = await page.locator(
+    'text=/current plan|already subscribed|you.re subscribed|subscribed/i'
+  ).first().isVisible().catch(() => false);
+  if (alreadySub) {
+    console.log(`  Already subscribed to ${name}`);
+    return true;
+  }
+
+  // Try subscribe buttons
+  const selectors = [
+    'button:has-text("Subscribe to Test")',
+    'button:has-text("Subscribe")',
+    'button:has-text("Select Plan")',
+    'a:has-text("Subscribe")',
+  ];
+  let clicked = false;
+  for (const sel of selectors) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 3000 })) {
+        await btn.click();
+        await page.waitForTimeout(3000);
+        clicked = true;
+        break;
+      }
+    } catch {}
+  }
+
+  if (clicked) {
+    // Confirm modal if it appears
+    try {
+      await page.locator('button:has-text("Confirm"), button:has-text("Yes")').first().click({ timeout: 4000 });
+      await page.waitForTimeout(2000);
+    } catch {}
+    console.log(`  ✅ Subscribed to ${name}`);
+    return true;
+  }
+
+  console.warn(`  ⚠️ Could not find subscribe button for ${name}`);
+  await page.screenshot({ path: `/tmp/rapidapi-sub-${Date.now()}.png` }).catch(() => {});
+  return false;
+}
+
+// ─── Scrape API Overview ──────────────────────────────────────────────────────
+
+async function scrapeAPIOverview(page, link) {
+  // Navigate to the main API page (not pricing)
+  const baseUrl = link.replace(/\/pricing\/?$/, '').replace(/\/$/, '');
+  await page.goto(baseUrl, { waitUntil: 'networkidle', timeout: 40000 });
+  await page.waitForTimeout(4000);
+
+  const overview = { about: '', category: '', provider: '', pricingTier: '', mcpUrl: '' };
+
+  // Provider — usually in the URL: rapidapi.com/{provider}/{api}
+  try {
+    const urlParts = new URL(baseUrl).pathname.split('/').filter(Boolean);
+    if (urlParts.length >= 2) overview.provider = urlParts[0];
+  } catch {}
+
+  // About / description — try multiple selector strategies
+  for (const sel of [
+    '[class*="DescriptionBox"], [class*="description-box"]',
+    '[class*="apiAbout"], [class*="api-about"]',
+    'section[class*="about"]',
+    '[data-testid*="description"]',
+    'p[class*="description"]',
+    'div[class*="overview"] p',
+  ]) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const text = (await el.textContent()).trim();
+        if (text.length > 20) { overview.about = text.slice(0, 3000); break; }
+      }
+    } catch {}
+  }
+
+  // Category
+  for (const sel of [
+    '[class*="category"], [data-testid*="category"]',
+    'a[href*="/category/"]',
+    '[class*="tag"]:first-child',
+  ]) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const text = (await el.textContent()).trim();
+        if (text) { overview.category = text; break; }
+      }
+    } catch {}
+  }
+
+  // Pricing tier on the free plan
+  for (const sel of [
+    '[class*="free"][class*="plan"], [class*="basic"][class*="plan"]',
+    'div:has-text("Free") [class*="limit"], div:has-text("Basic") [class*="limit"]',
+  ]) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const text = (await el.textContent()).trim();
+        if (text) { overview.pricingTier = text.slice(0, 200); break; }
+      }
+    } catch {}
+  }
+
+  // MCP — look for MCP tab, link, or section
+  for (const sel of [
+    'a:has-text("MCP"), button:has-text("MCP")',
+    '[href*="mcp"], [href*="/mcp"]',
+    '[class*="mcp"], [data-testid*="mcp"]',
+  ]) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const href = await el.getAttribute('href').catch(() => '');
+        overview.mcpUrl = href
+          ? (href.startsWith('http') ? href : `https://rapidapi.com${href}`)
+          : `${baseUrl}/mcp`;
+        break;
+      }
+    } catch {}
+  }
+  // Also construct a likely MCP URL even if not found on page
+  if (!overview.mcpUrl) {
+    overview.mcpUrl = `${baseUrl}/mcp`;
+  }
+
+  return overview;
+}
+
+// ─── Scrape Endpoints ─────────────────────────────────────────────────────────
+
+async function scrapeEndpoints(page) {
+  const endpoints = [];
+
+  // Wait for sidebar to load
+  await page.waitForTimeout(2000);
+
+  // RapidAPI sidebar endpoint items — try multiple selector strategies
+  const endpointSelectors = [
+    '[class*="EndpointListItem"], [class*="endpoint-list-item"]',
+    '[data-testid*="endpoint-item"]',
+    'li[class*="endpoint"]',
+    '[class*="SidebarItem"][class*="endpoint"]',
+    'ul[class*="endpoints"] li',
+    '[class*="method-"] + [class*="path"]',  // method badge next to path
+  ];
+
+  let found = false;
+  for (const sel of endpointSelectors) {
+    try {
+      const items = await page.locator(sel).all();
+      if (items.length > 0) {
+        console.log(`    Found ${items.length} endpoint item(s) with selector: ${sel}`);
+        for (const item of items.slice(0, 30)) {
+          try {
+            const text = (await item.textContent()).trim();
+            // Parse method + path from text (e.g. "GET /users/{id}")
+            const methodMatch = text.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i);
+            const method = methodMatch ? methodMatch[1].toUpperCase() : '';
+            const rest = method ? text.slice(method.length).trim() : text;
+            endpoints.push({ method, path: rest.split('\n')[0].trim(), description: '' });
+          } catch {}
+        }
+        found = true;
+        break;
+      }
+    } catch {}
+  }
+
+  if (!found) {
+    // Fallback: scan page text for endpoint patterns
+    try {
+      const bodyText = await page.locator('body').innerText();
+      const lines = bodyText.split('\n');
+      for (const line of lines) {
+        const m = line.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\/[^\s]{3,})/i);
+        if (m) {
+          endpoints.push({ method: m[1].toUpperCase(), path: m[2], description: '' });
+        }
+      }
+    } catch {}
+  }
+
+  // Deduplicate by method+path
+  const seen = new Set();
+  return endpoints.filter(e => {
+    const key = `${e.method}:${e.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// ─── Scrape Curl + Response for an Endpoint ───────────────────────────────────
+
+async function scrapeEndpointDetail(page, endpointItem) {
+  // Click the endpoint in the sidebar
+  const detail = { curl: '', response: '' };
+
+  try {
+    // Try clicking the endpoint by its path text
+    const itemLocator = page.locator(
+      `text="${endpointItem.path}", [class*="endpoint"]:has-text("${endpointItem.path}")`
+    ).first();
+    if (await itemLocator.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await itemLocator.click();
+      await page.waitForTimeout(2000);
+    }
+  } catch {}
+
+  // Get curl from "Shell" / "cURL" code snippet tab
+  for (const tabSel of [
+    'button:has-text("Shell"), button:has-text("cURL"), button:has-text("Curl")',
+    '[role="tab"]:has-text("Shell"), [role="tab"]:has-text("curl")',
+  ]) {
+    try {
+      const tab = page.locator(tabSel).first();
+      if (await tab.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await tab.click();
+        await page.waitForTimeout(1000);
+        break;
+      }
+    } catch {}
+  }
+
+  // Extract curl command
+  for (const codeSel of [
+    'pre:has-text("curl"), code:has-text("curl")',
+    '[class*="code-snippet"] pre',
+    '[class*="CodeSnippet"] pre',
+    '[class*="codeBlock"] pre',
+  ]) {
+    try {
+      const el = page.locator(codeSel).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const text = (await el.textContent()).trim();
+        if (text.includes('curl') || text.includes('--url')) {
+          detail.curl = text.slice(0, 2000);
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  // Get example response
+  for (const resSel of [
+    '[class*="response-example"] pre',
+    '[class*="ResponseExample"] pre',
+    '[class*="result"] pre',
+    '[class*="response"] code',
+  ]) {
+    try {
+      const el = page.locator(resSel).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        detail.response = (await el.textContent()).trim().slice(0, 2000);
+        break;
+      }
+    } catch {}
+  }
+
+  return detail;
+}
+
+// ─── Process one API ──────────────────────────────────────────────────────────
+
+async function processAPI(context, apiRecord, loginId) {
+  const name = apiRecord.fields['Name'] || apiRecord.id;
+  const link = apiRecord.fields['Link'];
+  const alreadyHasAbout = !!(apiRecord.fields['About']);
+
+  if (!link) {
+    console.warn(`  ⚠️ ${name}: no Link field — skipping`);
+    return { name, status: 'skip', reason: 'No Link' };
+  }
+
+  console.log(`\n${'─'.repeat(50)}`);
+  console.log(`API: ${name}  |  ${link}`);
+
+  const page = await context.newPage();
+  const result = { name, status: 'ok', fieldsUpdated: [] };
+
+  try {
+    // 1. Subscribe
+    const subscribed = await subscribeToAPI(page, link, name);
+    if (!subscribed) {
+      result.status = 'warn';
+      result.reason = 'Subscribe button not found';
+    }
+
+    // 2. Scrape overview (skip if About already filled)
+    const overview = await scrapeAPIOverview(page, link);
+    console.log(`  About: ${overview.about.slice(0, 80) || '(none found)'}...`);
+    console.log(`  Category: ${overview.category || '(none)'}, Provider: ${overview.provider || '(none)'}`);
+    console.log(`  MCP URL: ${overview.mcpUrl}`);
+
+    // 3. Scrape endpoints
+    const endpoints = await scrapeEndpoints(page);
+    console.log(`  Endpoints found: ${endpoints.length}`);
+
+    // 4. For first 10 endpoints, get curl + response detail
+    const enrichedEndpoints = [];
+    for (const ep of endpoints.slice(0, 10)) {
+      const detail = await scrapeEndpointDetail(page, ep);
+      enrichedEndpoints.push({ ...ep, ...detail });
+      if (detail.curl) console.log(`    ${ep.method} ${ep.path} — curl captured`);
+    }
+    // Add remaining endpoints without curl/response
+    for (const ep of endpoints.slice(10)) {
+      enrichedEndpoints.push(ep);
+    }
+
+    // 5. Build Airtable update payload (using field names for new fields)
+    const updateFields = {};
+    if (overview.about)       { updateFields['About']        = overview.about;       result.fieldsUpdated.push('About'); }
+    if (overview.category)    { updateFields['Category']     = overview.category;    result.fieldsUpdated.push('Category'); }
+    if (overview.provider)    { updateFields['Provider']     = overview.provider;    result.fieldsUpdated.push('Provider'); }
+    if (overview.mcpUrl)      { updateFields['MCP URL']      = overview.mcpUrl;      result.fieldsUpdated.push('MCP URL'); }
+    if (overview.pricingTier) { updateFields['Pricing Tier'] = overview.pricingTier; result.fieldsUpdated.push('Pricing Tier'); }
+    if (enrichedEndpoints.length > 0) {
+      updateFields['Endpoints'] = JSON.stringify(enrichedEndpoints, null, 2).slice(0, 99000);
+      result.fieldsUpdated.push(`Endpoints (${enrichedEndpoints.length})`);
+    }
+
+    // 6. Update Airtable
+    await updateAPIRecord(apiRecord.id, updateFields, loginId);
+    console.log(`  ✅ Airtable updated: ${result.fieldsUpdated.join(', ') || 'Subscribed only'}`);
+
+  } catch (err) {
+    console.warn(`  ❌ ${name}: ${err.message}`);
+    result.status = 'error';
+    result.reason = err.message;
+  } finally {
+    await page.close();
+  }
+
+  return result;
+}
+
+// ─── Slack ────────────────────────────────────────────────────────────────────
+
+async function postToSlack(text) {
+  if (!SLACK_BOT_TOKEN || !SLACK_CHANNEL) return;
+  try {
+    await axios.post('https://slack.com/api/chat.postMessage', {
+      channel: SLACK_CHANNEL, text,
+    }, {
+      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+    });
+  } catch {}
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log('='.repeat(60));
+  console.log('Marie — RapidAPI Subscriber & Enricher');
+  console.log(`Dry run: ${DRY_RUN}`);
+  console.log('='.repeat(60));
+
+  if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
+
+  // 1. Get credentials
+  console.log('\nFetching RapidAPI credentials from Airtable...');
+  const credentials = await getMostRecentRapidAPILogin();
+
+  // 2. Get APIs to process
+  const apis = await getAPIsToProcess();
+  console.log(`\nAPIs to process: ${apis.length} (Subscribe via Kondo = checked)`);
+  if (apis.length === 0) {
+    console.log('Nothing to do.');
+    return;
+  }
+
+  // 3. Launch browser
+  const browser = await chromium.launch({
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    locale: 'en-AU',
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    window.chrome = { runtime: {} };
+  });
+
+  // 4. Log in
+  const loginPage = await context.newPage();
+  try {
+    await loginToRapidAPI(loginPage, credentials.email, credentials.password);
+  } finally {
+    await loginPage.close();
+  }
+
+  // 5. Process each API
+  const results = { ok: [], warn: [], error: [], skip: [] };
+
+  for (const api of apis) {
+    const result = await processAPI(context, api, credentials.loginId);
+    (results[result.status] || results.error).push(result);
+    await new Promise(r => setTimeout(r, 2000)); // brief pause between APIs
+  }
+
+  await browser.close();
+
+  // 6. Summary
+  console.log('\n' + '='.repeat(60));
+  console.log('Summary');
+  console.log('='.repeat(60));
+  console.log(`✅ Done:    ${results.ok.length}`);
+  console.log(`⚠️  Warning: ${results.warn.length}`);
+  console.log(`❌ Error:   ${results.error.length}`);
+  console.log(`⏭  Skipped: ${results.skip.length}`);
+
+  if (results.warn.length) results.warn.forEach(r => console.log(`  ⚠️  ${r.name}: ${r.reason}`));
+  if (results.error.length) results.error.forEach(r => console.log(`  ❌ ${r.name}: ${r.reason}`));
+
+  // Slack summary
+  const lines = [
+    `🔌 *Marie — RapidAPI Subscriber & Enricher*`,
+    `_Account: ${credentials.email}_`,
+    `\n✅ *Subscribed & enriched (${results.ok.length}):*`,
+    ...results.ok.map(r => `• ${r.name} — ${r.fieldsUpdated?.join(', ') || 'subscribed'}`),
+  ];
+  if (results.warn.length) {
+    lines.push(`\n⚠️ *Warnings (${results.warn.length}):*`);
+    results.warn.forEach(r => lines.push(`• ${r.name}: ${r.reason}`));
+  }
+  if (results.error.length) {
+    lines.push(`\n❌ *Errors (${results.error.length}):*`);
+    results.error.forEach(r => lines.push(`• ${r.name}: ${r.reason}`));
+  }
+  await postToSlack(lines.join('\n'));
+
+  console.log('\n✅ Done.');
+}
+
+main().catch(err => {
+  console.error('Fatal:', err);
+  process.exit(1);
+});

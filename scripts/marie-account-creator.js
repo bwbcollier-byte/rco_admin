@@ -81,7 +81,7 @@ async function getGmailAddress() {
  */
 async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
   console.log(`  Polling Gmail inbox for ${email} (since ${sinceTimestamp})...`);
-  const SETTLE_MS = 300000; // keep polling 5 min after first message to catch late senders
+  const SETTLE_MS = 120000; // keep polling 2 min after first message to catch late senders
   const start = Date.now();
   let allMessages = [];
   let firstMessageAt = null;
@@ -1350,6 +1350,13 @@ async function captureXAIKey(context, loginId, mailConfig) {
         for (const msg of newMsgs) {
           const inlineBody = msg.content || msg.body || msg.html || msg.text || '';
           const mid = msg.mid || msg.id || msg.messageId;
+
+          // Skip messages already processed in Phase 2
+          if (mid && mailConfig.seenMids?.has(mid)) {
+            console.log(`  xAI: skipping already-processed message ${mid}`);
+            continue;
+          }
+
           const body = inlineBody || (mid ? await fetchGmailMessageBody(mid, mailConfig.email) : '');
           const subj = msg.subject || msg.textSubject || '';
           if (body && (subj.toLowerCase().includes('x.ai') || subj.toLowerCase().includes('xai') || body.toLowerCase().includes('x.ai'))) {
@@ -1358,7 +1365,8 @@ async function captureXAIKey(context, loginId, mailConfig) {
             if (linkMatch) {
               const link = linkMatch[0].replace(/&amp;/g, '&');
               console.log(`  xAI: clicking fresh magic link: ${link.slice(0, 80)}...`);
-              await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              if (mid) mailConfig.seenMids.add(mid);
+              await page.goto(link, { waitUntil: 'networkidle', timeout: 30000 });
               await page.waitForTimeout(5000);
               console.log(`  xAI: after magic link redirect: ${page.url().slice(0, 80)}`);
               break;
@@ -1526,6 +1534,13 @@ async function captureGroqKey(context, loginId, mailConfig) {
           // Fetch body — Gmail only gives metadata, Flash includes content inline
           const inlineBody = msg.content || msg.body || msg.html || msg.text || '';
           const mid = msg.mid || msg.id || msg.messageId;
+
+          // Skip messages already processed in Phase 2 — their tokens are consumed
+          if (mid && mailConfig.seenMids?.has(mid)) {
+            console.log(`  Groq: skipping already-processed message ${mid}`);
+            continue;
+          }
+
           const body = inlineBody || (mid ? await fetchGmailMessageBody(mid, mailConfig.email) : '');
           const subj = msg.subject || msg.textSubject || '';
           if (body && (subj.toLowerCase().includes('groq') || body.toLowerCase().includes('groq') || body.toLowerCase().includes('stytch'))) {
@@ -1536,9 +1551,12 @@ async function captureGroqKey(context, loginId, mailConfig) {
             if (linkMatch) {
               const link = linkMatch[0].replace(/&amp;/g, '&');
               console.log(`  Groq: clicking fresh magic link: ${link.slice(0, 80)}...`);
-              await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              if (mid) mailConfig.seenMids.add(mid);
+              await page.goto(link, { waitUntil: 'networkidle', timeout: 30000 });
               await page.waitForTimeout(5000);
-              console.log(`  Groq: after magic link redirect: ${page.url().slice(0, 80)}`);
+              const landedUrl = page.url();
+              console.log(`  Groq: after magic link redirect: ${landedUrl.slice(0, 80)}`);
+              if (landedUrl.includes('error')) console.warn(`  ⚠️ Groq: magic link redirect failed`);
               break;
             }
           }
@@ -1714,6 +1732,10 @@ async function main() {
   const { email: batchEmail, service: emailService } = await getBatchEmail();
   console.log(`\nBatch email for this run: ${batchEmail} (via ${emailService})`);
 
+  // Persistent mail config — seenMids tracks message IDs processed in Phase 2
+  // so Phase 4 re-auth never re-clicks an already-consumed magic link
+  const mailConfig = { email: batchEmail, service: emailService, seenMids: new Set() };
+
   const browser = await chromium.launch({
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
@@ -1806,6 +1828,9 @@ async function main() {
 
       console.log(`\n  Message: "${subject}" from ${from}`);
 
+      // Track this mid so Phase 4 re-auth never re-clicks a consumed magic link
+      if (mid) mailConfig.seenMids.add(mid);
+
       // Get full body — use inline if present (Flash), else fetch via API (Gmail)
       const body = inlineBody || (mid ? await fetchGmailMessageBody(mid, batchEmail) : '');
       if (!body) console.warn('  ⚠️ No body found for this message');
@@ -1829,12 +1854,26 @@ async function main() {
       if (linkMatch) {
         const link = linkMatch[0].replace(/&amp;/g, '&');
         console.log(`  Clicking: ${link.slice(0, 100)}...`);
+
+        // For Stytch magic links (Groq/xAI), navigate in a fresh page but first
+        // briefly visit the service domain so session cookies are in scope
+        const isStytch = link.includes('stytch.com/v1/magic_links');
         const verifyPage = await context.newPage();
         try {
-          await verifyPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          if (isStytch) {
+            // Prime the Groq domain cookies before following the Stytch redirect
+            await verifyPage.goto('https://console.groq.com/login', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            await verifyPage.waitForTimeout(1000);
+          }
+          await verifyPage.goto(link, { waitUntil: 'networkidle', timeout: 30000 });
           await verifyPage.waitForTimeout(3000);
-          await verifyPage.screenshot({ path: `/tmp/marie-verify-${Date.now()}.png` });
-          console.log(`  ✅ Verified (${verifyPage.url().slice(0, 60)}...)`);
+          const landedUrl = verifyPage.url();
+          try { await verifyPage.screenshot({ path: `/tmp/marie-verify-${Date.now()}.png` }); } catch {}
+          if (landedUrl.includes('error') || landedUrl.includes('redirect-error')) {
+            console.warn(`  ⚠️ Verification failed — landed on error page: ${landedUrl.slice(0, 80)}`);
+          } else {
+            console.log(`  ✅ Verified (${landedUrl.slice(0, 80)})`);
+          }
         } catch (err) {
           console.warn(`  Verification nav failed: ${err.message}`);
         }
@@ -1900,7 +1939,7 @@ async function main() {
       // Attempt to capture API key from the site dashboard
       if (loginId) {
         try {
-          await captureAPIKey(context, siteName, loginId, { email: batchEmail, service: emailService });
+          await captureAPIKey(context, siteName, loginId, mailConfig);
         } catch (keyErr) {
           console.warn(`  ⚠️ API key capture failed for ${siteName}: ${keyErr.message}`);
         }
