@@ -63,17 +63,36 @@ async function getAllRapidAPILogins() {
       headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
     }
   );
-  const records = (res.data.records || [])
+  const all = (res.data.records || [])
     .filter(r => r.fields[LOGIN_FIELD.siteName] === 'RapidAPI')
     .sort((a, b) => new Date(a.createdTime) - new Date(b.createdTime)); // oldest first
 
-  if (!records.length) throw new Error('No RapidAPI logins found in Airtable Logins table');
-  console.log(`  Found ${records.length} RapidAPI account(s)`);
+  // Only process accounts that are Active or Unverified (skip Failed/Inactive)
+  const records = all.filter(r => {
+    const status = r.fields[LOGIN_FIELD.status];
+    return !status || status === 'Active' || status === 'Unverified';
+  });
+
+  if (!records.length) throw new Error('No active RapidAPI logins found in Airtable Logins table');
+  const unverified = records.filter(r => r.fields[LOGIN_FIELD.status] === 'Unverified').length;
+  console.log(`  Found ${records.length} RapidAPI account(s) to try (${unverified} unverified)`);
   return records.map(r => ({
     email:    r.fields[LOGIN_FIELD.email],
     password: r.fields[LOGIN_FIELD.password],
     loginId:  r.id,
+    status:   r.fields[LOGIN_FIELD.status] || 'Active',
   }));
+}
+
+async function updateLoginStatus(loginId, status) {
+  if (DRY_RUN) return;
+  try {
+    await axios.patch(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_LOGINS}/${loginId}`,
+      { fields: { [LOGIN_FIELD.status]: status } },
+      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
+    );
+  } catch {}
 }
 
 async function getAPIsToProcess() {
@@ -160,16 +179,13 @@ async function loginToRapidAPI(page, email, password) {
   await page.locator('button[type="submit"]').first().click();
   await page.waitForTimeout(8000);
 
-  // Verify login
-  const isLoggedIn = await page.locator(
-    '[data-testid="user-menu"], .user-avatar, [aria-label*="account" i], img[alt*="avatar" i], [class*="userAvatar"]'
-  ).first().isVisible().catch(() => false);
-
-  if (!isLoggedIn) {
+  // Verify login — success = URL moved away from /auth/login
+  const finalUrl = page.url();
+  if (finalUrl.includes('/auth/login')) {
     await page.screenshot({ path: '/tmp/rapidapi-login-failed.png' }).catch(() => {});
-    throw new Error(`RapidAPI login failed — landed on: ${page.url()}`);
+    throw new Error(`RapidAPI login failed — landed on: ${finalUrl}`);
   }
-  console.log('  ✅ Logged in to RapidAPI');
+  console.log(`  ✅ Logged in to RapidAPI (${finalUrl})`);
 }
 
 // ─── Subscribe ────────────────────────────────────────────────────────────────
@@ -591,9 +607,16 @@ async function main() {
     const loginPage = await context.newPage();
     try {
       await loginToRapidAPI(loginPage, credentials.email, credentials.password);
+      // Login succeeded — if this account was Unverified, promote it to Active
+      if (credentials.status === 'Unverified') {
+        await updateLoginStatus(credentials.loginId, 'Active');
+        console.log(`  ✅ Promoted ${credentials.email} from Unverified → Active`);
+      }
     } catch (loginErr) {
       console.error(`  ❌ Login failed for ${credentials.email}: ${loginErr.message}`);
       await loginPage.screenshot({ path: `/tmp/rapidapi-login-fail-${i}.png` }).catch(() => {});
+      // Mark failed accounts so we don't keep retrying them
+      await updateLoginStatus(credentials.loginId, 'Failed');
       accountOk = false;
     } finally {
       await loginPage.close();

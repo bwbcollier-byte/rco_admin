@@ -388,9 +388,9 @@ async function updateSignupStatus(recordId, status, fields = {}) {
   );
 }
 
-async function saveToAirtable(siteName, email, password, notes) {
+async function saveToAirtable(siteName, email, password, notes, status = 'Active') {
   if (DRY_RUN) {
-    console.log(`  [DRY RUN] Would save to Airtable: ${siteName} / ${email}`);
+    console.log(`  [DRY RUN] Would save to Airtable: ${siteName} / ${email} (status: ${status})`);
     return null;
   }
 
@@ -403,7 +403,7 @@ async function saveToAirtable(siteName, email, password, notes) {
           fldQqf8eF4mT2U0zT: siteName,
           fldoqWChj7NAo6uRg: email,
           fldqoPo0O06uAHILu: password,
-          fldcZ9nAY8GD2OZW8: 'Active',
+          fldcZ9nAY8GD2OZW8: status,
           fldmNEniveVp5upxh: 'Email Password',
           fldupBswggA36MOyI: notes || '',
         },
@@ -1901,19 +1901,20 @@ async function main() {
     try {
       await rapidPage.goto('https://rapidapi.com/hub', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await rapidPage.waitForTimeout(3000);
-      isLoggedIn = await rapidPage.locator('[data-testid="user-menu"], .user-avatar, [aria-label*="account" i], img[alt*="avatar" i]').first().isVisible().catch(() => false);
-      console.log(`  RapidAPI session active: ${isLoggedIn}`);
-      if (!isLoggedIn) {
-        // Log page URL to help diagnose auth state
-        console.log(`  RapidAPI current URL: ${rapidPage.url()}`);
-      }
+      // Use URL as primary signal — if we land anywhere other than /auth/login, session is active
+      const rapidUrl = rapidPage.url();
+      isLoggedIn = !rapidUrl.includes('/auth/login');
+      console.log(`  RapidAPI session active: ${isLoggedIn} (URL: ${rapidUrl})`);
     } catch (e) {
       console.warn(`  RapidAPI session check failed: ${e.message}`);
     }
     await rapidPage.close();
 
+    // Store session result on rapidItem so Phase 4 knows whether to trust these credentials
+    rapidItem.sessionVerified = isLoggedIn;
+
     if (!isLoggedIn) {
-      console.log('  ⚠️ RapidAPI not authenticated — skipping subscriptions. Check signup succeeded and session is live.');
+      console.log('  ⚠️ RapidAPI not authenticated — skipping subscriptions. Credentials will be saved as Unverified.');
     } else {
       const subResults = await subscribeToRapidAPIs(context);
       rapidItem.subResults = subResults;
@@ -1932,8 +1933,13 @@ async function main() {
     try {
       let loginId = null;
       if (!item.isOMDB) {
-        // OMDB credentials saved separately (API key, not password)
-        loginId = await saveToAirtable(siteName, batchEmail, SIGNUP_PASSWORD, notes);
+        // RapidAPI: save as 'Unverified' if the browser session wasn't confirmed active in Phase 3.
+        // The subscriber script will upgrade to 'Active' after a successful fresh login.
+        const loginStatus = (item.isRapidAPI && !item.sessionVerified) ? 'Unverified' : 'Active';
+        if (item.isRapidAPI && !item.sessionVerified) {
+          console.log(`  ⚠️ RapidAPI session was not verified — saving as Unverified (credentials may not work)`);
+        }
+        loginId = await saveToAirtable(siteName, batchEmail, SIGNUP_PASSWORD, notes, loginStatus);
       }
 
       // Attempt to capture API key from the site dashboard
