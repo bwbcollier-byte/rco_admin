@@ -182,39 +182,73 @@ async function signUp(page, email, password) {
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-before.png' }).catch(() => {});
 
-  // Fill email — use pressSequentially (React form needs real keyboard events)
+  // ── Step 1: Fill email ──
   const emailInput = page.locator('input[type="email"], input[name="email"]').first();
   if (!await emailInput.isVisible({ timeout: 8000 }).catch(() => false)) {
     throw new Error('Email field not found on signup page');
   }
   await emailInput.click();
   await emailInput.pressSequentially(email, { delay: 60 });
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(500);
 
-  // Fill password
-  const passInput = page.locator('input[type="password"]').first();
-  if (await passInput.isVisible().catch(() => false)) {
-    await passInput.click();
-    await passInput.pressSequentially(password, { delay: 60 });
-    await page.waitForTimeout(300);
+  // ── Step 1b: If password field isn't visible yet, this is a multi-step form ──
+  // Click Continue/Next to advance to the password step
+  const passVisibleNow = await page.locator('input[type="password"]').first()
+    .isVisible({ timeout: 1500 }).catch(() => false);
+
+  if (!passVisibleNow) {
+    console.log('  Multi-step form detected — clicking Continue...');
+    const continueSels = [
+      'button:has-text("Continue")',
+      'button:has-text("Next")',
+      'button[type="submit"]',
+      'form button',
+    ];
+    for (const sel of continueSels) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await btn.click();
+          console.log(`  Clicked: ${sel}`);
+          break;
+        }
+      } catch {}
+    }
+    // Wait for password field to appear (step 2 of signup)
+    try {
+      await page.waitForSelector('input[type="password"]', { timeout: 12000 });
+      console.log('  Password field appeared — on step 2');
+    } catch {
+      await page.screenshot({ path: '/tmp/rapidapi-signup-step2-missing.png' }).catch(() => {});
+      throw new Error('Password field never appeared after Continue click');
+    }
   }
 
-  // Fill name fields if present
+  // ── Step 2: Fill password, name, terms ──
+  await page.screenshot({ path: '/tmp/rapidapi-signup-step2.png' }).catch(() => {});
+
+  const passInput = page.locator('input[type="password"]').first();
+  await passInput.click();
+  await passInput.pressSequentially(password, { delay: 60 });
+  await page.waitForTimeout(500);
+
+  // Name fields (may or may not be present)
   await page.locator('input[name="firstName"], input[placeholder*="first" i]').first().fill(DEFAULTS.firstName).catch(() => {});
   await page.locator('input[name="lastName"],  input[placeholder*="last" i]').first().fill(DEFAULTS.lastName).catch(() => {});
 
-  // Tick terms checkbox
+  // Terms checkbox
   await page.locator('input[type="checkbox"]').first().check().catch(() => {});
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-filled.png' }).catch(() => {});
 
-  // Submit — try multiple patterns RapidAPI uses
+  // ── Step 2: Submit ──
   let submitted = false;
   const submitSelectors = [
     'button[type="submit"]',
     'button:has-text("Sign Up")',
     'button:has-text("Create Account")',
     'button:has-text("Get Started")',
+    'button:has-text("Continue")',
     '[role="button"]:has-text("Sign Up")',
     'form button',
   ];
@@ -231,12 +265,17 @@ async function signUp(page, email, password) {
   }
   if (!submitted) throw new Error('Submit button not found on signup page');
 
-  await page.waitForTimeout(8000);
+  await page.waitForTimeout(10000);
   await page.screenshot({ path: '/tmp/rapidapi-signup-after.png' }).catch(() => {});
 
   // Verify session — success = URL moved away from /auth/
   const finalUrl = page.url();
   if (finalUrl.includes('/auth/')) {
+    // Dump visible button texts to help diagnose
+    const btns = await page.evaluate(() =>
+      [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null).map(b => b.textContent.trim()).filter(t => t)
+    ).catch(() => []);
+    console.warn(`  Visible buttons: ${btns.slice(0, 10).join(' | ')}`);
     throw new Error(`Signup may have failed — still on auth page: ${finalUrl}`);
   }
   console.log(`  ✅ Signed up (${finalUrl})`);
