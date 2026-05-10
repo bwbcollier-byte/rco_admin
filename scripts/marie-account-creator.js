@@ -430,12 +430,12 @@ async function saveToAirtable(siteName, email, password, notes) {
 // ─── Airtable — RapidAPI subscription list ────────────────────────────────────
 
 async function getUnsubscribedRapidAPIs() {
-  // Only pulls APIs where "Subscribe via Marie" is checked AND not yet subscribed
+  // Only pulls APIs where "Subscribe via Kondo" is checked AND not yet subscribed
   const res = await axios.get(
     `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}`,
     {
       params: {
-        filterByFormula: `AND({Subscribe via Marie}, NOT({Subscribed}))`,
+        filterByFormula: `AND({Subscribe via Kondo}, NOT({Subscribed}))`,
         fields: ['Name', 'Link'],
       },
       headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
