@@ -1,0 +1,63 @@
+name: Kondo — RapidAPI Account Creator
+
+on:
+  # Run every Monday at 8am AEST (10pm UTC Sunday) — before the subscriber runs at 9am
+  schedule:
+    - cron: '0 22 * * 0'
+
+  # Run manually any time you want a fresh account spun up
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Check/find but take no action'
+        required: false
+        default: 'false'
+
+jobs:
+  create-account:
+    name: Marie — RapidAPI Account Creator
+    runs-on: self-hosted
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install playwright playwright-extra puppeteer-extra-plugin-stealth axios
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      - name: Run RapidAPI Account Creator
+        env:
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ vars.AIRTABLE_BASE_ID }}
+          AIRTABLE_LOGINS:  ${{ vars.AIRTABLE_LOGINS }}
+          AIRTABLE_CREDS:   ${{ vars.AIRTABLE_CREDS }}
+          AIRTABLE_APIS:    ${{ vars.AIRTABLE_APIS }}
+          FIELD_LOGIN_SITE_NAME: ${{ vars.FIELD_LOGIN_SITE_NAME }}
+          FIELD_LOGIN_EMAIL:     ${{ vars.FIELD_LOGIN_EMAIL }}
+          FIELD_LOGIN_PASSWORD:  ${{ secrets.FIELD_LOGIN_PASSWORD }}
+          FIELD_LOGIN_STATUS:    ${{ vars.FIELD_LOGIN_STATUS }}
+          FIELD_API_SUBSCRIBED:  ${{ vars.FIELD_API_SUBSCRIBED }}
+          RAPIDAPI_KEY:    ${{ secrets.RAPIDAPI_KEY }}
+          SIGNUP_PASSWORD: ${{ secrets.SIGNUP_PASSWORD }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: node scripts/marie-rapidapi-account.js
+
+      - name: Upload debug screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rapidapi-account-screenshots
+          path: /tmp/rapidapi-*.png
+          retention-days: 7
+          overwrite: true
