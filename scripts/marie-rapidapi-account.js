@@ -226,17 +226,22 @@ async function signUp(page, email, password) {
   await page.screenshot({ path: '/tmp/rapidapi-signup-before.png' }).catch(() => {});
 
   // ── Step 1: Fill email → Next ──
+  // Strip '+tag' suffix — RapidAPI and many sites reject plus-aliased emails.
+  // Gmail still delivers to the same inbox either way.
+  const signupEmail = email.replace(/\+[^@]+@/, '@');
+  if (signupEmail !== email) console.log(`  Using stripped email for signup: ${signupEmail}`);
+
   const emailInput = page.locator('input[type="email"], input[name="email"]').first();
   if (!await emailInput.isVisible({ timeout: 8000 }).catch(() => false)) {
     throw new Error('Email field not found on signup page');
   }
   await emailInput.click();
-  await emailInput.pressSequentially(email, { delay: 60 });
+  await emailInput.pressSequentially(signupEmail, { delay: 60 });
   await page.waitForTimeout(500);
 
   // Tab out so React runs blur validation and enables the Next button
   await emailInput.press('Tab');
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
 
   // Check for inline validation errors (e.g. "Invalid email" or "Already in use")
   const emailErr = await page.evaluate(() => {
@@ -258,8 +263,9 @@ async function signUp(page, email, password) {
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-after-next.png' }).catch(() => {});
 
-  // Wait for password field to appear (step 2)
-  const pwAppeared = await page.waitForSelector('input[type="password"]', { timeout: 15000 })
+  // Wait for password field to become VISIBLE (state:visible, not just in DOM)
+  // The password input exists in the DOM on step 1 too — we need it to be visible.
+  const pwAppeared = await page.waitForSelector('input[type="password"]', { timeout: 15000, state: 'visible' })
     .then(() => true).catch(() => false);
   if (!pwAppeared) {
     // Log what's on screen to diagnose
