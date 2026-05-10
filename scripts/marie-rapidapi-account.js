@@ -166,6 +166,36 @@ async function markAPISubscribed(recordId, loginId) {
 
 // ─── RapidAPI Signup ──────────────────────────────────────────────────────────
 
+async function clickNext(page, stepLabel) {
+  // RapidAPI uses "Next" as the primary CTA on every signup step.
+  // Avoid 'form button' — it can match social login buttons (Google/GitHub).
+  const sels = [
+    'button:has-text("Next")',
+    'button:has-text("Continue")',
+    'button:has-text("Sign Up")',
+    'button:has-text("Create Account")',
+    'button:has-text("Get Started")',
+    'button[type="submit"]',
+  ];
+  for (const sel of sels) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const txt = (await btn.textContent().catch(() => sel)).trim();
+        console.log(`  [${stepLabel}] Clicked: "${txt}"`);
+        await btn.click();
+        return true;
+      }
+    } catch {}
+  }
+  // Last resort: dump buttons so we can see what's there, then fail
+  const btns = await page.evaluate(() =>
+    [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null).map(b => b.textContent.trim()).filter(t => t)
+  ).catch(() => []);
+  console.warn(`  [${stepLabel}] Visible buttons: ${btns.slice(0, 10).join(' | ')}`);
+  return false;
+}
+
 async function signUp(page, email, password) {
   console.log(`\n  Navigating to RapidAPI signup...`);
   await page.goto('https://rapidapi.com/auth/sign-up', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -182,7 +212,7 @@ async function signUp(page, email, password) {
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-before.png' }).catch(() => {});
 
-  // ── Step 1: Fill email ──
+  // ── Step 1: Fill email → Next ──
   const emailInput = page.locator('input[type="email"], input[name="email"]').first();
   if (!await emailInput.isVisible({ timeout: 8000 }).catch(() => false)) {
     throw new Error('Email field not found on signup page');
@@ -191,48 +221,30 @@ async function signUp(page, email, password) {
   await emailInput.pressSequentially(email, { delay: 60 });
   await page.waitForTimeout(500);
 
-  // ── Step 1b: If password field isn't visible yet, this is a multi-step form ──
-  // Click Continue/Next to advance to the password step
-  const passVisibleNow = await page.locator('input[type="password"]').first()
-    .isVisible({ timeout: 1500 }).catch(() => false);
+  // Always click Next after email — RapidAPI's signup is always multi-step.
+  // Even if a password field appears to be in the DOM, it may belong to a
+  // hidden step. Clicking Next is always safe here.
+  const step1ok = await clickNext(page, 'step1-email');
+  if (!step1ok) throw new Error('Could not find Next button after filling email');
 
-  if (!passVisibleNow) {
-    console.log('  Multi-step form detected — clicking Continue...');
-    const continueSels = [
-      'button:has-text("Continue")',
-      'button:has-text("Next")',
-      'button[type="submit"]',
-      'form button',
-    ];
-    for (const sel of continueSels) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await btn.click();
-          console.log(`  Clicked: ${sel}`);
-          break;
-        }
-      } catch {}
-    }
-    // Wait for password field to appear (step 2 of signup)
-    try {
-      await page.waitForSelector('input[type="password"]', { timeout: 12000 });
-      console.log('  Password field appeared — on step 2');
-    } catch {
-      await page.screenshot({ path: '/tmp/rapidapi-signup-step2-missing.png' }).catch(() => {});
-      throw new Error('Password field never appeared after Continue click');
-    }
+  // Wait for password field to appear (step 2)
+  try {
+    await page.waitForSelector('input[type="password"]', { timeout: 15000 });
+    console.log('  Password field appeared');
+  } catch {
+    await page.screenshot({ path: '/tmp/rapidapi-signup-nopw.png' }).catch(() => {});
+    throw new Error('Password field never appeared after clicking Next on step 1');
   }
 
-  // ── Step 2: Fill password, name, terms ──
   await page.screenshot({ path: '/tmp/rapidapi-signup-step2.png' }).catch(() => {});
 
+  // ── Step 2: Fill password, name, terms → Next/Submit ──
   const passInput = page.locator('input[type="password"]').first();
   await passInput.click();
   await passInput.pressSequentially(password, { delay: 60 });
   await page.waitForTimeout(500);
 
-  // Name fields (may or may not be present)
+  // Name fields (present on some RapidAPI signup variants)
   await page.locator('input[name="firstName"], input[placeholder*="first" i]').first().fill(DEFAULTS.firstName).catch(() => {});
   await page.locator('input[name="lastName"],  input[placeholder*="last" i]').first().fill(DEFAULTS.lastName).catch(() => {});
 
@@ -241,29 +253,8 @@ async function signUp(page, email, password) {
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-filled.png' }).catch(() => {});
 
-  // ── Step 2: Submit ──
-  let submitted = false;
-  const submitSelectors = [
-    'button[type="submit"]',
-    'button:has-text("Sign Up")',
-    'button:has-text("Create Account")',
-    'button:has-text("Get Started")',
-    'button:has-text("Continue")',
-    '[role="button"]:has-text("Sign Up")',
-    'form button',
-  ];
-  for (const sel of submitSelectors) {
-    try {
-      const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await btn.click();
-        submitted = true;
-        console.log(`  Submitted via: ${sel}`);
-        break;
-      }
-    } catch {}
-  }
-  if (!submitted) throw new Error('Submit button not found on signup page');
+  const step2ok = await clickNext(page, 'step2-submit');
+  if (!step2ok) throw new Error('Could not find submit button on step 2');
 
   await page.waitForTimeout(10000);
   await page.screenshot({ path: '/tmp/rapidapi-signup-after.png' }).catch(() => {});
@@ -271,7 +262,6 @@ async function signUp(page, email, password) {
   // Verify session — success = URL moved away from /auth/
   const finalUrl = page.url();
   if (finalUrl.includes('/auth/')) {
-    // Dump visible button texts to help diagnose
     const btns = await page.evaluate(() =>
       [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null).map(b => b.textContent.trim()).filter(t => t)
     ).catch(() => []);
