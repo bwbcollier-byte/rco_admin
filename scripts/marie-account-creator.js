@@ -81,7 +81,10 @@ async function getGmailAddress() {
  */
 async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
   console.log(`  Polling Gmail inbox for ${email} (since ${sinceTimestamp})...`);
+  const SETTLE_MS = 300000; // keep polling 5 min after first message to catch late senders
   const start = Date.now();
+  let allMessages = [];
+  let firstMessageAt = null;
 
   while (Date.now() - start < timeoutMs) {
     await new Promise(r => setTimeout(r, 10000));
@@ -98,11 +101,19 @@ async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
         : Array.isArray(res.data?.messages) ? res.data.messages
         : Array.isArray(res.data?.emails)   ? res.data.emails
         : [];
-      if (messages.length > 0) {
-        console.log(`  Got ${messages.length} message(s) in Gmail inbox`);
-        return messages;
+      if (messages.length > allMessages.length) {
+        console.log(`  Gmail inbox: ${messages.length} message(s) (+${messages.length - allMessages.length} new)`);
+        if (!firstMessageAt) firstMessageAt = Date.now();
+        allMessages = messages;
+      } else if (messages.length > 0) {
+        console.log(`  Gmail inbox: ${messages.length} message(s) — no new arrivals`);
+      } else {
+        console.log(`  No messages yet...`);
       }
-      console.log(`  No messages yet...`);
+      if (firstMessageAt && Date.now() - firstMessageAt >= SETTLE_MS) {
+        console.log(`  Settle window complete — processing ${allMessages.length} message(s)`);
+        return allMessages;
+      }
     } catch (err) {
       if (err.response?.status === 404) {
         console.log(`  Inbox empty (404), waiting...`);
@@ -111,7 +122,8 @@ async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
       }
     }
   }
-  return [];
+  console.log(`  Poll timeout — returning ${allMessages.length} message(s)`);
+  return allMessages;
 }
 
 /**
@@ -1306,12 +1318,17 @@ async function captureXAIKey(context, loginId, mailConfig) {
         await page.waitForTimeout(500);
         try { await page.locator('button[type="submit"]').first().click({ timeout: 5000 }); } catch {}
         await page.waitForTimeout(3000);
-        console.log('  xAI: fresh magic link requested, polling Flash inbox...');
+        const inboxServiceXAI = mailConfig.service || 'gmail';
+        console.log(`  xAI: fresh magic link requested, polling ${inboxServiceXAI} inbox...`);
 
         const sinceTs = Math.floor(Date.now() / 1000);
-        const newMsgs = await pollFlashInboxSince(mailConfig.email, sinceTs - 5, 120000);
+        const newMsgs = inboxServiceXAI === 'flash'
+          ? await pollFlashInboxSince(mailConfig.email, sinceTs - 5, 120000)
+          : await pollGmailInbox(mailConfig.email, sinceTs - 5, 120000);
         for (const msg of newMsgs) {
-          const body = msg.content || msg.body || msg.html || msg.text || '';
+          const inlineBody = msg.content || msg.body || msg.html || msg.text || '';
+          const mid = msg.mid || msg.id || msg.messageId;
+          const body = inlineBody || (mid ? await fetchGmailMessageBody(mid, mailConfig.email) : '');
           const subj = msg.subject || msg.textSubject || '';
           if (body && (subj.toLowerCase().includes('x.ai') || subj.toLowerCase().includes('xai') || body.toLowerCase().includes('x.ai'))) {
             const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:magic|token|verify|accounts\.x\.ai)[^\s"'<>]*/i)
@@ -1476,12 +1493,18 @@ async function captureGroqKey(context, loginId, mailConfig) {
         await page.waitForTimeout(500);
         await playwrightClickSubmit(page);
         await page.waitForTimeout(3000);
-        console.log('  Groq: fresh magic link requested, polling Flash inbox...');
+        const inboxService = mailConfig.service || 'gmail';
+        console.log(`  Groq: fresh magic link requested, polling ${inboxService} inbox...`);
 
         const sinceTs = Math.floor(Date.now() / 1000);
-        const newMsgs = await pollFlashInboxSince(mailConfig.email, sinceTs - 5, 120000);
+        const newMsgs = inboxService === 'flash'
+          ? await pollFlashInboxSince(mailConfig.email, sinceTs - 5, 120000)
+          : await pollGmailInbox(mailConfig.email, sinceTs - 5, 120000);
         for (const msg of newMsgs) {
-          const body = msg.content || msg.body || msg.html || msg.text || '';
+          // Fetch body — Gmail only gives metadata, Flash includes content inline
+          const inlineBody = msg.content || msg.body || msg.html || msg.text || '';
+          const mid = msg.mid || msg.id || msg.messageId;
+          const body = inlineBody || (mid ? await fetchGmailMessageBody(mid, mailConfig.email) : '');
           const subj = msg.subject || msg.textSubject || '';
           if (body && (subj.toLowerCase().includes('groq') || body.toLowerCase().includes('groq') || body.toLowerCase().includes('stytch'))) {
             const linkMatch = body.match(/https?:\/\/[^\s"'<>]+(?:magic|token|redirect|stytch)[^\s"'<>]*/i)
@@ -1811,16 +1834,27 @@ async function main() {
 
     // Navigate back to RapidAPI — session cookies should still be active
     const rapidPage = await context.newPage();
+    let isLoggedIn = false;
     try {
       await rapidPage.goto('https://rapidapi.com/hub', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await rapidPage.waitForTimeout(2000);
-      const isLoggedIn = await rapidPage.locator('[data-testid="user-menu"], .user-avatar, [aria-label*="account" i]').first().isVisible().catch(() => false);
+      await rapidPage.waitForTimeout(3000);
+      isLoggedIn = await rapidPage.locator('[data-testid="user-menu"], .user-avatar, [aria-label*="account" i], img[alt*="avatar" i]').first().isVisible().catch(() => false);
       console.log(`  RapidAPI session active: ${isLoggedIn}`);
-    } catch {}
+      if (!isLoggedIn) {
+        // Log page URL to help diagnose auth state
+        console.log(`  RapidAPI current URL: ${rapidPage.url()}`);
+      }
+    } catch (e) {
+      console.warn(`  RapidAPI session check failed: ${e.message}`);
+    }
     await rapidPage.close();
 
-    const subResults = await subscribeToRapidAPIs(context);
-    rapidItem.subResults = subResults;
+    if (!isLoggedIn) {
+      console.log('  ⚠️ RapidAPI not authenticated — skipping subscriptions. Check signup succeeded and session is live.');
+    } else {
+      const subResults = await subscribeToRapidAPIs(context);
+      rapidItem.subResults = subResults;
+    }
   }
 
   // ── Phase 4: Save credentials + mark Done ────────────────────────────────
