@@ -184,16 +184,16 @@ async function clickNext(page, stepLabel) {
       const btn = page.locator(sel).first();
       if (!await btn.isVisible({ timeout: 2000 }).catch(() => false)) continue;
 
-      // Skip disabled buttons — React often disables Next until field validates
       const disabled = await btn.evaluate(el =>
         el.disabled || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled')
       ).catch(() => false);
-      if (disabled) { console.log(`  [${stepLabel}] "${sel}" is disabled — skipping`); continue; }
 
       const txt = (await btn.textContent().catch(() => sel)).trim();
-      console.log(`  [${stepLabel}] Clicking: "${txt}" (force)`);
-      await btn.click({ force: true });   // bypass interception checks
-      await page.waitForTimeout(500);
+      if (disabled) console.log(`  [${stepLabel}] "${txt}" is disabled — force-clicking anyway`);
+      else console.log(`  [${stepLabel}] Clicking: "${txt}"`);
+
+      await btn.click({ force: true });   // force bypasses interception AND disabled checks
+      await page.waitForTimeout(800);
       console.log(`  [${stepLabel}] Clicked ✓`);
       return true;
     } catch (e) {
@@ -278,17 +278,45 @@ async function signUp(page, email, password) {
   await passInput.pressSequentially(password, { delay: 60 });
   await page.waitForTimeout(500);
 
+  // Tab out of password so React runs blur validation and enables Next
+  await passInput.press('Tab');
+  await page.waitForTimeout(1500);
+
+  // Check for password validation errors
+  const passErr = await page.evaluate(() => {
+    const msgs = [...document.querySelectorAll('[role="alert"], .error, [class*="error" i], [class*="invalid" i], [class*="helper" i]')]
+      .map(el => el.textContent.trim()).filter(t => t);
+    return msgs.join(' | ');
+  }).catch(() => '');
+  if (passErr) console.warn(`  ⚠️ Password validation: ${passErr}`);
+
   // Name fields (present on some RapidAPI signup variants)
-  await page.locator('input[name="firstName"], input[placeholder*="first" i]').first().fill(DEFAULTS.firstName).catch(() => {});
-  await page.locator('input[name="lastName"],  input[placeholder*="last" i]').first().fill(DEFAULTS.lastName).catch(() => {});
+  const firstNameEl = page.locator('input[name="firstName"], input[placeholder*="first" i]').first();
+  if (await firstNameEl.isVisible({ timeout: 1000 }).catch(() => false)) {
+    await firstNameEl.pressSequentially(DEFAULTS.firstName, { delay: 40 });
+    await firstNameEl.press('Tab');
+    await page.waitForTimeout(300);
+  }
+  const lastNameEl = page.locator('input[name="lastName"], input[placeholder*="last" i]').first();
+  if (await lastNameEl.isVisible({ timeout: 1000 }).catch(() => false)) {
+    await lastNameEl.pressSequentially(DEFAULTS.lastName, { delay: 40 });
+    await lastNameEl.press('Tab');
+    await page.waitForTimeout(300);
+  }
 
   // Terms checkbox
   await page.locator('input[type="checkbox"]').first().check().catch(() => {});
+  await page.waitForTimeout(500);
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-filled.png' }).catch(() => {});
 
+  // Try clickNext; if button still reports disabled, also try Enter
   const step2ok = await clickNext(page, 'step2-submit');
-  if (!step2ok) throw new Error('Could not find submit button on step 2');
+  if (!step2ok) {
+    console.log('  step2 clickNext failed — trying Enter key...');
+    await passInput.press('Enter');
+    await page.waitForTimeout(5000);
+  }
 
   await page.waitForTimeout(10000);
   await page.screenshot({ path: '/tmp/rapidapi-signup-after.png' }).catch(() => {});
