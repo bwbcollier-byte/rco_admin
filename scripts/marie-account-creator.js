@@ -287,18 +287,22 @@ async function pollFlashInboxSince(email, sinceUnixTs, timeoutMs = 120000) {
 // ─── Email provider router ────────────────────────────────────────────────────
 
 /**
- * Try Flash Temp Mail first (returns full email bodies); fall back to Gmail.
+ * Try Gmail first (real gmail.com address — universally trusted by SMTP filters).
+ * Fall back to Flash Temp Mail if Gmail API fails.
  * Returns { email, service } so Phase 2 knows which inbox to poll.
+ *
+ * Gmail is primary because Flash domains (sendhelp.mom, step-sis.help, etc.) are
+ * on spam blocklists and get silently rejected by Tavily, OpenRouter, TMDB, xAI, etc.
  */
 async function getBatchEmail() {
   try {
-    const email = await createFlashMailbox();
-    return { email, service: 'flash' };
-  } catch (err) {
-    console.warn(`  ⚠️ Flash Mail API failed: ${err.message}`);
-    console.log('  → Falling back to Gmail...');
     const email = await getGmailAddress();
     return { email, service: 'gmail' };
+  } catch (err) {
+    console.warn(`  ⚠️ Gmail API failed: ${err.message}`);
+    console.log('  → Falling back to Flash Temp Mail...');
+    const email = await createFlashMailbox();
+    return { email, service: 'flash' };
   }
 }
 
@@ -1276,10 +1280,15 @@ async function captureXAIKey(context, loginId, mailConfig) {
     await page.goto('https://console.x.ai/team/default/api-keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(4000);
 
-    // If not authenticated, re-request a fresh magic link
+    // If not authenticated, re-request a fresh magic link.
+    // xAI may keep the URL at the keys page while showing an auth overlay.
     const currentUrl = page.url();
-    if (!currentUrl.includes('console.x.ai') && mailConfig?.email) {
-      console.log(`  xAI: not authenticated (at ${currentUrl.slice(0, 70)}) — requesting fresh magic link...`);
+    const hasLoginFormXAI = await page.locator('input[type="email"], button:has-text("Login with email")').first().isVisible().catch(() => false);
+    const hasKeyTableXAI  = await page.locator('table, [class*="key"], button:has-text("Create")').first().isVisible().catch(() => false);
+    const isNotAuthedXAI  = !currentUrl.includes('console.x.ai') || hasLoginFormXAI || !hasKeyTableXAI;
+    console.log(`  xAI: url=${currentUrl.slice(0, 60)} hasLoginForm=${hasLoginFormXAI} hasKeyTable=${hasKeyTableXAI}`);
+    if (isNotAuthedXAI && mailConfig?.email) {
+      console.log(`  xAI: not authenticated — requesting fresh magic link...`);
       await page.goto('https://console.x.ai/sign-in', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(8000);
 
@@ -1441,10 +1450,16 @@ async function captureGroqKey(context, loginId, mailConfig) {
     await page.goto('https://console.groq.com/keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
 
-    // If not authenticated, re-request a fresh magic link
+    // If not authenticated, re-request a fresh magic link.
+    // Groq uses Clerk which may keep the URL at /keys while showing a login overlay —
+    // so check for the *absence* of authenticated UI elements, not just the URL.
     const currentUrl = page.url();
-    if (!currentUrl.includes('console.groq.com/keys') && mailConfig?.email) {
-      console.log(`  Groq: not authenticated (at ${currentUrl.slice(0, 70)}) — requesting fresh magic link...`);
+    const hasLoginForm = await page.locator('input[type="email"]').isVisible().catch(() => false);
+    const hasKeyTable  = await page.locator('table, [class*="key"], [data-testid*="key"]').first().isVisible().catch(() => false);
+    const isNotAuthed  = !currentUrl.includes('console.groq.com') || hasLoginForm || !hasKeyTable;
+    console.log(`  Groq: url=${currentUrl.slice(0, 60)} hasLoginForm=${hasLoginForm} hasKeyTable=${hasKeyTable}`);
+    if (isNotAuthed && mailConfig?.email) {
+      console.log(`  Groq: not authenticated — requesting fresh magic link...`);
       await page.goto('https://console.groq.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(5000);
 
