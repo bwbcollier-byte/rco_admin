@@ -23,7 +23,9 @@
  *   SLACK_BOT_TOKEN, SLACK_CHANNEL_AI_ENGINEERING  (optional — for summary)
  */
 
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+chromium.use(StealthPlugin());
 const axios = require('axios');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -126,27 +128,37 @@ async function updateAPIRecord(recordId, data, loginId) {
 async function loginToRapidAPI(page, email, password) {
   console.log(`\n  Logging in to RapidAPI as ${email}...`);
   await page.goto('https://rapidapi.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(4000);
+  await page.waitForTimeout(2000);
 
-  // Fill email
-  const emailInput = page.locator('input[type="email"], input[name="email"], input[autocomplete="email"]').first();
-  if (!await emailInput.isVisible().catch(() => false)) {
-    throw new Error('RapidAPI login: email field not found');
-  }
-  await emailInput.fill(email);
-  await page.waitForTimeout(500);
+  // Wait for and dismiss cookie consent banner
+  try {
+    await page.locator('button:has-text("Reject All"), button:has-text("Accept All")').first().waitFor({ state: 'visible', timeout: 5000 });
+    await page.locator('button:has-text("Reject All")').first().click();
+    console.log('  Dismissed cookie banner');
+    await page.waitForTimeout(1500);
+  } catch {}
 
-  // Fill password
+  // Wait for email field to be visible
+  const emailInput = page.locator('input[name="email"]').first();
+  await emailInput.waitFor({ state: 'visible', timeout: 10000 });
+
+  // Use pressSequentially to simulate real typing (React-friendly)
+  await emailInput.click();
+  await emailInput.pressSequentially(email, { delay: 60 });
+  await page.waitForTimeout(400);
+
+  // Password
   const passInput = page.locator('input[type="password"]').first();
   if (!await passInput.isVisible().catch(() => false)) {
     throw new Error('RapidAPI login: password field not found');
   }
-  await passInput.fill(password);
-  await page.waitForTimeout(500);
+  await passInput.click();
+  await passInput.pressSequentially(password, { delay: 60 });
+  await page.waitForTimeout(400);
 
   // Submit
-  await page.locator('button[type="submit"], button:has-text("Log In"), button:has-text("Sign In")').first().click();
-  await page.waitForTimeout(6000);
+  await page.locator('button[type="submit"]').first().click();
+  await page.waitForTimeout(8000);
 
   // Verify login
   const isLoggedIn = await page.locator(

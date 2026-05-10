@@ -16,7 +16,7 @@ on:
 jobs:
   subscribe:
     name: Marie — RapidAPI Subscriber
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 60
 
     steps:
@@ -29,7 +29,7 @@ jobs:
           node-version: '22'
 
       - name: Install dependencies
-        run: npm install playwright axios
+        run: npm install playwright playwright-extra puppeteer-extra-plugin-stealth axios
 
       - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
