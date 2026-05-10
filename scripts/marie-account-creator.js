@@ -81,7 +81,7 @@ async function getGmailAddress() {
  */
 async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 600000) {
   console.log(`  Polling Gmail inbox for ${email} (since ${sinceTimestamp})...`);
-  const SETTLE_MS = 120000; // keep polling 2 min after first message to catch late senders
+  const SETTLE_MS = 300000; // keep polling 5 min after first message to catch late senders
   const start = Date.now();
   let allMessages = [];
   let firstMessageAt = null;
@@ -1176,12 +1176,48 @@ async function saveAPIKeyToAirtable(siteName, apiKey, loginId) {
   }
 }
 
-async function captureOpenRouterKey(context, loginId) {
+// Re-login helper for sites that use email+password (no magic link)
+async function tryRelogin(page, loginUrl, email, password) {
+  try {
+    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForTimeout(3000);
+    const emailEl = page.locator('input[type="email"], input[name*="email" i], input[autocomplete="email"]').first();
+    if (!await emailEl.isVisible().catch(() => false)) return false;
+    await emailEl.fill(email);
+    const pwEl = page.locator('input[type="password"]').first();
+    if (await pwEl.isVisible().catch(() => false)) {
+      await pwEl.fill(password);
+    } else {
+      // Identifier-first flow — click Continue then fill password
+      await page.locator('button[type="submit"], button:has-text("Continue")').first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      const pwEl2 = page.locator('input[type="password"]').first();
+      if (await pwEl2.isVisible().catch(() => false)) await pwEl2.fill(password);
+    }
+    await page.locator('button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(5000);
+    console.log(`    Re-login landed: ${page.url().slice(0, 80)}`);
+    return true;
+  } catch (e) {
+    console.warn(`    Re-login failed: ${e.message}`);
+    return false;
+  }
+}
+
+async function captureOpenRouterKey(context, loginId, mailConfig) {
   const page = await context.newPage();
   try {
     console.log('  → OpenRouter: navigating to API keys page...');
     await page.goto('https://openrouter.ai/keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(4000);
+
+    // If redirected to login, try logging in with credentials
+    if (page.url().includes('/auth') || page.url().includes('/login') || page.url().includes('/sign')) {
+      console.log('    Not authenticated — attempting re-login...');
+      await tryRelogin(page, 'https://openrouter.ai/sign-in', mailConfig?.email || '', SIGNUP_PASSWORD);
+      await page.goto('https://openrouter.ai/keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+    }
 
     // Click "Create Key" button
     const createBtn = page.locator('button:has-text("Create Key"), button:has-text("New Key"), button:has-text("Add Key")').first();
@@ -1224,12 +1260,18 @@ async function captureOpenRouterKey(context, loginId) {
   }
 }
 
-async function captureDeepSeekKey(context, loginId) {
+async function captureDeepSeekKey(context, loginId, mailConfig) {
   const page = await context.newPage();
   try {
     console.log('  → DeepSeek: navigating to API keys page...');
     await page.goto('https://platform.deepseek.com/api_keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(4000);
+    if (page.url().includes('/login') || page.url().includes('/sign')) {
+      console.log('    Not authenticated — attempting re-login...');
+      await tryRelogin(page, 'https://platform.deepseek.com/login', mailConfig?.email || '', SIGNUP_PASSWORD);
+      await page.goto('https://platform.deepseek.com/api_keys', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+    }
 
     // Click "Create new API key" button
     const createBtn = page.locator('button:has-text("Create"), button:has-text("New"), button:has-text("Generate")').first();
@@ -1269,12 +1311,18 @@ async function captureDeepSeekKey(context, loginId) {
   }
 }
 
-async function captureTavilyKey(context, loginId) {
+async function captureTavilyKey(context, loginId, mailConfig) {
   const page = await context.newPage();
   try {
     console.log('  → Tavily: navigating to API keys page...');
     await page.goto('https://app.tavily.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(4000);
+    if (page.url().includes('/login') || page.url().includes('/sign') || page.url().includes('auth0')) {
+      console.log('    Not authenticated — attempting re-login...');
+      await tryRelogin(page, 'https://app.tavily.com/sign-in', mailConfig?.email || '', SIGNUP_PASSWORD);
+      await page.goto('https://app.tavily.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+    }
 
     // Tavily shows the key on the home dashboard
     const keyEl = page.locator('input[value^="tvly-"], code:has-text("tvly-"), [class*="api-key"], [class*="apiKey"]').first();
@@ -1366,8 +1414,8 @@ async function captureXAIKey(context, loginId, mailConfig) {
               const link = linkMatch[0].replace(/&amp;/g, '&');
               console.log(`  xAI: clicking fresh magic link: ${link.slice(0, 80)}...`);
               if (mid) mailConfig.seenMids.add(mid);
-              await page.goto(link, { waitUntil: 'networkidle', timeout: 30000 });
-              await page.waitForTimeout(5000);
+              await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.waitForTimeout(8000);  // auth redirect chain needs time to complete
               console.log(`  xAI: after magic link redirect: ${page.url().slice(0, 80)}`);
               break;
             }
@@ -1420,12 +1468,18 @@ async function captureXAIKey(context, loginId, mailConfig) {
   }
 }
 
-async function captureTMDBKey(context, loginId) {
+async function captureTMDBKey(context, loginId, mailConfig) {
   const page = await context.newPage();
   try {
     console.log('  → TMDB: navigating to API settings...');
     await page.goto('https://www.themoviedb.org/settings/api', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(4000);
+    if (page.url().includes('/login') || page.url().includes('/sign')) {
+      console.log('    Not authenticated — attempting re-login...');
+      await tryRelogin(page, 'https://www.themoviedb.org/login', mailConfig?.email || '', SIGNUP_PASSWORD);
+      await page.goto('https://www.themoviedb.org/settings/api', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+    }
 
     // TMDB shows API key (v3 auth) and Read Access Token (v4)
     const keyEl = page.locator('input#api_key, [id*="api_key"], input[name="api_key"]').first();
@@ -1552,8 +1606,8 @@ async function captureGroqKey(context, loginId, mailConfig) {
               const link = linkMatch[0].replace(/&amp;/g, '&');
               console.log(`  Groq: clicking fresh magic link: ${link.slice(0, 80)}...`);
               if (mid) mailConfig.seenMids.add(mid);
-              await page.goto(link, { waitUntil: 'networkidle', timeout: 30000 });
-              await page.waitForTimeout(5000);
+              await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.waitForTimeout(8000);  // auth redirect chain needs time to complete
               const landedUrl = page.url();
               console.log(`  Groq: after magic link redirect: ${landedUrl.slice(0, 80)}`);
               if (landedUrl.includes('error')) console.warn(`  ⚠️ Groq: magic link redirect failed`);
@@ -1608,7 +1662,7 @@ async function captureGroqKey(context, loginId, mailConfig) {
   }
 }
 
-async function captureLastFMKey(context, loginId) {
+async function captureLastFMKey(context, loginId, mailConfig) {
   const page = await context.newPage();
   try {
     console.log('  → Last FM: navigating to API account page...');
@@ -1656,8 +1710,18 @@ async function captureLastFMKey(context, loginId) {
         } catch { /* try next */ }
       }
       if (!clicked) {
-        console.warn('  ⚠️ Last FM: could not find submit button — check /tmp/lastfm-api-form.png');
-        return;
+        // Last resort: submit the form directly via JS
+        const submitted = await page.evaluate(() => {
+          const form = document.querySelector('form');
+          if (form) { form.submit(); return true; }
+          return false;
+        });
+        if (!submitted) {
+          console.warn('  ⚠️ Last FM: could not find submit button or form — check /tmp/lastfm-api-form.png');
+          return;
+        }
+        console.log('  Last FM API form submitted via JS form.submit()');
+        clicked = true;
       }
       await page.waitForTimeout(3000);
     } else {
@@ -1686,14 +1750,14 @@ async function captureLastFMKey(context, loginId) {
  */
 async function captureAPIKey(context, siteName, loginId, mailConfig) {
   const name = (siteName || '').toLowerCase();
-  if (name.includes('openrouter'))    return captureOpenRouterKey(context, loginId);
-  if (name.includes('deepseek'))      return captureDeepSeekKey(context, loginId);
-  if (name.includes('tavily'))        return captureTavilyKey(context, loginId);
+  if (name.includes('openrouter'))    return captureOpenRouterKey(context, loginId, mailConfig);
+  if (name.includes('deepseek'))      return captureDeepSeekKey(context, loginId, mailConfig);
+  if (name.includes('tavily'))        return captureTavilyKey(context, loginId, mailConfig);
   if (name === 'groq')                return captureGroqKey(context, loginId, mailConfig);
   if (name.includes('xai') || (name.includes('grok') && !name.includes('groq'))) return captureXAIKey(context, loginId, mailConfig);
-  if (name.includes('tmdb'))          return captureTMDBKey(context, loginId);
+  if (name.includes('tmdb'))          return captureTMDBKey(context, loginId, mailConfig);
   if (name.includes('rapidapi'))      return captureRapidAPIKey(context, loginId);
-  if (name.includes('last fm') || name.includes('lastfm')) return captureLastFMKey(context, loginId);
+  if (name.includes('last fm') || name.includes('lastfm')) return captureLastFMKey(context, loginId, mailConfig);
   // MusicBrainz, Socialcrawl, Qwen: no automated key capture — skip silently
 }
 
@@ -1865,9 +1929,12 @@ async function main() {
             await verifyPage.goto('https://console.groq.com/login', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
             await verifyPage.waitForTimeout(1000);
           }
-          await verifyPage.goto(link, { waitUntil: 'networkidle', timeout: 30000 });
-          await verifyPage.waitForTimeout(3000);
+          // Use domcontentloaded — Stytch/magic links never reach networkidle (continuous polling)
+          await verifyPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          // Wait 8s for auth redirect chain to complete and set session cookies in context
+          await verifyPage.waitForTimeout(8000);
           const landedUrl = verifyPage.url();
+          console.log(`  Landed: ${landedUrl.slice(0, 80)}`);
           try { await verifyPage.screenshot({ path: `/tmp/marie-verify-${Date.now()}.png` }); } catch {}
           if (landedUrl.includes('error') || landedUrl.includes('redirect-error')) {
             console.warn(`  ⚠️ Verification failed — landed on error page: ${landedUrl.slice(0, 80)}`);
