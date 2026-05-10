@@ -437,7 +437,7 @@ async function main() {
   console.log('='.repeat(60));
 
   if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
-  if (!RAPIDAPI_KEY)     throw new Error('RAPIDAPI_KEY not set');
+  if (!RAPIDAPI_KEY && !process.env.SIGNUP_EMAIL) throw new Error('RAPIDAPI_KEY not set (or set SIGNUP_EMAIL to skip temp-gmail)');
   if (!SIGNUP_PASSWORD)  throw new Error('SIGNUP_PASSWORD not set');
 
   // 1. Get a fresh temp Gmail address
