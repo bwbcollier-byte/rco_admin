@@ -48,9 +48,18 @@ const HEADLESS          = process.env.HEADLESS !== 'false';
 const RESCRAPE_DAYS     = parseInt(process.env.RESCRAPE_DAYS || '7', 10);
 const MAX_PER_RUN       = parseInt(process.env.MAX_PER_RUN || '50', 10);
 const FORCE             = process.env.FORCE === 'true';  // skip lastScraped filter entirely
-const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;   // used for live test calls
+const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;   // primary key for live test calls
+// All available keys — used for rotation on 403 before falling back to subscribe
+const ALL_RAPIDAPI_KEYS = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY || '')
+  .split(',').map(k => k.trim()).filter(Boolean);
+// Airtable Logins table (for auto-subscribe when all keys return 403)
+const AIRTABLE_LOGINS   = process.env.AIRTABLE_LOGINS || 'tbldJkG11gY1W3jTf';
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
+
+// Session state — set once after login, reused across all APIs in the run
+let SESSION_API_KEY = RAPIDAPI_KEY;
+let SESSION_LOGGED_IN = false;
 
 // Airtable field IDs (from tblMb9HFyKcnQ7aKb schema)
 const F = {
@@ -222,6 +231,128 @@ function parseNum(str) {
   if (suf === 'K') n *= 1000;
   if (suf === 'M') n *= 1000000;
   return Math.round(n * 100) / 100;
+}
+
+// ─── Login + Auto-subscribe ───────────────────────────────────────────────────
+
+/** Fetch the first Active RapidAPI login from Airtable. */
+async function getFirstActiveLogin() {
+  try {
+    const res = await axios.get(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_LOGINS}`,
+      {
+        params: {
+          filterByFormula: `AND({fldcZ9nAY8GD2OZW8}='Active', {fldQqf8eF4mT2U0zT}='RapidAPI')`,
+          maxRecords: 1,
+          fields: ['fldoqWChj7NAo6uRg', 'fldqoPo0O06uAHILu'],  // Login, Password
+        },
+        headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+      }
+    );
+    const r = res.data.records?.[0];
+    if (!r) return null;
+    return { email: r.fields['fldoqWChj7NAo6uRg'], password: r.fields['fldqoPo0O06uAHILu'] };
+  } catch (e) {
+    console.warn(`  ⚠️ Could not fetch login: ${e.message}`);
+    return null;
+  }
+}
+
+/** Log into RapidAPI (email → Next → password → Submit). */
+async function loginToRapidAPI(page, email, password) {
+  await page.goto('https://rapidapi.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(2000);
+  try {
+    await page.waitForSelector('button:has-text("Reject All")', { timeout: 5000 });
+    await page.locator('button:has-text("Reject All")').first().click();
+    await page.waitForTimeout(800);
+  } catch {}
+
+  // Email field + Next
+  await page.locator('input[type="email"], input[name="email"]').first().fill(email);
+  await page.locator('button:has-text("Next"), button[type="submit"]').first().click();
+  await page.waitForTimeout(2500);
+
+  // Password field + Submit
+  await page.locator('input[type="password"]').first().fill(password);
+  await page.locator('button[type="submit"]').first().click();
+  await page.waitForTimeout(8000);
+
+  const url = page.url();
+  if (url.includes('/auth/login')) throw new Error('Login failed — still on login page');
+  console.log(`  ✅ Logged in as ${email}`);
+}
+
+/**
+ * Subscribe to an API's free plan using the already-logged-in Playwright page.
+ * Navigates to the pricing page, clicks "Start Free Plan" (if visible), and
+ * confirms any modal. Returns true if a subscribe click happened.
+ */
+async function subscribeViaPlaywright(page, baseUrl) {
+  const pricingUrl = baseUrl.replace(/\/+$/, '') + '/pricing';
+  try {
+    await page.goto(pricingUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3500);
+
+    // Already subscribed?
+    const isSubscribed = await page.evaluate(() => {
+      const btns = [...document.querySelectorAll('button, a')];
+      return btns.some(el => /cancel plan|current plan|upgrade plan/i.test(el.textContent));
+    });
+    if (isSubscribed) { console.log(`    Already subscribed — no action`); return false; }
+
+    // Click "Start Free Plan"
+    const freeBtn = page.locator('button:has-text("Start Free Plan"), a:has-text("Start Free Plan")').first();
+    if (await freeBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await freeBtn.click();
+      await page.waitForTimeout(3000);
+      // Confirm modal if it appears
+      try {
+        await page.locator('button:has-text("Confirm"), button:has-text("Yes"), button:has-text("Subscribe")').first().click({ timeout: 4000 });
+        await page.waitForTimeout(2000);
+      } catch {}
+      console.log(`    ✅ Subscribed via Playwright`);
+      return true;
+    }
+    console.log(`    ⚠️ Start Free Plan button not found`);
+    return false;
+  } catch (e) {
+    console.warn(`    ⚠️ Subscribe attempt failed: ${e.message.slice(0, 80)}`);
+    return false;
+  }
+}
+
+/**
+ * Extract the x-rapidapi-key from the logged-in developer apps page.
+ * Tries /developer/apps table → app security tab → page text scan.
+ */
+async function grabAPIKey(page) {
+  async function scanPage() {
+    return page.evaluate(() => {
+      for (const input of document.querySelectorAll('input')) {
+        const v = (input.value || input.defaultValue || '').trim();
+        if (v.length >= 30 && /^[a-zA-Z0-9]+$/.test(v)) return v;
+      }
+      const m = document.body.innerText.match(/x-rapidapi-key["'\s:]+([a-zA-Z0-9]{30,})/i);
+      return m ? m[1] : null;
+    });
+  }
+  try {
+    await page.goto('https://rapidapi.com/developer/apps', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    let appName = null;
+    try {
+      await page.waitForSelector('table tbody tr td', { timeout: 15000 });
+      appName = (await page.locator('table tbody tr td:first-child').first().textContent()).trim();
+    } catch {}
+
+    if (appName) {
+      await page.goto(`https://rapidapi.com/developer/apps/${encodeURIComponent(appName)}/security`, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      await page.waitForTimeout(4000);
+      const key = await scanPage();
+      if (key) return key;
+    }
+  } catch {}
+  return null;
 }
 
 // ─── Overview Page ────────────────────────────────────────────────────────────
@@ -605,30 +736,80 @@ async function scrapeEndpoints(page, baseUrl) {
     console.warn(`    ⚠️  Playground nav failed: ${e.message}`);
   }
 
-  // ── Step 3: Live test call ────────────────────────────────────────────────
-  // One real HTTP request to the first endpoint validates the API is live.
+  // ── Step 3: Live test call (with key rotation + auto-subscribe fallback) ────
   let testResults = '';
-  if (RAPIDAPI_KEY && testUrl && testHost) {
+  if (testUrl && testHost) {
     console.log(`      Testing: ${testUrl}`);
-    try {
+
+    // Helper: one axios GET, returns { status, body } or throws
+    async function tryCall(key) {
       const res = await axios.get(testUrl, {
-        headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': testHost },
+        headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': testHost },
         timeout: 12000,
-        validateStatus: null,  // record all statuses, don't throw
+        validateStatus: null,
       });
       const body = typeof res.data === 'object'
         ? JSON.stringify(res.data).slice(0, 400)
         : String(res.data).slice(0, 400);
-      testResults = `${res.status >= 200 && res.status < 300 ? '✅' : '❌'} HTTP ${res.status} — ${body}`;
-      console.log(`      Test: HTTP ${res.status}`);
-    } catch (e) {
-      testResults = `❌ ${e.code || 'ERR'} — ${e.message.slice(0, 120)}`;
-      console.warn(`      Test failed: ${e.message.slice(0, 80)}`);
+      return { status: res.status, body };
+    }
+
+    let result = null;
+
+    // Pass 1: try all available keys — if ANY account is subscribed, it'll work
+    for (const key of ALL_RAPIDAPI_KEYS) {
+      try {
+        const r = await tryCall(key);
+        if (r.status !== 403) { result = r; break; }
+      } catch {}
+    }
+
+    // Pass 2: all keys returned 403 → subscribe via Playwright then retry
+    if (!result) {
+      console.log(`      All keys → 403. Attempting auto-subscribe…`);
+      if (SESSION_LOGGED_IN) {
+        // Already logged in — go straight to subscribe
+        const subscribed = await subscribeViaPlaywright(page, baseUrl);
+        if (subscribed) {
+          // Retry with session key (now subscribed)
+          try { result = await tryCall(SESSION_API_KEY); } catch {}
+        }
+      } else {
+        // Try to log in first, then subscribe
+        const login = await getFirstActiveLogin();
+        if (login) {
+          try {
+            await loginToRapidAPI(page, login.email, login.password);
+            SESSION_LOGGED_IN = true;
+            // Grab the session API key
+            const keyPage = await page.context().newPage();
+            const key = await grabAPIKey(keyPage);
+            await keyPage.close().catch(() => {});
+            if (key) SESSION_API_KEY = key;
+
+            const subscribed = await subscribeViaPlaywright(page, baseUrl);
+            if (subscribed) {
+              try { result = await tryCall(SESSION_API_KEY); } catch {}
+            }
+          } catch (e) {
+            console.warn(`      Login failed: ${e.message.slice(0, 80)}`);
+          }
+        }
+      }
+    }
+
+    if (result) {
+      const emoji = result.status >= 200 && result.status < 300 ? '✅' : '❌';
+      testResults = `${emoji} HTTP ${result.status} — ${result.body}`;
+      console.log(`      Test: HTTP ${result.status}`);
+    } else {
+      testResults = `❌ HTTP 403 — not subscribed on any account`;
+      console.warn(`      All keys returned 403 and subscribe failed`);
     }
   } else {
-    testResults = RAPIDAPI_KEY
+    testResults = ALL_RAPIDAPI_KEYS.length
       ? `⚠️ No endpoint URL found from playground — test skipped`
-      : `⚠️ RAPIDAPI_KEY not set — test skipped`;
+      : `⚠️ No RAPIDAPI_KEY configured — test skipped`;
   }
 
   return {
@@ -701,6 +882,29 @@ async function main() {
     viewport: { width: 1440, height: 900 },
   });
   const page = await context.newPage();
+
+  // ── Optional: log in once so we can auto-subscribe on 403 ────────────────
+  // Reads the first Active RapidAPI login from Airtable. If found, logs in
+  // and grabs the session API key — used for all test calls this run.
+  console.log('Checking for RapidAPI login credentials…');
+  const login = await getFirstActiveLogin();
+  if (login) {
+    try {
+      await loginToRapidAPI(page, login.email, login.password);
+      SESSION_LOGGED_IN = true;
+      const keyPage = await context.newPage();
+      const key = await grabAPIKey(keyPage);
+      await keyPage.close().catch(() => {});
+      if (key) {
+        SESSION_API_KEY = key;
+        console.log(`  Session key: ${key.slice(0, 8)}… (will use for all test calls)\n`);
+      }
+    } catch (e) {
+      console.warn(`  ⚠️ Login skipped: ${e.message.slice(0, 80)} — will still try key rotation\n`);
+    }
+  } else {
+    console.log('  No RapidAPI login found — using key rotation only\n');
+  }
 
   let enriched = 0;
   let failed   = 0;
