@@ -896,9 +896,12 @@ async function createOneAccount(browser, apis) {
     console.log('\n── Phase 1c: Save Login + Credential to Airtable ────────');
     loginId = await saveLogin(email, actualPassword);
 
-    // Grab the x-rapidapi-key while we still have the authenticated browser open
+    // Grab the x-rapidapi-key while we still have the authenticated browser context.
+    // verifyPage was closed inside clickMagicLink — open a fresh page here.
     console.log('  Grabbing x-rapidapi-key from developer apps…');
-    const apiKey = await grabAPIKey(verifyPage);
+    const keyPage = await context.newPage();
+    const apiKey = await grabAPIKey(keyPage);
+    await keyPage.close().catch(() => {});
     if (apiKey) {
       if (loginId) await saveCredential(apiKey, loginId, email);
     } else {
