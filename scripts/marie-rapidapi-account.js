@@ -89,14 +89,74 @@ const DEFAULTS = { firstName: 'Ben', lastName: 'Collier', company: 'Rascals Inc'
 // is the single key we use — no rotation.
 
 const FLASH_HOST = 'flash-temp-mail.p.rapidapi.com';
-const FLASH_KEY  = process.env.FLASH_TEMP_MAIL_KEY;
 
-function flashHeaders(extra = {}) {
-  return {
-    'x-rapidapi-key':  FLASH_KEY,
-    'x-rapidapi-host': FLASH_HOST,
-    ...extra,
-  };
+// Populated at startup from Airtable Credentials (any RapidAPI API Key
+// credential) with the FLASH_TEMP_MAIL_KEY env var as fallback. Multiple
+// keys = larger daily quota since each Ben-owned RapidAPI account has its
+// own per-key rate limit. Most keys will 403 because only some accounts
+// are subscribed to flash-temp-mail, which is fine — rotation skips them.
+let FLASH_KEYS = [];
+
+function shuffledFlashKeys() {
+  return [...FLASH_KEYS].sort(() => Math.random() - 0.5);
+}
+
+// Try every flash-temp-mail key in random order. Rotate on 403 (not subscribed
+// to this API) and 429 (rate limited). Bail immediately on other errors —
+// they're not key-related.
+async function flashCall(method, path, body) {
+  if (!FLASH_KEYS.length) throw new Error('No flash-temp-mail keys available');
+  let lastErr;
+  for (const key of shuffledFlashKeys()) {
+    try {
+      const res = await axios({
+        method,
+        url:     `https://${FLASH_HOST}${path}`,
+        headers: {
+          'x-rapidapi-key':  key,
+          'x-rapidapi-host': FLASH_HOST,
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        timeout: 10000,
+        ...(body ? { data: body } : {}),
+      });
+      return res.data;
+    } catch (err) {
+      const status = err.response?.status;
+      lastErr = err;
+      if (status !== 403 && status !== 429) throw err;
+    }
+  }
+  throw lastErr || new Error('All flash-temp-mail keys failed (403/429)');
+}
+
+async function fetchFlashTempMailKeys() {
+  // Read Airtable Credentials where Credential Type = "API Key" AND the
+  // record name mentions RapidAPI. Returns the Value column as the key set.
+  const all = [];
+  let offset;
+  do {
+    const params = {
+      filterByFormula: "AND({Credential Type}='API Key', SEARCH('RapidAPI', {Name}))",
+      'fields[]':      'Value',
+      pageSize:        100,
+      ...(offset ? { offset } : {}),
+    };
+    const res = await axios.get(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}`,
+      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` }, params }
+    );
+    all.push(...(res.data.records || []));
+    offset = res.data.offset;
+  } while (offset);
+
+  const keys = all
+    .map(r => (r.fields?.Value || '').trim())
+    // RapidAPI keys are ~50 chars and contain "msh" in the middle. Skip
+    // multi-line entries (those are notes, not raw keys) and exact dupes.
+    .filter(v => v.length > 30 && !v.includes('\n') && /msh/.test(v))
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+  return keys;
 }
 
 async function createTempEmail() {
@@ -104,16 +164,10 @@ async function createTempEmail() {
     console.log(`  Using provided email: ${process.env.SIGNUP_EMAIL}`);
     return { email: process.env.SIGNUP_EMAIL };
   }
-  if (!FLASH_KEY) throw new Error('FLASH_TEMP_MAIL_KEY not set');
-
-  const res = await axios.post(
-    `https://${FLASH_HOST}/mailbox/create?free_domains=false`,
-    { not_required: 'not_required' },
-    { headers: flashHeaders({ 'Content-Type': 'application/json' }), timeout: 10000 }
-  );
-  const email = res.data?.email_address;
-  if (!email) throw new Error(`Unexpected flash-temp-mail create response: ${JSON.stringify(res.data)}`);
-  console.log(`  Flash Temp Mail address: ${email} (expires ${new Date((res.data.expires_at||0)*1000).toISOString()})`);
+  const data = await flashCall('POST', '/mailbox/create?free_domains=false', { not_required: 'not_required' });
+  const email = data?.email_address;
+  if (!email) throw new Error(`Unexpected flash-temp-mail create response: ${JSON.stringify(data)}`);
+  console.log(`  Flash Temp Mail address: ${email} (expires ${new Date((data.expires_at||0)*1000).toISOString()})`);
   return { email };
 }
 
@@ -130,11 +184,8 @@ function normaliseMessages(payload) {
 }
 
 async function fetchInboxMessages(email) {
-  const res = await axios.get(
-    `https://${FLASH_HOST}/mailbox/emails-html?email_address=${encodeURIComponent(email)}`,
-    { headers: flashHeaders(), timeout: 10000 }
-  );
-  return normaliseMessages(res.data?.emails);
+  const data = await flashCall('GET', `/mailbox/emails-html?email_address=${encodeURIComponent(email)}`);
+  return normaliseMessages(data?.emails);
 }
 
 function extractMagicLink(text) {
@@ -550,8 +601,8 @@ async function signUp(page, email, password) {
 
 async function clickMagicLink(context, emailInfo) {
   const { email } = emailInfo;
-  if (!FLASH_KEY) {
-    console.log('  FLASH_TEMP_MAIL_KEY not set — skipping magic link polling.');
+  if (!FLASH_KEYS.length) {
+    console.log('  No flash-temp-mail keys loaded — skipping magic link polling.');
     return false;
   }
 
@@ -682,39 +733,19 @@ async function postToSlack(text) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function main() {
-  console.log('='.repeat(60));
-  console.log('Marie — RapidAPI Account Creator & Subscriber');
-  console.log(`Dry run: ${DRY_RUN}`);
-  console.log('='.repeat(60));
-
-  if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
-  if (!SIGNUP_PASSWORD)  throw new Error('SIGNUP_PASSWORD not set');
-  if (!FLASH_KEY && !process.env.SIGNUP_EMAIL) {
-    throw new Error('FLASH_TEMP_MAIL_KEY must be set');
-  }
-
+// Create one RapidAPI account end-to-end: signup → verify → save → subscribe.
+// Returns { email, subscribed: [], failed: [] }. Throws on unrecoverable failure.
+async function createOneAccount(browser, apis) {
   // 1. Create a fresh private mailbox via Flash Temp Mail
   console.log('\nCreating Flash Temp Mail mailbox...');
   let emailInfo = await createTempEmail();
   const { email } = emailInfo;
 
-  // 2. Launch browser
-  const browser = await chromium.launch({
-    headless: process.env.HEADLESS !== 'false',
-    args: [
-      '--no-sandbox', '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-    ],
-  });
-
   const newContext = () => browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
 
-  // context is declared here so it's accessible in the finally block
   let context = await newContext();
-
   let loginId = null;
   const subscribed = [];
   const failed = [];
@@ -771,7 +802,6 @@ async function main() {
     // 5. Subscribe to all APIs, flushing API-to-Login links in batches of 10
     //    so that a mid-run abort leaves a usable partial record.
     console.log('\n── Phase 2: Subscribe to all APIs ───────────────────────');
-    const apis = await getAPIsToSubscribe();
     console.log(`  APIs to subscribe: ${apis.length}`);
 
     const LINK_BATCH_SIZE = 10;
@@ -824,24 +854,121 @@ async function main() {
     await flushPendingLinks();
     await apiPage.close();
 
+    // Per-account summary + Slack ping
+    console.log('\n' + '─'.repeat(60));
+    console.log(`Account: ${email}`);
+    console.log(`Subscribed: ${subscribed.length} ✅   Failed: ${failed.length} ⚠️`);
+    if (failed.length) console.log(`Failed: ${failed.join(', ')}`);
+    await postToSlack(
+      `*Marie — RapidAPI Account Created* 🤖\n` +
+      `Account: \`${email}\`\n` +
+      `Subscribed: ${subscribed.length} APIs ✅   Failed: ${failed.length} ⚠️`
+    );
+
+    return { email, subscribed, failed };
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+async function main() {
+  console.log('='.repeat(60));
+  console.log('Marie — RapidAPI Account Creator & Subscriber');
+  console.log(`Dry run: ${DRY_RUN}`);
+  console.log('='.repeat(60));
+
+  if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
+  if (!SIGNUP_PASSWORD)  throw new Error('SIGNUP_PASSWORD not set');
+
+  // Load rotation pool of flash-temp-mail keys from Airtable + the env var.
+  // The FLASH_TEMP_MAIL_KEY env value is *always* included (deduped) so the
+  // known-working key isn't lost just because Airtable hasn't been populated
+  // with it yet. Most Airtable keys will 403 (their account isn't subscribed
+  // to flash-temp-mail) — rotation skips them, which is fine.
+  console.log('\nLoading flash-temp-mail keys from Airtable...');
+  try {
+    FLASH_KEYS = await fetchFlashTempMailKeys();
+  } catch (err) {
+    console.warn(`  ⚠️ Airtable key fetch failed: ${err.message}`);
+    FLASH_KEYS = [];
+  }
+  const envKey = (process.env.FLASH_TEMP_MAIL_KEY || '').trim();
+  if (envKey && !FLASH_KEYS.includes(envKey)) FLASH_KEYS.push(envKey);
+  console.log(`  ${FLASH_KEYS.length} key(s) available for rotation (${FLASH_KEYS.length ? FLASH_KEYS.map(k => k.slice(0, 8) + '…').join(', ') : 'none'})`);
+  if (!FLASH_KEYS.length && !process.env.SIGNUP_EMAIL) {
+    throw new Error('No flash-temp-mail keys (Airtable Credentials + FLASH_TEMP_MAIL_KEY env both empty)');
+  }
+
+  // Fetch the APIs list once at startup — same list applies to every account
+  // we create in this run, no point re-querying for each.
+  const apis = await getAPIsToSubscribe();
+  console.log(`  ${apis.length} APIs flagged Subscribe via Kondo`);
+
+  // Launch browser ONCE — reused across all accounts. Each account gets its
+  // own fresh BrowserContext so cookies/fingerprint don't carry between them.
+  const browser = await chromium.launch({
+    headless: process.env.HEADLESS !== 'false',
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  });
+
+  // Outer loop: keep creating accounts until the user kills the process or
+  // we hit N consecutive failures (something's wrong, stop). MAX_ACCOUNTS
+  // hard-caps a single invocation so a runaway loop can't burn unlimited
+  // RapidAPI signups; set MAX_ACCOUNTS env to override.
+  const MAX_ACCOUNTS                = parseInt(process.env.MAX_ACCOUNTS || '50', 10);
+  const MAX_CONSECUTIVE_FAILURES    = 5;
+  const PAUSE_BETWEEN_ACCOUNTS_MS   = 30000;
+  let runIndex            = 0;
+  let consecutiveFailures = 0;
+  const totals            = { ok: 0, fail: 0, subscribed: 0, failedSubs: 0 };
+
+  try {
+    while (runIndex < MAX_ACCOUNTS) {
+      runIndex++;
+      console.log('\n' + '#'.repeat(60));
+      console.log(`# ACCOUNT ${runIndex}/${MAX_ACCOUNTS}`);
+      console.log('#'.repeat(60));
+      try {
+        const result = await createOneAccount(browser, apis);
+        totals.ok++;
+        totals.subscribed += result.subscribed.length;
+        totals.failedSubs += result.failed.length;
+        consecutiveFailures = 0;
+      } catch (err) {
+        totals.fail++;
+        consecutiveFailures++;
+        console.error(`\n❌ Account ${runIndex} failed: ${err.message}`);
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          console.error(`\nStopping outer loop — ${consecutiveFailures} consecutive failures (something's wrong upstream)`);
+          break;
+        }
+      }
+      // Brief pause between accounts — keeps RapidAPI from seeing a tight burst.
+      if (runIndex < MAX_ACCOUNTS) {
+        console.log(`\n⏸  Pausing ${PAUSE_BETWEEN_ACCOUNTS_MS / 1000}s before next account...`);
+        await new Promise(r => setTimeout(r, PAUSE_BETWEEN_ACCOUNTS_MS));
+      }
+    }
   } finally {
     await browser.close();
   }
 
-  // 7. Summary
+  // Final summary across all accounts created this run
   console.log('\n' + '='.repeat(60));
-  console.log('Summary');
+  console.log('Run Summary');
   console.log('='.repeat(60));
-  console.log(`  Account: ${email}`);
-  console.log(`  Subscribed: ${subscribed.length} ✅   Failed: ${failed.length} ⚠️`);
-  if (failed.length) console.log(`  Failed: ${failed.join(', ')}`);
-
+  console.log(`  Accounts created : ${totals.ok}`);
+  console.log(`  Accounts failed  : ${totals.fail}`);
+  console.log(`  Total subscribed : ${totals.subscribed}`);
+  console.log(`  Total failed subs: ${totals.failedSubs}`);
   await postToSlack(
-    `*Marie — RapidAPI Account Created* 🤖\n` +
-    `Account: \`${email}\`\n` +
-    `Subscribed: ${subscribed.length} APIs ✅   Failed: ${failed.length} ⚠️`
+    `*Marie — Run Complete* 🤖\n` +
+    `Accounts created: ${totals.ok}   Failed: ${totals.fail}\n` +
+    `Total subscriptions: ${totals.subscribed} ✅   Failed: ${totals.failedSubs} ⚠️`
   );
-
   console.log('\n✅ Done.');
 }
 
