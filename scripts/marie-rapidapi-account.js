@@ -1,10 +1,11 @@
 /**
  * Marie — RapidAPI Account Creator & Subscriber
  *
- * 1. Gets a fresh real Gmail address from Gmailnator (each call → a DIFFERENT base address,
- *    not a +alias — RapidAPI strips +tags so aliases can't be used for uniqueness)
+ * 1. Creates a fresh private mailbox via Flash Temp Mail (each call → a brand-new
+ *    address on a private domain, e.g. *@everythingispersonal.com — no shared
+ *    pool, no stale verification emails from prior users)
  * 2. Signs up for a new RapidAPI account (uses pressSequentially — React form safe)
- * 3. Polls the Gmailnator inbox for the verification email and clicks the magic link
+ * 3. Polls the Flash Temp Mail inbox for the verification email and clicks the magic link
  * 4. Subscribes to every API in the Airtable APIs table where {Subscribe via Kondo} is checked
  * 5. Saves Login + Credential records to Airtable as Active
  * 6. Links the new Login record to every API it subscribed to
@@ -26,7 +27,7 @@
  *   FIELD_LOGIN_STATUS       (field ID)
  *   FIELD_API_SUBSCRIBED     (field ID)
  *   SIGNUP_PASSWORD
- *   RAPIDAPI_KEYS            (comma-separated, used for Gmailnator with rotation)
+ *   FLASH_TEMP_MAIL_KEY      (single RapidAPI key subscribed to flash-temp-mail.p.rapidapi.com)
  *   SLACK_BOT_TOKEN          (optional)
  *   SLACK_CHANNEL_AI_ENGINEERING (optional)
  */
@@ -69,25 +70,33 @@ const API_FIELD = {
 
 const DEFAULTS = { firstName: 'Ben', lastName: 'Collier', company: 'Rascals Inc' };
 
-// ─── Gmailnator (real distinct Gmail addresses, not +aliases) ────────────────
-// RapidAPI strips +tags before deduping — confirmed by repeated "Username and
-// email must be unique" rejections on attempts that varied only by +tag. So
-// we need *distinct base addresses* per signup, which Gmailnator provides:
-// each call to /api/emails/generate returns a real Gmail account from their
-// pool. The 10 RAPIDAPI_KEYS are rotated for rate-limit headroom.
+// ─── Flash Temp Mail (fresh private mailboxes, not pool-shared) ──────────────
+// flash-temp-mail.p.rapidapi.com creates a brand-new mailbox per call (e.g.
+// `<random>@everythingispersonal.com`) with a private domain RapidAPI accepts.
+// Unlike Gmailnator's shared pool, these are NEW addresses — no stale
+// verification emails from previous users hijacking our magic-link click.
+//
+// Mailboxes expire after ~25 minutes. That's plenty for the signup → verify
+// sub-flow; if the script needs to retry signup we create a fresh mailbox.
 //
 // Endpoints:
-//   POST /api/emails/generate        → { email: "abc1234@gmail.com" }
-//   POST /api/inbox  { email }       → { messages: [ { id, from, subject, body, ... } ] }
-//   GET  /api/inbox/:messageId       → { content: "<full HTML>" }
+//   POST /mailbox/create?free_domains=false
+//     → { email_address: "abc@everythingispersonal.com", expires_at: <unix>, success: true }
+//   GET  /mailbox/emails-html?email_address=<addr>
+//     → { emails: { ... }, expires_at: <unix>, success: true }
+//
+// Ben subscribed only one of his RapidAPI accounts to this API, so FLASH_TEMP_MAIL_KEY
+// is the single key we use — no rotation.
 
-const GMAILNATOR_HOST = 'gmailnator.p.rapidapi.com';
+const FLASH_HOST = 'flash-temp-mail.p.rapidapi.com';
+const FLASH_KEY  = process.env.FLASH_TEMP_MAIL_KEY;
 
-const _rapidKeys = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY || '')
-  .split(',').map(k => k.trim()).filter(Boolean);
-
-function shuffledKeys() {
-  return [..._rapidKeys].sort(() => Math.random() - 0.5);
+function flashHeaders(extra = {}) {
+  return {
+    'x-rapidapi-key':  FLASH_KEY,
+    'x-rapidapi-host': FLASH_HOST,
+    ...extra,
+  };
 }
 
 async function createTempEmail() {
@@ -95,101 +104,37 @@ async function createTempEmail() {
     console.log(`  Using provided email: ${process.env.SIGNUP_EMAIL}`);
     return { email: process.env.SIGNUP_EMAIL };
   }
-  if (!_rapidKeys.length) throw new Error('RAPIDAPI_KEYS not set — needed for Gmailnator');
+  if (!FLASH_KEY) throw new Error('FLASH_TEMP_MAIL_KEY not set');
 
-  // Cap total attempts so a bad-keys day doesn't burn the whole pool.
-  // ~60-70% of Gmailnator responses are non-private types we skip, so we need
-  // headroom to find a usable address. 30 lets us survive a high-skip streak.
-  const MAX_ATTEMPTS = 30;
-  let attempts = 0;
-  const keys = shuffledKeys();
-  while (attempts < MAX_ATTEMPTS) {
-    for (const key of keys) {
-      if (attempts >= MAX_ATTEMPTS) break;
-      attempts++;
-      try {
-        const res = await axios.post(
-          `https://${GMAILNATOR_HOST}/api/emails/generate`,
-          {},
-          {
-            headers: {
-              'Content-Type':    'application/json',
-              'X-RapidAPI-Key':  key,
-              'X-RapidAPI-Host': GMAILNATOR_HOST,
-            },
-            timeout: 8000,
-          }
-        );
-        const email = res.data?.email;
-        const type  = res.data?.type;
-        // Only accept Gmailnator `private_*` types. Confirmed type distribution
-        // from probing the API: roughly 60% public_gmail_plus (+aliases,
-        // RapidAPI strips +tags so they all collapse), 10-20% public_email_domain
-        // (disposable domains RapidAPI blocks with "Something went wrong"),
-        // and 10-20% private_googlemail OR private_email_domain. The private_*
-        // pool is many DISTINCT base accounts owned by Gmailnator — each one
-        // a fresh signup for RapidAPI. private_email_domain (e.g. *@premiumnator.com)
-        // is ideal, but private_googlemail works too (each call hands out a
-        // different googlemail base account, so dot-stripping is irrelevant
-        // until that single base has been used).
-        if (!email || email.includes('+')) continue;
-        if (!type || !type.startsWith('private_')) {
-          console.log(`  Skipping ${email} (type=${type || 'unknown'}) — non-private domain`);
-          continue;
-        }
-        console.log(`  Gmailnator address: ${email} (${type})`);
-        return { email };
-      } catch (err) {
-        // 403/429 → just rotate to next key
-      }
-    }
-  }
-  throw new Error(`Gmailnator failed after ${MAX_ATTEMPTS} attempts across ${_rapidKeys.length} keys`);
+  const res = await axios.post(
+    `https://${FLASH_HOST}/mailbox/create?free_domains=false`,
+    { not_required: 'not_required' },
+    { headers: flashHeaders({ 'Content-Type': 'application/json' }), timeout: 10000 }
+  );
+  const email = res.data?.email_address;
+  if (!email) throw new Error(`Unexpected flash-temp-mail create response: ${JSON.stringify(res.data)}`);
+  console.log(`  Flash Temp Mail address: ${email} (expires ${new Date((res.data.expires_at||0)*1000).toISOString()})`);
+  return { email };
+}
+
+// Pull every plausible body field out of a single Flash Temp Mail email object.
+// The /emails-html endpoint can return either a list of objects or an object
+// keyed by id — both shapes are normalised to an array of message objects.
+function normaliseMessages(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  if (typeof payload === 'object') return Object.entries(payload).map(([k, v]) =>
+    v && typeof v === 'object' ? { id: k, ...v } : { id: k, body: String(v) }
+  );
+  return [];
 }
 
 async function fetchInboxMessages(email) {
-  for (const key of shuffledKeys()) {
-    try {
-      const res = await axios.post(
-        `https://${GMAILNATOR_HOST}/api/inbox`,
-        { email },
-        {
-          headers: {
-            'Content-Type':    'application/json',
-            'X-RapidAPI-Key':  key,
-            'X-RapidAPI-Host': GMAILNATOR_HOST,
-          },
-          timeout: 8000,
-        }
-      );
-      return res.data?.messages || [];
-    } catch (err) {
-      // try next key
-    }
-  }
-  throw new Error('All Gmailnator keys failed on /api/inbox');
-}
-
-async function fetchInboxMessageBody(messageId) {
-  for (const key of shuffledKeys()) {
-    try {
-      const res = await axios.get(
-        `https://${GMAILNATOR_HOST}/api/inbox/${encodeURIComponent(messageId)}`,
-        {
-          headers: {
-            'Accept':          'application/json',
-            'X-RapidAPI-Key':  key,
-            'X-RapidAPI-Host': GMAILNATOR_HOST,
-          },
-          timeout: 8000,
-        }
-      );
-      return res.data?.content || res.data?.body || '';
-    } catch (err) {
-      // try next key
-    }
-  }
-  return '';
+  const res = await axios.get(
+    `https://${FLASH_HOST}/mailbox/emails-html?email_address=${encodeURIComponent(email)}`,
+    { headers: flashHeaders(), timeout: 10000 }
+  );
+  return normaliseMessages(res.data?.emails);
 }
 
 function extractMagicLink(text) {
@@ -212,37 +157,56 @@ function extractMagicLink(text) {
   return null;
 }
 
-async function pollGmailnatorForMagicLink(email, timeoutMs = 360000) {
+// Search every value of a message object for a RapidAPI link — different temp-mail
+// services name the body field differently (`html`, `content`, `body`, `text`, ...).
+function findLinkInMessage(msg) {
+  if (!msg) return null;
+  for (const v of Object.values(msg)) {
+    if (typeof v === 'string') {
+      const link = extractMagicLink(v);
+      if (link) return link;
+    }
+  }
+  return null;
+}
+
+async function pollFlashMailForMagicLink(email, timeoutMs = 360000) {
   const POLL_INTERVAL = 10000;
   const start = Date.now();
-  console.log(`  Polling Gmailnator inbox for ${email}...`);
-  // Initial 10s wait so the verification email has a chance to land
-  await new Promise(r => setTimeout(r, 10000));
+  console.log(`  Polling Flash Temp Mail inbox for ${email}...`);
+  // Initial 8s wait so the verification email has a chance to land
+  await new Promise(r => setTimeout(r, 8000));
 
+  let firstDump = true;
   while (Date.now() - start < timeoutMs) {
     try {
       const messages = await fetchInboxMessages(email);
-      for (const msg of messages) {
-        const inlineBody = msg.body || msg.content || msg.text || '';
-        let link = extractMagicLink(inlineBody);
-        if (!link) {
-          const id = msg.id || msg.message_id;
-          if (id) {
-            const fullBody = await fetchInboxMessageBody(id);
-            link = extractMagicLink(fullBody);
+      if (messages.length && firstDump) {
+        // One-shot debug dump of the message shape — helps if the body
+        // field name ever changes. Logged at INFO so we see it once per run.
+        const sample = { ...messages[0] };
+        for (const k of Object.keys(sample)) {
+          if (typeof sample[k] === 'string' && sample[k].length > 200) {
+            sample[k] = sample[k].slice(0, 200) + '...';
           }
         }
+        console.log(`  First message keys: ${Object.keys(messages[0]).join(', ')}`);
+        firstDump = false;
+      }
+      for (const msg of messages) {
+        const link = findLinkInMessage(msg);
         if (link) {
-          console.log(`  Magic link found (subject: "${msg.subject || '?'}")`);
+          console.log(`  Magic link found (subject: "${msg.subject || msg.Subject || '?'}")`);
           return link;
         }
-        if (msg.subject) console.log(`  Email in inbox but no RapidAPI link (subject: "${msg.subject}")`);
+        const subj = msg.subject || msg.Subject;
+        if (subj) console.log(`  Email in inbox but no RapidAPI link (subject: "${subj}")`);
       }
       if (!messages.length) {
         console.log(`  Inbox empty — waiting... (${Math.round((Date.now() - start) / 1000)}s)`);
       }
     } catch (err) {
-      console.warn(`  Gmailnator poll error: ${err.message}`);
+      console.warn(`  Flash Temp Mail poll error: ${err.response?.status || ''} ${err.message}`);
     }
     await new Promise(r => setTimeout(r, POLL_INTERVAL));
   }
@@ -395,10 +359,11 @@ async function signUp(page, email, password) {
   //
   // Password requirements: 8+ chars, upper+lower, digit, special char (@;!$.)
 
-  // Gmailnator returns real distinct base addresses (no +aliases), so we pass
-  // them straight through to RapidAPI. (Previously we tried Gmail +aliasing,
-  // but confirmed via repeated rejections that RapidAPI strips +tags before
-  // dedup, so aliases of one base address all collide.)
+  // Flash Temp Mail returns a brand-new mailbox per call, so we pass it
+  // straight through to RapidAPI. (Earlier we tried Gmail + addressing, then
+  // Gmailnator's shared Gmail pool — both failed because RapidAPI strips
+  // +tags and dots before dedup, and Gmailnator's recycled inboxes carried
+  // stale verify emails that hijacked the magic-link click.)
   const signupEmail = email;
 
   // Ensure password has a special character
@@ -552,13 +517,13 @@ async function signUp(page, email, password) {
 
 async function clickMagicLink(context, emailInfo) {
   const { email } = emailInfo;
-  if (!_rapidKeys.length) {
-    console.log('  RAPIDAPI_KEYS not set — skipping magic link polling.');
+  if (!FLASH_KEY) {
+    console.log('  FLASH_TEMP_MAIL_KEY not set — skipping magic link polling.');
     return false;
   }
 
-  console.log(`  Polling Gmailnator for magic link (up to 6 min)...`);
-  const link = await pollGmailnatorForMagicLink(email, 360000);
+  console.log(`  Polling Flash Temp Mail for magic link (up to 6 min)...`);
+  const link = await pollFlashMailForMagicLink(email, 360000);
   if (!link) {
     console.warn('  ⚠️ No magic link arrived within the timeout.');
     return false;
@@ -675,12 +640,12 @@ async function main() {
 
   if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
   if (!SIGNUP_PASSWORD)  throw new Error('SIGNUP_PASSWORD not set');
-  if (!_rapidKeys.length && !process.env.SIGNUP_EMAIL) {
-    throw new Error('RAPIDAPI_KEYS (or RAPIDAPI_KEY) must be set for Gmailnator');
+  if (!FLASH_KEY && !process.env.SIGNUP_EMAIL) {
+    throw new Error('FLASH_TEMP_MAIL_KEY must be set');
   }
 
-  // 1. Get a fresh real Gmail address from Gmailnator (each is a distinct base address)
-  console.log('\nGenerating Gmailnator address...');
+  // 1. Create a fresh private mailbox via Flash Temp Mail
+  console.log('\nCreating Flash Temp Mail mailbox...');
   let emailInfo = await createTempEmail();
   const { email } = emailInfo;
 
@@ -724,7 +689,7 @@ async function main() {
           //   - "Something went wrong"              → disposable-domain block, or transient
           //   - any other page error                → treat as retriable
           // Either way the recovery is the same: new browser context (no cookies),
-          // new Gmailnator address. Only the final attempt rethrows.
+          // new Flash Temp Mail mailbox. Only the final attempt rethrows.
           const reason = err.emailTaken ? 'email/username taken' : (err.message || 'unknown error').slice(0, 80);
           console.warn(`  Signup attempt ${attempt} failed — ${reason}. Fresh context + new address (attempt ${attempt + 1}/20)...`);
           await context.close();
