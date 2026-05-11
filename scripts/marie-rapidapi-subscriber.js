@@ -23,6 +23,9 @@
  *   SLACK_BOT_TOKEN, SLACK_CHANNEL_AI_ENGINEERING  (optional — for summary)
  */
 
+// Auto-load .env for local runs; no-op on GitHub Actions.
+try { require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }); } catch {}
+
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
@@ -234,8 +237,10 @@ async function subscribeToAPI(page, link, name) {
     '[class*="CurrentPlan"], [class*="current-plan"], [class*="currentPlan"], ' +
     'button:has-text("Current Plan"), span:has-text("Current Plan"), ' +
     'button:has-text("Manage My Plan"), button:has-text("Manage Plan"), ' +
+    // "Cancel Plan" and "Upgrade Plan" appear when the account already has an active subscription
+    'button:has-text("Cancel Plan"), button:has-text("Upgrade Plan"), ' +
     '[class*="active"][class*="plan"], [class*="plan"][class*="selected"], ' +
-    'text=/current plan|already subscribed|you.re subscribed|manage my plan|manage plan/i'
+    'text=/current plan|already subscribed|you.re subscribed|manage my plan|manage plan|cancel plan/i'
   ).first().isVisible().catch(() => false);
   if (alreadySub) {
     console.log(`  ✅ Already subscribed to ${name}`);

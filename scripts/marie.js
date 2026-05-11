@@ -32,6 +32,9 @@ const axios = require('axios');
 const fs = require('fs');
 const crypto = require('crypto');
 
+// Auto-load .env for local runs; no-op on GitHub Actions.
+try { require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }); } catch {}
+
 // ─── Global Config ────────────────────────────────────────────────────────────
 
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;

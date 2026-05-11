@@ -19,6 +19,9 @@ const { chromium } = require('playwright');
 const axios = require('axios');
 const crypto = require('crypto');
 
+// Auto-load .env for local runs; no-op on GitHub Actions.
+try { require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }); } catch {}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const AIRTABLE_API_KEY  = process.env.AIRTABLE_API_KEY;
@@ -29,6 +32,9 @@ const AIRTABLE_CREDS    = 'tblvBr6RIc7bcGXYJ';   // Credentials
 const AIRTABLE_APIS     = 'tblMb9HFyKcnQ7aKb';   // APIs
 
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;
+// Flash Temp Mail requires a key subscribed to flash-temp-mail.p.rapidapi.com.
+// Falls back to RAPIDAPI_KEY so GHA works if only one key var is set.
+const FLASH_TEMP_MAIL_KEY = process.env.FLASH_TEMP_MAIL_KEY || RAPIDAPI_KEY;
 const TEMPGMAIL_HOST    = 'temp-gmail.p.rapidapi.com';
 const TEMPGMAIL_PASS    = 'abc123'; // password for the temp Gmail alias — must be consistent per session
 
@@ -185,7 +191,7 @@ async function createFlashMailbox() {
       {
         params: { free_domains: false },
         headers: {
-          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-key': FLASH_TEMP_MAIL_KEY,
           'x-rapidapi-host': FLASHMAIL_HOST,
           'Content-Type': 'application/json',
         },
@@ -219,7 +225,7 @@ async function pollFlashInbox(email, timeoutMs = 600000) {
       const res = await axios.get('https://flash-temp-mail.p.rapidapi.com/mailbox/emails-html', {
         params: { email_address: email },
         headers: {
-          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-key': FLASH_TEMP_MAIL_KEY,
           'x-rapidapi-host': FLASHMAIL_HOST,
           'Content-Type': 'application/json',
         },
@@ -273,7 +279,7 @@ async function pollFlashInboxSince(email, sinceUnixTs, timeoutMs = 120000) {
       const res = await axios.get('https://flash-temp-mail.p.rapidapi.com/mailbox/emails-html', {
         params: { email_address: email },
         headers: {
-          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-key': FLASH_TEMP_MAIL_KEY,
           'x-rapidapi-host': FLASHMAIL_HOST,
           'Content-Type': 'application/json',
         },
