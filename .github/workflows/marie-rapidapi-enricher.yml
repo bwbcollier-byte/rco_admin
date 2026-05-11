@@ -1,0 +1,64 @@
+name: Kondo — RapidAPI Enricher
+
+on:
+  # Run every Tuesday at 9am AEST (11pm UTC Monday) — after the subscriber run
+  schedule:
+    - cron: '0 23 * * 1'
+
+  # Trigger manually any time you want a fresh scrape pass
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Scrape but take no action (true/false)'
+        required: false
+        default: 'false'
+      max_per_run:
+        description: 'Max APIs to process this run (default 50)'
+        required: false
+        default: '50'
+      rescrape_days:
+        description: 'Re-scrape APIs last enriched more than N days ago (default 7)'
+        required: false
+        default: '7'
+
+jobs:
+  enrich:
+    name: Marie — RapidAPI Enricher
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install playwright playwright-extra puppeteer-extra-plugin-stealth axios
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      - name: Run RapidAPI Enricher
+        env:
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ vars.AIRTABLE_BASE_ID }}
+          AIRTABLE_APIS:    ${{ vars.AIRTABLE_APIS }}
+          SLACK_BOT_TOKEN:  ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
+          DRY_RUN:          ${{ github.event.inputs.dry_run || 'false' }}
+          MAX_PER_RUN:      ${{ github.event.inputs.max_per_run || vars.ENRICH_MAX_PER_RUN || '50' }}
+          RESCRAPE_DAYS:    ${{ github.event.inputs.rescrape_days || vars.ENRICH_RESCRAPE_DAYS || '7' }}
+        run: node scripts/marie-rapidapi-enricher.js
+
+      - name: Upload debug screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rapidapi-enricher-screenshots
+          path: /tmp/rapidapi-enrich-*.png
+          retention-days: 7
+          overwrite: true
