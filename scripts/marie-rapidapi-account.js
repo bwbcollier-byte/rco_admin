@@ -140,19 +140,34 @@ async function fetchInboxMessages(email) {
 function extractMagicLink(text) {
   if (!text) return null;
   const cleaned = text.replace(/=\r?\n/g, '').replace(/=3D/gi, '=');
-  // RapidAPI verification emails go through a SendGrid-style click tracker on
-  // a `urlNNNN.rapidapi.com/ls/click` subdomain. The bare `rapidapi.com/...`
-  // is just static assets (logos) and the unsubscribe link. We want the FIRST
-  // `/ls/click` URL — it follows the "Verify Email" CTA. Fall back to bare
-  // rapidapi.com verify/confirm paths if the email format changes.
-  const patterns = [
-    /https?:\/\/url\d+\.rapidapi\.com\/ls\/click\?[^\s"'<>\n\r]+/gi,
-    /https?:\/\/[a-z0-9.-]*rapidapi\.com\/[^\s"'<>\n\r]*(?:confirm|verify|magic|activate)[^\s"'<>\n\r]*/gi,
-    /https?:\/\/rapidapi\.com\/auth\/[^\s"'<>\n\r]+/gi,
-  ];
-  for (const re of patterns) {
-    const match = cleaned.match(re);
-    if (match) return match[0];
+
+  // The verify email has 3 `/ls/click` URLs:
+  //   1. Header logo (→ rapidapi.com homepage — NOT verification)
+  //   2. "Verify Email" CTA button (→ /auth/confirm-email — what we want)
+  //   3. Footer link (→ rapidapi.com homepage)
+  // Picking the first match silently clicks the logo and we end up on the
+  // public homepage thinking we're verified. So: parse <a> tags, look at
+  // each anchor's TEXT content, and prefer the one labelled Verify/Confirm.
+  const anchors = [...cleaned.matchAll(/<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
+  const candidates = anchors
+    .map(m => ({ href: m[1], text: m[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() }))
+    .filter(a => /^https?:\/\/(?:[a-z0-9.-]*\.)?rapidapi\.com\//i.test(a.href));
+
+  // Strong match: anchor text says "verify" / "confirm" / "activate"
+  const verifyAnchor = candidates.find(a => /verify|confirm|activate/i.test(a.text));
+  if (verifyAnchor) return verifyAnchor.href;
+
+  // Fallback: an anchor whose href contains a verify/confirm path segment
+  const verifyHref = candidates.find(a => /(?:confirm|verify|magic|activate)/i.test(a.href));
+  if (verifyHref) return verifyHref.href;
+
+  // Last resort: first /ls/click URL (legacy behaviour — kept for safety,
+  // but will pick the header logo on RapidAPI's current template). Logged
+  // so we notice when we're relying on the brittle path.
+  const looseMatch = cleaned.match(/https?:\/\/url\d+\.rapidapi\.com\/ls\/click\?[^\s"'<>\n\r]+/i);
+  if (looseMatch) {
+    console.warn('  ⚠️ extractMagicLink falling back to first /ls/click URL (no anchor with Verify text found)');
+    return looseMatch[0];
   }
   return null;
 }
@@ -532,17 +547,34 @@ async function clickMagicLink(context, emailInfo) {
   console.log(`  Magic link: ${link.slice(0, 80)}...`);
   const verifyPage = await context.newPage();
   await verifyPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // SendGrid `/ls/click` URLs do a JS redirect after a brief delay; wait long
+  // enough for that to settle before checking final state.
   await verifyPage.waitForTimeout(8000);
   const landedUrl = verifyPage.url();
   console.log(`  After magic link: ${landedUrl}`);
   await verifyPage.screenshot({ path: '/tmp/rapidapi-after-verify.png' }).catch(() => {});
+
+  // Don't trust the URL alone — RapidAPI's public homepage is /, which used
+  // to pass the `!landedUrl.includes('/auth/')` check even though the user
+  // is logged out. Probe a real authenticated page and confirm we don't get
+  // bounced to login. The dashboard or /developer/account both require auth.
+  await verifyPage.goto('https://rapidapi.com/developer/dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  await verifyPage.waitForTimeout(3000);
+  const dashboardUrl = verifyPage.url();
+  await verifyPage.screenshot({ path: '/tmp/rapidapi-dashboard-check.png' }).catch(() => {});
   await verifyPage.close();
 
-  if (!landedUrl.includes('/auth/')) {
-    console.log('  ✅ Email verified — session active');
+  // If we got bounced to /auth/login or /auth/sign-in, the magic link didn't
+  // actually authenticate us. Treat as verification failure.
+  if (/\/auth\/(?:login|sign-in|sign-up)/i.test(dashboardUrl)) {
+    console.warn(`  ⚠️ Magic link did not authenticate — dashboard bounced to ${dashboardUrl}`);
+    return false;
+  }
+  if (dashboardUrl.includes('/developer/')) {
+    console.log(`  ✅ Email verified — session active (dashboard: ${dashboardUrl})`);
     return true;
   }
-  console.warn('  ⚠️ Magic link redirected back to auth page');
+  console.warn(`  ⚠️ Unexpected post-verify URL: ${dashboardUrl} (treating as not verified)`);
   return false;
 }
 
@@ -705,7 +737,10 @@ async function main() {
 
     // 3b. Click magic link from verification email
     console.log('\n── Phase 1b: Verify email via magic link ─────────────────');
-    await clickMagicLink(context, emailInfo);
+    const verified = await clickMagicLink(context, emailInfo);
+    if (!verified) {
+      throw new Error('Email verification failed — bailing before subscriptions to avoid creating a half-broken account record');
+    }
 
     // 4. Subscribe to all APIs
     console.log('\n── Phase 2: Subscribe to all APIs ───────────────────────');
