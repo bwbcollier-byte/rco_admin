@@ -747,13 +747,17 @@ async function main() {
     const apis = await getAPIsToSubscribe();
     console.log(`  APIs to subscribe: ${apis.length}`);
 
+    // Reuse one page across all subscriptions. The auth context (cookies) is on
+    // `context` so it persists either way, but reusing the page avoids ~1-2s
+    // of tab-creation overhead per iteration (~2 min total for 100 APIs).
+    // If a page error breaks the tab state, we close + reopen and continue.
+    let apiPage = await context.newPage();
     for (const api of apis) {
       const name = api.fields['Name'] || api.id;
       const link = api.fields['Link'];
       if (!link) { failed.push(name); continue; }
 
       console.log(`\n  API: ${name}`);
-      const apiPage = await context.newPage();
       try {
         const ok = await subscribeToAPI(apiPage, link, name);
         if (ok) subscribed.push({ name, recordId: api.id });
@@ -761,10 +765,14 @@ async function main() {
       } catch (err) {
         console.warn(`    ❌ ${name}: ${err.message}`);
         failed.push(name);
+        // If the page is in a broken state (closed, crashed, etc), spin up a new one
+        if (apiPage.isClosed()) {
+          apiPage = await context.newPage();
+        }
       }
-      await apiPage.close();
       await new Promise(r => setTimeout(r, 1000));
     }
+    await apiPage.close();
 
     // 5. Save to Airtable
     console.log('\n── Phase 3: Save to Airtable ────────────────────────────');
