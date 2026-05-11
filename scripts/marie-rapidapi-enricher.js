@@ -103,8 +103,9 @@ async function getAllRapidAPIAPIs() {
   do {
     const params = {
       returnFieldsByFieldId: true,
-      filterByFormula: `AND(SEARCH("rapidapi.com", {${F.link}}), {${F.status}}="Discovered")`,
-      fields: [F.name, F.link, F.lastScraped, F.dateFound, F.decision],
+      // Discovered = needs first enrichment. Error = previous run failed (retry).
+      filterByFormula: `AND(SEARCH("rapidapi.com", {${F.link}}), OR({${F.status}}="Discovered", {${F.status}}="Error"))`,
+      fields: [F.name, F.link, F.lastScraped, F.dateFound, F.decision, F.status],
       pageSize: 100,
     };
     if (offset) params.offset = offset;
@@ -122,6 +123,7 @@ async function getAllRapidAPIAPIs() {
         lastScraped: r.fields[F.lastScraped] || null,
         dateFound:   r.fields[F.dateFound]   || null,
         decision:    r.fields[F.decision]    || null,
+        status:      r.fields[F.status]      || null,
       });
     }
     offset = res.data.offset || null;
@@ -827,7 +829,18 @@ async function scrapeEndpoints(page, baseUrl, apiRecordId = null) {
     const ok = await ensureSubscribed();
     if (!ok) return null;
 
-    try { return await tryCall(SESSION_API_KEY, testUrl, testHost); } catch {}
+    // After subscribing, rotate all keys again — one of them belongs to the
+    // account that just subscribed. SESSION_API_KEY may not be correct if
+    // grabAPIKey failed at startup, so brute-force through all keys.
+    for (const key of [SESSION_API_KEY, ...ALL_RAPIDAPI_KEYS]) {
+      try {
+        const r = await tryCall(key, testUrl, testHost);
+        if (r.status !== 403) {
+          SESSION_API_KEY = key;  // lock in the working key for future calls
+          return r;
+        }
+      } catch {}
+    }
     return null;
   }
 
@@ -946,7 +959,8 @@ async function main() {
   const toProcess = apis
     .filter(api => {
       if (!api.link) return false;
-      if (FORCE) return true;   // FORCE=true bypasses the date check entirely
+      if (FORCE) return true;              // FORCE=true bypasses all date checks
+      if (api.status === 'Error') return true;  // always retry failed records
       return !api.lastScraped || new Date(api.lastScraped) < cutoff;
     })
     .slice(0, MAX_PER_RUN);
