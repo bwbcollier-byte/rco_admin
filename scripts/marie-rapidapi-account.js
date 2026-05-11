@@ -186,11 +186,16 @@ function findLinkInMessage(msg) {
 }
 
 async function pollFlashMailForMagicLink(email, timeoutMs = 360000) {
-  const POLL_INTERVAL = 10000;
+  // Verification emails empirically take ~30s–2min to arrive. Each poll is
+  // one flash-temp-mail API credit, so polling aggressively from t=0 just
+  // burns credits while the inbox is guaranteed empty. Wait a full minute
+  // first, then poll every 15s. ~1+(360-60)/15 = 21 polls max vs ~36 before.
+  const INITIAL_WAIT  = 60000;
+  const POLL_INTERVAL = 15000;
   const start = Date.now();
   console.log(`  Polling Flash Temp Mail inbox for ${email}...`);
-  // Initial 8s wait so the verification email has a chance to land
-  await new Promise(r => setTimeout(r, 8000));
+  console.log(`  Waiting ${INITIAL_WAIT / 1000}s before first poll (emails take 30s+ to arrive; saves API credits)`);
+  await new Promise(r => setTimeout(r, INITIAL_WAIT));
 
   let firstDump = true;
   while (Date.now() - start < timeoutMs) {
@@ -742,10 +747,35 @@ async function main() {
       throw new Error('Email verification failed — bailing before subscriptions to avoid creating a half-broken account record');
     }
 
-    // 4. Subscribe to all APIs
+    // 4. Save Login + Credential to Airtable NOW that the account is verified.
+    //    Phase 2 (100 API subscriptions) takes 10+ minutes — if the script
+    //    gets killed mid-loop we still want the credentials persisted so we
+    //    can log into the account by hand.
+    console.log('\n── Phase 1c: Save Login + Credential to Airtable ────────');
+    loginId = await saveLogin(email, actualPassword);
+    if (loginId) await saveCredential(email, actualPassword, loginId);
+
+    // 5. Subscribe to all APIs, flushing API-to-Login links in batches of 10
+    //    so that a mid-run abort leaves a usable partial record.
     console.log('\n── Phase 2: Subscribe to all APIs ───────────────────────');
     const apis = await getAPIsToSubscribe();
     console.log(`  APIs to subscribe: ${apis.length}`);
+
+    const LINK_BATCH_SIZE = 10;
+    let pendingLinks = [];
+    async function flushPendingLinks() {
+      if (!pendingLinks.length || !loginId) return;
+      const batch = pendingLinks;
+      pendingLinks = [];
+      console.log(`  Linking ${batch.length} subscribed API(s) to login...`);
+      for (const api of batch) {
+        try {
+          await markAPISubscribed(api.recordId, loginId);
+        } catch (err) {
+          console.warn(`  ⚠️ Could not link ${api.name}: ${err.message}`);
+        }
+      }
+    }
 
     // Reuse one page across all subscriptions. The auth context (cookies) is on
     // `context` so it persists either way, but reusing the page avoids ~1-2s
@@ -760,8 +790,13 @@ async function main() {
       console.log(`\n  API: ${name}`);
       try {
         const ok = await subscribeToAPI(apiPage, link, name);
-        if (ok) subscribed.push({ name, recordId: api.id });
-        else    failed.push(name);
+        if (ok) {
+          subscribed.push({ name, recordId: api.id });
+          pendingLinks.push({ name, recordId: api.id });
+          if (pendingLinks.length >= LINK_BATCH_SIZE) await flushPendingLinks();
+        } else {
+          failed.push(name);
+        }
       } catch (err) {
         console.warn(`    ❌ ${name}: ${err.message}`);
         failed.push(name);
@@ -772,22 +807,9 @@ async function main() {
       }
       await new Promise(r => setTimeout(r, 1000));
     }
+    // Final flush — anything left in the partial last batch
+    await flushPendingLinks();
     await apiPage.close();
-
-    // 5. Save to Airtable
-    console.log('\n── Phase 3: Save to Airtable ────────────────────────────');
-    loginId = await saveLogin(email, actualPassword);
-    if (loginId) await saveCredential(email, actualPassword, loginId);
-
-    // 6. Mark subscribed APIs + link login
-    console.log(`\n  Linking ${subscribed.length} subscribed API(s) to login...`);
-    for (const api of subscribed) {
-      try {
-        await markAPISubscribed(api.recordId, loginId);
-      } catch (err) {
-        console.warn(`  ⚠️ Could not update API record ${api.name}: ${err.message}`);
-      }
-    }
 
   } finally {
     await browser.close();
