@@ -236,14 +236,27 @@ async function pollFlashMailForMagicLink(email, timeoutMs = 360000) {
 // ─── Airtable ─────────────────────────────────────────────────────────────────
 
 async function getAPIsToSubscribe() {
-  const res = await axios.get(
-    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}`,
-    {
-      params: { filterByFormula: `{Subscribe via Kondo}`, fields: ['Name', 'Link'] },
-      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
-    }
-  );
-  return res.data.records || [];
+  // Airtable returns 100 records per page by default; paginate via `offset`
+  // tokens until exhausted so we pick up every API flagged Subscribe via Kondo.
+  const all = [];
+  let offset;
+  do {
+    const res = await axios.get(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}`,
+      {
+        params: {
+          filterByFormula: `{Subscribe via Kondo}`,
+          fields: ['Name', 'Link'],
+          pageSize: 100,
+          ...(offset ? { offset } : {}),
+        },
+        headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+      }
+    );
+    all.push(...(res.data.records || []));
+    offset = res.data.offset;
+  } while (offset);
+  return all;
 }
 
 async function saveLogin(email, password) {
