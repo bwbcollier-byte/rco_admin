@@ -1,9 +1,10 @@
 /**
  * Marie — RapidAPI Account Creator & Subscriber
  *
- * 1. Creates a fresh temp Gmail alias (via temp-gmail RapidAPI)
+ * 1. Gets a fresh real Gmail address from Gmailnator (each call → a DIFFERENT base address,
+ *    not a +alias — RapidAPI strips +tags so aliases can't be used for uniqueness)
  * 2. Signs up for a new RapidAPI account (uses pressSequentially — React form safe)
- * 3. Verifies the session is active (URL-based check)
+ * 3. Polls the Gmailnator inbox for the verification email and clicks the magic link
  * 4. Subscribes to every API in the Airtable APIs table where {Subscribe via Kondo} is checked
  * 5. Saves Login + Credential records to Airtable as Active
  * 6. Links the new Login record to every API it subscribed to
@@ -24,11 +25,14 @@
  *   FIELD_LOGIN_PASSWORD     (field ID)
  *   FIELD_LOGIN_STATUS       (field ID)
  *   FIELD_API_SUBSCRIBED     (field ID)
- *   RAPIDAPI_KEY             (used for temp Gmail API)
  *   SIGNUP_PASSWORD
+ *   RAPIDAPI_KEYS            (comma-separated, used for Gmailnator with rotation)
  *   SLACK_BOT_TOKEN          (optional)
  *   SLACK_CHANNEL_AI_ENGINEERING (optional)
  */
+
+// Auto-load .env when running locally. No-op on GitHub Actions (no .env present).
+try { require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }); } catch {}
 
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -43,7 +47,6 @@ const AIRTABLE_LOGINS  = process.env.AIRTABLE_LOGINS;
 const AIRTABLE_CREDS   = process.env.AIRTABLE_CREDS;
 const AIRTABLE_APIS    = process.env.AIRTABLE_APIS;
 
-const RAPIDAPI_KEY     = process.env.RAPIDAPI_KEY;
 const SIGNUP_PASSWORD  = process.env.SIGNUP_PASSWORD;
 const DRY_RUN          = process.env.DRY_RUN === 'true';
 
@@ -64,28 +67,182 @@ const API_FIELD = {
   subscribedAccounts: 'Subscribed Accounts',  // linked record field — use name
 };
 
-// Temp Gmail settings
-const TEMPGMAIL_HOST = 'temp-gmail.p.rapidapi.com';
-const TEMPGMAIL_PASS = 'abc123';
-
 const DEFAULTS = { firstName: 'Ben', lastName: 'Collier', company: 'Rascals Inc' };
 
-// ─── Temp Gmail ───────────────────────────────────────────────────────────────
+// ─── Gmailnator (real distinct Gmail addresses, not +aliases) ────────────────
+// RapidAPI strips +tags before deduping — confirmed by repeated "Username and
+// email must be unique" rejections on attempts that varied only by +tag. So
+// we need *distinct base addresses* per signup, which Gmailnator provides:
+// each call to /api/emails/generate returns a real Gmail account from their
+// pool. The 10 RAPIDAPI_KEYS are rotated for rate-limit headroom.
+//
+// Endpoints:
+//   POST /api/emails/generate        → { email: "abc1234@gmail.com" }
+//   POST /api/inbox  { email }       → { messages: [ { id, from, subject, body, ... } ] }
+//   GET  /api/inbox/:messageId       → { content: "<full HTML>" }
 
-async function getGmailAddress() {
-  // Allow overriding for local debugging — skip the temp-gmail API call
+const GMAILNATOR_HOST = 'gmailnator.p.rapidapi.com';
+
+const _rapidKeys = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY || '')
+  .split(',').map(k => k.trim()).filter(Boolean);
+
+function shuffledKeys() {
+  return [..._rapidKeys].sort(() => Math.random() - 0.5);
+}
+
+async function createTempEmail() {
   if (process.env.SIGNUP_EMAIL) {
     console.log(`  Using provided email: ${process.env.SIGNUP_EMAIL}`);
-    return process.env.SIGNUP_EMAIL;
+    return { email: process.env.SIGNUP_EMAIL };
   }
-  const res = await axios.get('https://temp-gmail.p.rapidapi.com/random', {
-    params: { type: 'alias', password: TEMPGMAIL_PASS },
-    headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPGMAIL_HOST },
-  });
-  const email = res.data.email || res.data.gmail || res.data.address;
-  if (!email) throw new Error(`Unexpected temp Gmail response: ${JSON.stringify(res.data)}`);
-  console.log(`  Temp Gmail address: ${email}`);
-  return email;
+  if (!_rapidKeys.length) throw new Error('RAPIDAPI_KEYS not set — needed for Gmailnator');
+
+  // Cap total attempts so a bad-keys day doesn't burn the whole pool
+  const MAX_ATTEMPTS = 10;
+  let attempts = 0;
+  const keys = shuffledKeys();
+  while (attempts < MAX_ATTEMPTS) {
+    for (const key of keys) {
+      if (attempts >= MAX_ATTEMPTS) break;
+      attempts++;
+      try {
+        const res = await axios.post(
+          `https://${GMAILNATOR_HOST}/api/emails/generate`,
+          {},
+          {
+            headers: {
+              'Content-Type':    'application/json',
+              'X-RapidAPI-Key':  key,
+              'X-RapidAPI-Host': GMAILNATOR_HOST,
+            },
+            timeout: 8000,
+          }
+        );
+        const email = res.data?.email;
+        const type  = res.data?.type;
+        // Accept Gmailnator's `private_*` types (e.g. *@premiumnator.com,
+        // googlemail.com aliases owned by the service). These deliver mail
+        // back to us and present as distinct base addresses to RapidAPI.
+        // Reject:
+        //   - +aliases (RapidAPI strips +tags before dedup)
+        //   - public_gmail_dot / @gmail.com (dot-trick variants of one Gmail —
+        //     RapidAPI strips dots, all variants collapse to one base. This is
+        //     the exhausted pool that blocked the prior integration.)
+        if (!email || email.includes('+')) continue;
+        if (type === 'public_gmail_dot' || email.endsWith('@gmail.com')) {
+          console.log(`  Skipping ${email} (type=${type}) — dot-trick pool`);
+          continue;
+        }
+        console.log(`  Gmailnator address: ${email} (${type || 'unknown'})`);
+        return { email };
+      } catch (err) {
+        // 403/429 → just rotate to next key
+      }
+    }
+  }
+  throw new Error(`Gmailnator failed after ${MAX_ATTEMPTS} attempts across ${_rapidKeys.length} keys`);
+}
+
+async function fetchInboxMessages(email) {
+  for (const key of shuffledKeys()) {
+    try {
+      const res = await axios.post(
+        `https://${GMAILNATOR_HOST}/api/inbox`,
+        { email },
+        {
+          headers: {
+            'Content-Type':    'application/json',
+            'X-RapidAPI-Key':  key,
+            'X-RapidAPI-Host': GMAILNATOR_HOST,
+          },
+          timeout: 8000,
+        }
+      );
+      return res.data?.messages || [];
+    } catch (err) {
+      // try next key
+    }
+  }
+  throw new Error('All Gmailnator keys failed on /api/inbox');
+}
+
+async function fetchInboxMessageBody(messageId) {
+  for (const key of shuffledKeys()) {
+    try {
+      const res = await axios.get(
+        `https://${GMAILNATOR_HOST}/api/inbox/${encodeURIComponent(messageId)}`,
+        {
+          headers: {
+            'Accept':          'application/json',
+            'X-RapidAPI-Key':  key,
+            'X-RapidAPI-Host': GMAILNATOR_HOST,
+          },
+          timeout: 8000,
+        }
+      );
+      return res.data?.content || res.data?.body || '';
+    } catch (err) {
+      // try next key
+    }
+  }
+  return '';
+}
+
+function extractMagicLink(text) {
+  if (!text) return null;
+  const cleaned = text.replace(/=\r?\n/g, '').replace(/=3D/gi, '=');
+  // RapidAPI verification emails go through a SendGrid-style click tracker on
+  // a `urlNNNN.rapidapi.com/ls/click` subdomain. The bare `rapidapi.com/...`
+  // is just static assets (logos) and the unsubscribe link. We want the FIRST
+  // `/ls/click` URL — it follows the "Verify Email" CTA. Fall back to bare
+  // rapidapi.com verify/confirm paths if the email format changes.
+  const patterns = [
+    /https?:\/\/url\d+\.rapidapi\.com\/ls\/click\?[^\s"'<>\n\r]+/gi,
+    /https?:\/\/[a-z0-9.-]*rapidapi\.com\/[^\s"'<>\n\r]*(?:confirm|verify|magic|activate)[^\s"'<>\n\r]*/gi,
+    /https?:\/\/rapidapi\.com\/auth\/[^\s"'<>\n\r]+/gi,
+  ];
+  for (const re of patterns) {
+    const match = cleaned.match(re);
+    if (match) return match[0];
+  }
+  return null;
+}
+
+async function pollGmailnatorForMagicLink(email, timeoutMs = 360000) {
+  const POLL_INTERVAL = 10000;
+  const start = Date.now();
+  console.log(`  Polling Gmailnator inbox for ${email}...`);
+  // Initial 10s wait so the verification email has a chance to land
+  await new Promise(r => setTimeout(r, 10000));
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const messages = await fetchInboxMessages(email);
+      for (const msg of messages) {
+        const inlineBody = msg.body || msg.content || msg.text || '';
+        let link = extractMagicLink(inlineBody);
+        if (!link) {
+          const id = msg.id || msg.message_id;
+          if (id) {
+            const fullBody = await fetchInboxMessageBody(id);
+            link = extractMagicLink(fullBody);
+          }
+        }
+        if (link) {
+          console.log(`  Magic link found (subject: "${msg.subject || '?'}")`);
+          return link;
+        }
+        if (msg.subject) console.log(`  Email in inbox but no RapidAPI link (subject: "${msg.subject}")`);
+      }
+      if (!messages.length) {
+        console.log(`  Inbox empty — waiting... (${Math.round((Date.now() - start) / 1000)}s)`);
+      }
+    } catch (err) {
+      console.warn(`  Gmailnator poll error: ${err.message}`);
+    }
+    await new Promise(r => setTimeout(r, POLL_INTERVAL));
+  }
+  return null;
 }
 
 // ─── Airtable ─────────────────────────────────────────────────────────────────
@@ -234,17 +391,22 @@ async function signUp(page, email, password) {
   //
   // Password requirements: 8+ chars, upper+lower, digit, special char (@;!$.)
 
-  // Strip '+tag' — RapidAPI rejects plus-aliased emails
-  const signupEmail = email.replace(/\+[^@]+@/, '@');
-  if (signupEmail !== email) console.log(`  Stripped email for signup: ${signupEmail}`);
+  // Gmailnator returns real distinct base addresses (no +aliases), so we pass
+  // them straight through to RapidAPI. (Previously we tried Gmail +aliasing,
+  // but confirmed via repeated rejections that RapidAPI strips +tags before
+  // dedup, so aliases of one base address all collide.)
+  const signupEmail = email;
 
   // Ensure password has a special character
   const signupPass = /[@;!$._#%^&*()\-]/.test(password) ? password : password + '!';
   if (signupPass !== password) console.log(`  Appended '!' to meet special-char requirement`);
 
-  // Generate username from email prefix (alphanumeric only, max 20 chars, random suffix)
-  const usernameStem = signupEmail.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').slice(0, 12);
-  const username = usernameStem + Math.floor(Math.random() * 9000 + 1000);
+  // Generate a fully random username — not derived from email so it's always unique
+  const adjectives = ['swift','bright','calm','bold','keen','fair','pure','wise','neat','quick'];
+  const nouns      = ['fox','dev','api','hub','byte','node','cloud','mesh','flux','core'];
+  const adj  = adjectives[Math.floor(Math.random() * adjectives.length)];
+  const noun = nouns[Math.floor(Math.random() * nouns.length)];
+  const username = adj + noun + Math.floor(Math.random() * 90000 + 10000);
   console.log(`  Username: ${username}`);
 
   await page.screenshot({ path: '/tmp/rapidapi-signup-before.png' }).catch(() => {});
@@ -349,97 +511,69 @@ async function signUp(page, email, password) {
   // Otherwise check URL moved off /auth/
   const finalUrl = page.url();
   if (finalUrl.includes('/auth/')) {
+    // Capture any error message visible on the page to help diagnose
+    const errText = await page.evaluate(() => {
+      const selectors = [
+        '[class*="error" i]', '[class*="alert" i]', '[class*="toast" i]',
+        '[role="alert"]', '[data-testid*="error"]', 'p[class*="red"]',
+      ];
+      for (const s of selectors) {
+        const el = document.querySelector(s);
+        if (el && el.innerText?.trim()) return el.innerText.trim();
+      }
+      // Last resort: scan full body text for known error patterns
+      const body = document.body.innerText;
+      const match = body.match(/[^.!\n]*(something went wrong|unique|already.*exist|already.*taken|error|failed|blocked|invalid email|not allowed)[^.!\n]*/i);
+      return match ? match[0].trim() : null;
+    }).catch(() => null);
+
     const btns = await page.evaluate(() =>
       [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null).map(b => b.textContent.trim()).filter(t => t)
     ).catch(() => []);
+    if (errText) console.warn(`  Page error message: "${errText}"`);
     console.warn(`  Visible buttons: ${btns.slice(0, 10).join(' | ')}`);
-    throw new Error(`Signup may have failed — still on auth page: ${finalUrl}`);
+
+    // "Username and email must be unique" — this address is already registered.
+    // Throw a retriable error so main() can get a fresh email and try again.
+    const isEmailTaken = /unique|already.*exist|already.*taken/i.test(errText || '');
+    const err = new Error(`Signup failed — ${errText || finalUrl}`);
+    err.emailTaken = isEmailTaken;
+    throw err;
   }
   console.log(`  ✅ Signed up as ${username} — session active (${finalUrl})`);
   return signupPass;
 }
 
-// ─── Poll temp-gmail for RapidAPI magic link and click it ─────────────────────
+// ─── Poll inbox for RapidAPI magic link and click it ─────────────────────────
 
-async function pollGmailInbox(email, sinceTimestamp, timeoutMs = 360000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    await new Promise(r => setTimeout(r, 10000));
-    try {
-      const res = await axios.get('https://temp-gmail.p.rapidapi.com/inbox', {
-        params: { email, timestamp: sinceTimestamp },
-        headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPGMAIL_HOST },
-      });
-      const messages = Array.isArray(res.data) ? res.data
-        : Array.isArray(res.data?.messages) ? res.data.messages
-        : Array.isArray(res.data?.emails)   ? res.data.emails : [];
-      if (messages.length) return messages;
-      console.log(`  Inbox empty — waiting... (${Math.round((Date.now()-start)/1000)}s)`);
-    } catch (err) {
-      if (err.response?.status !== 404) console.warn(`  Poll error: ${err.message}`);
-      else console.log(`  Inbox empty (404) — waiting...`);
-    }
-  }
-  return [];
-}
-
-async function fetchMessageBody(mid, email) {
-  for (const params of [{ email, mid }, { mid }]) {
-    try {
-      const res = await axios.get('https://temp-gmail.p.rapidapi.com/message', {
-        params,
-        headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': TEMPGMAIL_HOST },
-      });
-      const body = res.data?.textBody || res.data?.htmlBody || res.data?.body
-                || res.data?.text    || res.data?.html     || res.data?.content || '';
-      if (body) return body;
-    } catch (err) {
-      if (err.response?.status !== 422 && err.response?.status !== 400) return '';
-    }
-  }
-  return '';
-}
-
-async function clickMagicLink(context, email) {
-  // Local testing (SIGNUP_EMAIL) — no temp-gmail access, skip automatically
-  if (process.env.SIGNUP_EMAIL) {
-    console.log('  [Local test] No inbox access — skipping magic link. Click it manually if needed.');
+async function clickMagicLink(context, emailInfo) {
+  const { email } = emailInfo;
+  if (!_rapidKeys.length) {
+    console.log('  RAPIDAPI_KEYS not set — skipping magic link polling.');
     return false;
   }
 
-  const sinceTs = Math.floor(Date.now() / 1000) - 30;
-  console.log(`  Polling inbox for magic link (up to 6 min)...`);
-  const messages = await pollGmailInbox(email, sinceTs, 360000);
-
-  for (const msg of messages) {
-    const mid = msg.mid || msg.id || msg.messageId;
-    const inlineBody = msg.textBody || msg.htmlBody || msg.body || msg.text || msg.html || '';
-    const body = inlineBody || (mid ? await fetchMessageBody(mid, email) : '');
-
-    // Find magic link — RapidAPI sends a link containing 'auth' and a token
-    const linkMatch = body.match(/https?:\/\/rapidapi\.com\/[^\s"'<>]+/gi)
-                   || body.match(/href="(https?:\/\/rapidapi\.com[^"]+)"/gi);
-    if (!linkMatch) continue;
-
-    const link = (linkMatch[0].startsWith('href=') ? linkMatch[0].replace(/href="([^"]+)"/, '$1') : linkMatch[0]).trim();
-    console.log(`  Magic link: ${link.slice(0, 80)}...`);
-
-    const verifyPage = await context.newPage();
-    await verifyPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await verifyPage.waitForTimeout(8000);
-    const landedUrl = verifyPage.url();
-    console.log(`  After magic link: ${landedUrl}`);
-    await verifyPage.close();
-
-    if (!landedUrl.includes('/auth/')) {
-      console.log('  ✅ Email verified — session active');
-      return true;
-    }
-    console.warn('  ⚠️ Magic link redirected back to auth page');
+  console.log(`  Polling Gmailnator for magic link (up to 6 min)...`);
+  const link = await pollGmailnatorForMagicLink(email, 360000);
+  if (!link) {
+    console.warn('  ⚠️ No magic link arrived within the timeout.');
     return false;
   }
 
-  console.warn('  ⚠️ No magic link found in inbox');
+  console.log(`  Magic link: ${link.slice(0, 80)}...`);
+  const verifyPage = await context.newPage();
+  await verifyPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await verifyPage.waitForTimeout(8000);
+  const landedUrl = verifyPage.url();
+  console.log(`  After magic link: ${landedUrl}`);
+  await verifyPage.screenshot({ path: '/tmp/rapidapi-after-verify.png' }).catch(() => {});
+  await verifyPage.close();
+
+  if (!landedUrl.includes('/auth/')) {
+    console.log('  ✅ Email verified — session active');
+    return true;
+  }
+  console.warn('  ⚠️ Magic link redirected back to auth page');
   return false;
 }
 
@@ -536,12 +670,15 @@ async function main() {
   console.log('='.repeat(60));
 
   if (!AIRTABLE_API_KEY) throw new Error('AIRTABLE_API_KEY not set');
-  if (!RAPIDAPI_KEY && !process.env.SIGNUP_EMAIL) throw new Error('RAPIDAPI_KEY not set (or set SIGNUP_EMAIL to skip temp-gmail)');
   if (!SIGNUP_PASSWORD)  throw new Error('SIGNUP_PASSWORD not set');
+  if (!_rapidKeys.length && !process.env.SIGNUP_EMAIL) {
+    throw new Error('RAPIDAPI_KEYS (or RAPIDAPI_KEY) must be set for Gmailnator');
+  }
 
-  // 1. Get a fresh temp Gmail address
-  console.log('\nGetting temp Gmail address...');
-  const email = await getGmailAddress();
+  // 1. Get a fresh real Gmail address from Gmailnator (each is a distinct base address)
+  console.log('\nGenerating Gmailnator address...');
+  let emailInfo = await createTempEmail();
+  const { email } = emailInfo;
 
   // 2. Launch browser
   const browser = await chromium.launch({
@@ -551,25 +688,48 @@ async function main() {
       '--disable-blink-features=AutomationControlled',
     ],
   });
-  const context = await browser.newContext({
+
+  const newContext = () => browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
+
+  // context is declared here so it's accessible in the finally block
+  let context = await newContext();
 
   let loginId = null;
   const subscribed = [];
   const failed = [];
 
   try {
-    const page = await context.newPage();
-
-    // 3. Sign up
+    // 3. Sign up — retry up to 20 times with a fresh context each attempt
+    //    (fresh context = no session cookies carried over between retries)
     console.log('\n── Phase 1: Sign up ──────────────────────────────────────');
-    const actualPassword = await signUp(page, email, SIGNUP_PASSWORD);
-    await page.close();
+    let actualPassword, signupEmail = email;
+    for (let attempt = 1; attempt <= 20; attempt++) {
+      const page = await context.newPage();
+      try {
+        actualPassword = await signUp(page, signupEmail, SIGNUP_PASSWORD);
+        await page.close();
+        break; // success
+      } catch (err) {
+        await page.close();
+        if (err.emailTaken && attempt < 20) {
+          console.warn(`  Email/username already taken — fresh context + new address (attempt ${attempt + 1}/20)...`);
+          // Close old context so RapidAPI sees a completely new session
+          await context.close();
+          context = await newContext();
+          const fresh = await createTempEmail();
+          signupEmail = fresh.email;
+          emailInfo = fresh; // update for magic link phase
+        } else {
+          throw err;
+        }
+      }
+    }
 
     // 3b. Click magic link from verification email
     console.log('\n── Phase 1b: Verify email via magic link ─────────────────');
-    await clickMagicLink(context, email);
+    await clickMagicLink(context, emailInfo);
 
     // 4. Subscribe to all APIs
     console.log('\n── Phase 2: Subscribe to all APIs ───────────────────────');

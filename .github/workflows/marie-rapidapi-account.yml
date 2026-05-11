@@ -46,7 +46,8 @@ jobs:
           FIELD_LOGIN_PASSWORD:  ${{ secrets.FIELD_LOGIN_PASSWORD }}
           FIELD_LOGIN_STATUS:    ${{ vars.FIELD_LOGIN_STATUS }}
           FIELD_API_SUBSCRIBED:  ${{ vars.FIELD_API_SUBSCRIBED }}
-          RAPIDAPI_KEY:    ${{ secrets.RAPIDAPI_KEY }}
+          RAPIDAPI_KEY:  ${{ secrets.RAPIDAPI_KEY }}
+          RAPIDAPI_KEYS: ${{ secrets.RAPIDAPI_KEYS }}
           SIGNUP_PASSWORD: ${{ secrets.SIGNUP_PASSWORD }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
