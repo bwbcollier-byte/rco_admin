@@ -97,8 +97,10 @@ async function createTempEmail() {
   }
   if (!_rapidKeys.length) throw new Error('RAPIDAPI_KEYS not set — needed for Gmailnator');
 
-  // Cap total attempts so a bad-keys day doesn't burn the whole pool
-  const MAX_ATTEMPTS = 10;
+  // Cap total attempts so a bad-keys day doesn't burn the whole pool.
+  // ~60-70% of Gmailnator responses are non-private types we skip, so we need
+  // headroom to find a usable address. 30 lets us survive a high-skip streak.
+  const MAX_ATTEMPTS = 30;
   let attempts = 0;
   const keys = shuffledKeys();
   while (attempts < MAX_ATTEMPTS) {
@@ -120,20 +122,22 @@ async function createTempEmail() {
         );
         const email = res.data?.email;
         const type  = res.data?.type;
-        // Accept Gmailnator's `private_*` types (e.g. *@premiumnator.com,
-        // googlemail.com aliases owned by the service). These deliver mail
-        // back to us and present as distinct base addresses to RapidAPI.
-        // Reject:
-        //   - +aliases (RapidAPI strips +tags before dedup)
-        //   - public_gmail_dot / @gmail.com (dot-trick variants of one Gmail —
-        //     RapidAPI strips dots, all variants collapse to one base. This is
-        //     the exhausted pool that blocked the prior integration.)
+        // Only accept Gmailnator `private_*` types. Confirmed type distribution
+        // from probing the API: roughly 60% public_gmail_plus (+aliases,
+        // RapidAPI strips +tags so they all collapse), 10-20% public_email_domain
+        // (disposable domains RapidAPI blocks with "Something went wrong"),
+        // and 10-20% private_googlemail OR private_email_domain. The private_*
+        // pool is many DISTINCT base accounts owned by Gmailnator — each one
+        // a fresh signup for RapidAPI. private_email_domain (e.g. *@premiumnator.com)
+        // is ideal, but private_googlemail works too (each call hands out a
+        // different googlemail base account, so dot-stripping is irrelevant
+        // until that single base has been used).
         if (!email || email.includes('+')) continue;
-        if (type === 'public_gmail_dot' || email.endsWith('@gmail.com')) {
-          console.log(`  Skipping ${email} (type=${type}) — dot-trick pool`);
+        if (!type || !type.startsWith('private_')) {
+          console.log(`  Skipping ${email} (type=${type || 'unknown'}) — non-private domain`);
           continue;
         }
-        console.log(`  Gmailnator address: ${email} (${type || 'unknown'})`);
+        console.log(`  Gmailnator address: ${email} (${type})`);
         return { email };
       } catch (err) {
         // 403/429 → just rotate to next key
@@ -713,9 +717,16 @@ async function main() {
         break; // success
       } catch (err) {
         await page.close();
-        if (err.emailTaken && attempt < 20) {
-          console.warn(`  Email/username already taken — fresh context + new address (attempt ${attempt + 1}/20)...`);
-          // Close old context so RapidAPI sees a completely new session
+        if (attempt < 20) {
+          // Retry on ANY signup failure with a fresh context + new address.
+          // RapidAPI surfaces three distinct rejections we've seen:
+          //   - "Username and email must be unique" → dedup hit (email/username taken)
+          //   - "Something went wrong"              → disposable-domain block, or transient
+          //   - any other page error                → treat as retriable
+          // Either way the recovery is the same: new browser context (no cookies),
+          // new Gmailnator address. Only the final attempt rethrows.
+          const reason = err.emailTaken ? 'email/username taken' : (err.message || 'unknown error').slice(0, 80);
+          console.warn(`  Signup attempt ${attempt} failed — ${reason}. Fresh context + new address (attempt ${attempt + 1}/20)...`);
           await context.close();
           context = await newContext();
           const fresh = await createTempEmail();
