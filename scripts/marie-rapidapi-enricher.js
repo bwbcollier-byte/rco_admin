@@ -54,6 +54,8 @@ const ALL_RAPIDAPI_KEYS = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY
   .split(',').map(k => k.trim()).filter(Boolean);
 // Airtable Logins table (for auto-subscribe when all keys return 403)
 const AIRTABLE_LOGINS   = process.env.AIRTABLE_LOGINS || 'tbldJkG11gY1W3jTf';
+// Max endpoints to test per API (each needs a page load + test call — keep reasonable)
+const MAX_ENDPOINTS     = parseInt(process.env.MAX_ENDPOINTS || '5', 10);
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
 
@@ -242,16 +244,19 @@ async function getFirstActiveLogin() {
       `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_LOGINS}`,
       {
         params: {
-          filterByFormula: `AND({fldcZ9nAY8GD2OZW8}='Active', {fldQqf8eF4mT2U0zT}='RapidAPI')`,
+          filterByFormula: `AND({Status}='Active', {Name}='RapidAPI')`,
           maxRecords: 1,
-          fields: ['fldoqWChj7NAo6uRg', 'fldqoPo0O06uAHILu'],  // Login, Password
+          fields: ['Login', 'Password'],  // field display names
         },
         headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
       }
     );
     const r = res.data.records?.[0];
     if (!r) return null;
-    return { email: r.fields['fldoqWChj7NAo6uRg'], password: r.fields['fldqoPo0O06uAHILu'] };
+    const email    = r.fields['Login'];
+    const password = r.fields['Password'];
+    if (!email || !password) return null;
+    return { email, password };
   } catch (e) {
     console.warn(`  ⚠️ Could not fetch login: ${e.message}`);
     return null;
@@ -622,12 +627,19 @@ async function scrapePricing(page, baseUrl) {
   return pricing;
 }
 
-// ─── Endpoints + Playground + Live Test Call ─────────────────────────────────
+// ─── Endpoints + Playground + Per-Endpoint Test Calls ────────────────────────
 
 async function scrapeEndpoints(page, baseUrl) {
-  console.log(`    → Endpoints + playground + test call`);
+  console.log(`    → Endpoints (all) + curl + test calls`);
 
-  // ── Step 1: Overview page — sidebar endpoint list ─────────────────────────
+  const NAV_NOISE = new Set([
+    'api overview', 'endpoints', 'search endpoints', 'mcp playground',
+    'overview', 'tutorials', 'changelog', 'discussions', 'about',
+    'playground', 'versions', 'sign in', 'sign up', 'log in', 'login',
+    'get started', 'discovery', 'workspace', 'open playground',
+  ]);
+
+  // ── Step 1: Overview page — collect all endpoint hrefs from the sidebar ────
   try {
     await gotoAndDismissCookies(page, baseUrl);
   } catch (e) {
@@ -637,186 +649,197 @@ async function scrapeEndpoints(page, baseUrl) {
 
   await page.screenshot({ path: `/tmp/rapidapi-enrich-endpoints-${Date.now()}.png` }).catch(() => {});
 
-  const NAV_NOISE_ARR = [
-    'api overview', 'endpoints', 'search endpoints', 'mcp playground',
-    'overview', 'tutorials', 'changelog', 'discussions', 'about',
-    'playground', 'versions', 'sign in', 'sign up', 'log in', 'login',
-    'get started', 'discovery', 'workspace', 'open playground',
-  ];
-
-  const sidebarData = await page.evaluate((noiseArr) => {
+  // Grab every sidebar link that looks like an endpoint (has /playground/ or /endpoints/ in href)
+  // PLUS collect the display names for the endpointList field.
+  const sidebarInfo = await page.evaluate((noiseArr) => {
     const NAV_NOISE = new Set(noiseArr);
-    const result = { endpointList: [], apiHost: '', playgroundHref: '' };
-
     const sidebar = document.querySelector(
       'nav[class*="sidebar"], [class*="Sidebar"], [class*="left-nav"], aside, [role="navigation"]'
     );
+    const links = [];
+    const names = [];
+    let apiHost = '';
+    let playgroundBase = '';
 
     if (sidebar) {
-      // Capture "Open playground" href for step 2
       for (const a of sidebar.querySelectorAll('a')) {
-        if (/open playground|playground/i.test(a.textContent) && a.href) {
-          result.playgroundHref = a.href;
-          break;
-        }
-      }
-      // Endpoint items — filter out navigation noise
-      result.endpointList = [...new Set(
-        Array.from(sidebar.querySelectorAll('a, li, [class*="endpoint"], [class*="Endpoint"]'))
-          .map(el => el.textContent.trim())
-          .filter(t => {
-            const l = t.toLowerCase();
-            return t && t.length > 1 && t.length < 120
-              && !NAV_NOISE.has(l)
-              && !/^(sign|log|get started|discover|workspace)/i.test(l);
-          })
-      )].slice(0, 50);
-    }
+        const text = a.textContent.trim();
+        const href = a.href || '';
+        const lower = text.toLowerCase();
 
-    // Fallback endpoint detection: HTTP method + path links
-    if (!result.endpointList.length) {
-      result.endpointList = [...new Set(
-        Array.from(document.querySelectorAll('a'))
-          .map(a => a.textContent.trim())
-          .filter(t => t.length < 100 &&
-            (t.startsWith('/') || /^(GET|POST|PUT|DELETE|PATCH|HEAD)\s/i.test(t)))
-      )].slice(0, 50);
+        // "Open playground" base URL
+        if (/open playground/i.test(text) && href) {
+          playgroundBase = href;
+          continue;
+        }
+        // Skip nav noise
+        if (!text || text.length > 120 || NAV_NOISE.has(lower)) continue;
+        if (/^(sign|log|get started|discover|workspace)/i.test(lower)) continue;
+
+        // Clean up label: sidebar items have the HTTP method badge text glued
+      // directly onto the endpoint name (e.g. "GETFetch Latest Jobs").
+      // Insert a space after the method so it reads "GET Fetch Latest Jobs".
+      const cleanText = text.replace(/^(GET|POST|PUT|DELETE|PATCH|HEAD)([A-Z\s])/,
+        (_, method, next) => `${method} ${next}`);
+
+      // Endpoint link — must go to playground or endpoint detail
+      if (href && (href.includes('/playground') || href.includes('/endpoint'))) {
+        links.push({ text: cleanText, href });
+      }
+      names.push(cleanText);
+      }
     }
 
     const m = document.body.innerText.match(/[\w-]+\.p\.rapidapi\.com/);
-    if (m) result.apiHost = m[0];
+    if (m) apiHost = m[0];
 
-    return result;
-  }, NAV_NOISE_ARR).catch(() => ({ endpointList: [], apiHost: '', playgroundHref: '' }));
+    return { links, names: [...new Set(names)].slice(0, 50), apiHost, playgroundBase };
+  }, [...NAV_NOISE]).catch(() => ({ links: [], names: [], apiHost: '', playgroundBase: '' }));
 
-  console.log(`      Sidebar: ${sidebarData.endpointList.length} endpoints | host: ${sidebarData.apiHost || '(none)'}`);
+  let endpointList = sidebarInfo.names;
+  let apiHost      = sidebarInfo.apiHost;
 
-  // ── Step 2: Navigate to playground — extract curl command ─────────────────
-  // Curl commands (with real endpoint URLs) only appear in the playground view,
-  // not on the hub/overview page. Navigate there and extract from code blocks.
-  let curlCommand = '';
-  let testUrl     = '';
-  let testHost    = sidebarData.apiHost;
-
-  const playUrl = sidebarData.playgroundHref || (baseUrl.replace(/\/+$/, '') + '/playground/requestDetails');
-  try {
-    await page.goto(playUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(5000);
-    await page.screenshot({ path: `/tmp/rapidapi-enrich-playground-${Date.now()}.png` }).catch(() => {});
-
-    const curlData = await page.evaluate(() => {
-      const r = { curl: '', testUrl: '', testHost: '' };
-      for (const el of document.querySelectorAll(
-        'code, pre, [class*="code"], [class*="Code"], [class*="curl"], [class*="Curl"]'
-      )) {
-        const t = el.textContent.trim();
-        if ((t.toLowerCase().includes('curl') || t.includes('x-rapidapi')) && t.includes('http')) {
-          r.curl = t.slice(0, 1500);
-          const urlM = t.match(/--url\s+['"]?(https?:\/\/[^\s'"]+)/i);
-          if (urlM) {
-            r.testUrl = urlM[1].replace(/['"]$/, '').split('?')[0];
-            const hM = r.testUrl.match(/\/\/([\w.-]+\.p\.rapidapi\.com)/);
-            if (hM) r.testHost = hM[1];
-          }
-          break;
-        }
-      }
-      if (!r.testHost) {
-        const m = document.body.innerText.match(/[\w-]+\.p\.rapidapi\.com/);
-        if (m) r.testHost = m[0];
-      }
-      return r;
-    }).catch(() => ({ curl: '', testUrl: '', testHost: '' }));
-
-    curlCommand = curlData.curl;
-    testUrl     = curlData.testUrl;
-    if (curlData.testHost) testHost = curlData.testHost;
-    console.log(`      Curl: ${curlCommand ? curlCommand.slice(0, 70).replace(/\n/g, ' ') + '…' : '(none)'}`);
-  } catch (e) {
-    console.warn(`    ⚠️  Playground nav failed: ${e.message}`);
+  // Fallback: if no endpoint links found via sidebar, use the playground base URL
+  // to get the first available endpoint
+  let endpointHrefs = sidebarInfo.links.slice(0, MAX_ENDPOINTS);
+  if (!endpointHrefs.length) {
+    const playUrl = sidebarInfo.playgroundBase || (baseUrl.replace(/\/+$/, '') + '/playground/requestDetails');
+    endpointHrefs = [{ text: 'Default', href: playUrl }];
   }
 
-  // ── Step 3: Live test call (with key rotation + auto-subscribe fallback) ────
-  let testResults = '';
-  if (testUrl && testHost) {
-    console.log(`      Testing: ${testUrl}`);
+  console.log(`      Sidebar: ${endpointList.length} endpoint names, ${endpointHrefs.length} playground links`);
 
-    // Helper: one axios GET, returns { status, body } or throws
+  // ── Step 2: Visit each endpoint's playground page ─────────────────────────
+  // For each endpoint: extract curl, parse URL, make test call, capture result.
+  // Output is accumulated into multiline text fields with ### headers.
+
+  const curlSections   = [];  // one per endpoint → goes into Curl Commands field
+  const resultSections = [];  // one per endpoint → goes into Test Results field
+  let   firstApiHost   = apiHost;
+
+  // Helper: make one GET call, try all keys, auto-subscribe on 403
+  async function testEndpoint(testUrl, testHost) {
     async function tryCall(key) {
       const res = await axios.get(testUrl, {
         headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': testHost },
-        timeout: 12000,
-        validateStatus: null,
+        timeout: 12000, validateStatus: null,
       });
       const body = typeof res.data === 'object'
-        ? JSON.stringify(res.data).slice(0, 400)
-        : String(res.data).slice(0, 400);
+        ? JSON.stringify(res.data).slice(0, 350)
+        : String(res.data).slice(0, 350);
       return { status: res.status, body };
     }
 
-    let result = null;
-
-    // Pass 1: try all available keys — if ANY account is subscribed, it'll work
+    // Pass 1: rotate all keys
     for (const key of ALL_RAPIDAPI_KEYS) {
       try {
         const r = await tryCall(key);
-        if (r.status !== 403) { result = r; break; }
+        if (r.status !== 403) return r;
       } catch {}
     }
 
-    // Pass 2: all keys returned 403 → subscribe via Playwright then retry
-    if (!result) {
-      console.log(`      All keys → 403. Attempting auto-subscribe…`);
-      if (SESSION_LOGGED_IN) {
-        // Already logged in — go straight to subscribe
-        const subscribed = await subscribeViaPlaywright(page, baseUrl);
-        if (subscribed) {
-          // Retry with session key (now subscribed)
-          try { result = await tryCall(SESSION_API_KEY); } catch {}
-        }
-      } else {
-        // Try to log in first, then subscribe
-        const login = await getFirstActiveLogin();
-        if (login) {
-          try {
-            await loginToRapidAPI(page, login.email, login.password);
-            SESSION_LOGGED_IN = true;
-            // Grab the session API key
-            const keyPage = await page.context().newPage();
-            const key = await grabAPIKey(keyPage);
-            await keyPage.close().catch(() => {});
-            if (key) SESSION_API_KEY = key;
-
-            const subscribed = await subscribeViaPlaywright(page, baseUrl);
-            if (subscribed) {
-              try { result = await tryCall(SESSION_API_KEY); } catch {}
-            }
-          } catch (e) {
-            console.warn(`      Login failed: ${e.message.slice(0, 80)}`);
-          }
+    // Pass 2: subscribe and retry
+    if (SESSION_LOGGED_IN) {
+      await subscribeViaPlaywright(page, baseUrl);
+    } else {
+      const login = await getFirstActiveLogin();
+      if (login) {
+        try {
+          await loginToRapidAPI(page, login.email, login.password);
+          SESSION_LOGGED_IN = true;
+          const kp = await page.context().newPage();
+          const k  = await grabAPIKey(kp);
+          await kp.close().catch(() => {});
+          if (k) SESSION_API_KEY = k;
+          await subscribeViaPlaywright(page, baseUrl);
+        } catch (e) {
+          console.warn(`      Login failed: ${e.message.slice(0, 60)}`);
         }
       }
     }
-
-    if (result) {
-      const emoji = result.status >= 200 && result.status < 300 ? '✅' : '❌';
-      testResults = `${emoji} HTTP ${result.status} — ${result.body}`;
-      console.log(`      Test: HTTP ${result.status}`);
-    } else {
-      testResults = `❌ HTTP 403 — not subscribed on any account`;
-      console.warn(`      All keys returned 403 and subscribe failed`);
-    }
-  } else {
-    testResults = ALL_RAPIDAPI_KEYS.length
-      ? `⚠️ No endpoint URL found from playground — test skipped`
-      : `⚠️ No RAPIDAPI_KEY configured — test skipped`;
+    try { return await tryCall(SESSION_API_KEY); } catch {}
+    return null;
   }
 
+  for (const ep of endpointHrefs) {
+    try {
+      await page.goto(ep.href, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+
+      // Extract curl + parse URL from this endpoint's code block
+      const epData = await page.evaluate(() => {
+        const r = { curl: '', testUrl: '', testHost: '', method: 'GET' };
+        for (const el of document.querySelectorAll(
+          'code, pre, [class*="code"], [class*="Code"], [class*="curl"], [class*="Curl"]'
+        )) {
+          const t = el.textContent.trim();
+          if ((t.toLowerCase().includes('curl') || t.includes('x-rapidapi')) && t.includes('http')) {
+            r.curl = t.slice(0, 1200);
+            // Extract method
+            const methM = t.match(/--request\s+(\w+)/i);
+            if (methM) r.method = methM[1].toUpperCase();
+            // Extract URL
+            const urlM = t.match(/--url\s+['"]?(https?:\/\/[^\s'"]+)/i);
+            if (urlM) {
+              r.testUrl = urlM[1].replace(/['"]$/, '');
+              const hM = r.testUrl.match(/\/\/([\w.-]+\.p\.rapidapi\.com)/);
+              if (hM) r.testHost = hM[1];
+            }
+            break;
+          }
+        }
+        if (!r.testHost) {
+          const m = document.body.innerText.match(/[\w-]+\.p\.rapidapi\.com/);
+          if (m) r.testHost = m[0];
+        }
+        return r;
+      }).catch(() => ({ curl: '', testUrl: '', testHost: '', method: 'GET' }));
+
+      if (!firstApiHost && epData.testHost) firstApiHost = epData.testHost;
+      if (!apiHost && epData.testHost)      apiHost      = epData.testHost;
+
+      const label = ep.text !== 'Default' ? ep.text : (epData.method + ' endpoint');
+
+      // Curl section
+      if (epData.curl) {
+        curlSections.push(`### ${label}\n${epData.curl}`);
+      }
+
+      // Test call — only GET (POST/PUT/DELETE need a body we don't have)
+      if (epData.testUrl && epData.testHost) {
+        if (epData.method === 'GET') {
+          console.log(`      Testing [${label}]: ${epData.testUrl.slice(0, 60)}`);
+          const result = await testEndpoint(epData.testUrl, epData.testHost);
+          if (result) {
+            const emoji = result.status >= 200 && result.status < 300 ? '✅' : '❌';
+            resultSections.push(`### ${label}\n${emoji} HTTP ${result.status}\n${result.body}`);
+            console.log(`        → HTTP ${result.status}`);
+          } else {
+            resultSections.push(`### ${label}\n❌ All keys returned 403 — not subscribed`);
+          }
+        } else {
+          // Non-GET: record the method but skip the live call
+          resultSections.push(`### ${label}\n⏭ ${epData.method} — test call skipped (body required)`);
+          console.log(`      [${label}] ${epData.method} — skipped`);
+        }
+      } else if (epData.curl) {
+        resultSections.push(`### ${label}\n⚠️ Could not parse endpoint URL from curl`);
+      }
+
+    } catch (e) {
+      console.warn(`      ⚠️ [${ep.text}] failed: ${e.message.slice(0, 80)}`);
+    }
+
+    // Brief pause between endpoint visits to be polite
+    await page.waitForTimeout(1500);
+  }
+
+  const DIVIDER = '\n\n---\n\n';
   return {
-    endpointList: sidebarData.endpointList,
-    apiHost:      testHost,
-    curlCommands: curlCommand,
-    testResults,
+    endpointList: endpointList,
+    apiHost:      firstApiHost || apiHost,
+    curlCommands: curlSections.join(DIVIDER),
+    testResults:  resultSections.join(DIVIDER),
   };
 }
 
