@@ -46,7 +46,7 @@ const AIRTABLE_APIS     = process.env.AIRTABLE_APIS || 'tblMb9HFyKcnQ7aKb';
 const DRY_RUN           = process.env.DRY_RUN === 'true';
 const HEADLESS          = process.env.HEADLESS !== 'false';
 const RESCRAPE_DAYS     = parseInt(process.env.RESCRAPE_DAYS || '7', 10);
-const MAX_PER_RUN       = parseInt(process.env.MAX_PER_RUN || '50', 10);
+const MAX_PER_RUN       = parseInt(process.env.MAX_PER_RUN || '999', 10);
 const FORCE             = process.env.FORCE === 'true';  // skip lastScraped filter entirely
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;   // primary key for live test calls
 // All available keys — used for rotation on 403 before falling back to subscribe
