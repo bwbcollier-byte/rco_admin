@@ -109,20 +109,28 @@ async function getAPIsToProcess() {
   return res.data.records || [];
 }
 
-async function updateAPIRecord(recordId, data, loginId) {
+async function updateAPIRecord(recordId, data, loginId, subscribed = true) {
   if (DRY_RUN) {
-    console.log(`  [DRY RUN] Would update API record ${recordId}:`, Object.keys(data).join(', '), loginId ? `+ link loginId ${loginId}` : '');
+    console.log(`  [DRY RUN] Would update API record ${recordId}:`, Object.keys(data).join(', '), loginId && subscribed ? `+ link loginId ${loginId}` : '', subscribed ? '' : '(subscribed=false)');
     return;
   }
 
   const headers = { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' };
   const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${recordId}`;
 
-  // ── Step 1: Always mark Subscribed (core — must succeed) ──────────────────
-  await axios.patch(url, { fields: { [API_FIELD.subscribed]: true } }, { headers });
+  // ── Step 1: Mark Subscribed ONLY when the click actually succeeded. ────────
+  //    Was always-true previously, which silently lied to the Airtable record
+  //    when a Subscribe button wasn't found and the account never actually
+  //    subscribed to that API. Enrichment fields still get written below so
+  //    we don't lose the scraped metadata.
+  if (subscribed) {
+    await axios.patch(url, { fields: { [API_FIELD.subscribed]: true } }, { headers });
+  }
 
   // ── Step 2: Append loginId to Subscribed Accounts (best-effort) ───────────
-  if (loginId) {
+  //    Skip when subscribed=false — the link would imply an active subscription
+  //    that doesn't actually exist.
+  if (loginId && subscribed) {
     try {
       const current = await axios.get(url, { headers });
       const existingLinks = current.data.fields?.[API_FIELD.subscribedAccounts] || [];
@@ -574,9 +582,14 @@ async function processAPI(context, apiRecord, loginId, doScrape = true) {
       }
     }
 
-    // 6. Update Airtable (always — marks subscribed + appends to Subscribed Accounts)
-    await updateAPIRecord(apiRecord.id, updateFields, loginId);
-    console.log(`  ✅ Airtable updated: ${result.fieldsUpdated.join(', ') || 'Subscribed + linked account'}`);
+    // 6. Update Airtable. Mark Subscribed + link the account ONLY when the
+    //    subscribe click actually succeeded; otherwise just write enrichment
+    //    fields so the metadata we scraped isn't lost.
+    await updateAPIRecord(apiRecord.id, updateFields, loginId, subscribed);
+    const summary = subscribed
+      ? `Subscribed + linked account${result.fieldsUpdated.length ? ' + ' + result.fieldsUpdated.join(', ') : ''}`
+      : `enrichment-only (subscribe failed): ${result.fieldsUpdated.join(', ') || 'no fields'}`;
+    console.log(`  ${subscribed ? '✅' : '⚠️'} Airtable updated: ${summary}`);
 
   } catch (err) {
     console.warn(`  ❌ ${name}: ${err.message}`);
