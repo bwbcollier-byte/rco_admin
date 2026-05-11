@@ -54,8 +54,9 @@ const ALL_RAPIDAPI_KEYS = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY
   .split(',').map(k => k.trim()).filter(Boolean);
 // Airtable Logins table (for auto-subscribe when all keys return 403)
 const AIRTABLE_LOGINS   = process.env.AIRTABLE_LOGINS || 'tbldJkG11gY1W3jTf';
-// Max endpoints to test per API (each needs a page load + test call — keep reasonable)
-const MAX_ENDPOINTS     = parseInt(process.env.MAX_ENDPOINTS || '5', 10);
+// No hard cap on endpoints — scrape and test every endpoint in the sidebar.
+// Override with MAX_ENDPOINTS=N env var only if you want to limit for speed.
+const MAX_ENDPOINTS     = parseInt(process.env.MAX_ENDPOINTS || '999', 10);
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
 
@@ -97,7 +98,7 @@ async function getAllRapidAPIAPIs() {
   do {
     const params = {
       returnFieldsByFieldId: true,
-      filterByFormula: `SEARCH("rapidapi.com", {${F.link}})`,
+      filterByFormula: `AND(SEARCH("rapidapi.com", {${F.link}}), {${F.status}}="Discovered")`,
       fields: [F.name, F.link, F.lastScraped],
       pageSize: 100,
     };
@@ -266,25 +267,41 @@ async function getFirstActiveLogin() {
 /** Log into RapidAPI (email → Next → password → Submit). */
 async function loginToRapidAPI(page, email, password) {
   await page.goto('https://rapidapi.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(3000);
+
+  // Dismiss cookie banner if it appears
   try {
-    await page.waitForSelector('button:has-text("Reject All")', { timeout: 5000 });
-    await page.locator('button:has-text("Reject All")').first().click();
-    await page.waitForTimeout(800);
+    const rejectBtn = page.locator('button:has-text("Reject All")').first();
+    if (await rejectBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await rejectBtn.click();
+      await page.waitForTimeout(800);
+    }
   } catch {}
 
-  // Email field + Next
+  // Fill email
+  await page.locator('input[type="email"], input[name="email"]').first().waitFor({ state: 'visible', timeout: 15000 });
   await page.locator('input[type="email"], input[name="email"]').first().fill(email);
-  await page.locator('button:has-text("Next"), button[type="submit"]').first().click();
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(500);
 
-  // Password field + Submit
+  // Click Next (may be labelled "Next", "Continue", or just a submit)
+  const nextBtn = page.locator('button:has-text("Next"), button:has-text("Continue"), button[type="submit"]').first();
+  await nextBtn.waitFor({ state: 'visible', timeout: 10000 });
+  await nextBtn.click();
+  await page.waitForTimeout(3000);
+
+  // Fill password
+  await page.locator('input[type="password"]').first().waitFor({ state: 'visible', timeout: 10000 });
   await page.locator('input[type="password"]').first().fill(password);
+  await page.waitForTimeout(500);
+
+  // Submit
   await page.locator('button[type="submit"]').first().click();
-  await page.waitForTimeout(8000);
+  await page.waitForTimeout(9000);
 
   const url = page.url();
-  if (url.includes('/auth/login')) throw new Error('Login failed — still on login page');
+  if (url.includes('/auth/login') || url.includes('/auth/sign')) {
+    throw new Error(`Login failed — still on: ${url}`);
+  }
   console.log(`  ✅ Logged in as ${email}`);
 }
 
