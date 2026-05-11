@@ -409,16 +409,18 @@ async function subscribeToAPI(page, link, name) {
     await page.waitForTimeout(3000);
   }
 
-  // Check if already subscribed — RapidAPI shows "Current Plan" button on the active tier
-  const alreadySub = await page.locator(
-    '[class*="CurrentPlan"], [class*="current-plan"], [class*="currentPlan"], ' +
-    'button:has-text("Current Plan"), span:has-text("Current Plan"), ' +
-    'button:has-text("Manage My Plan"), button:has-text("Manage Plan"), ' +
-    // "Cancel Plan" and "Upgrade Plan" appear when the account already has an active subscription
-    'button:has-text("Cancel Plan"), button:has-text("Upgrade Plan"), ' +
-    '[class*="active"][class*="plan"], [class*="plan"][class*="selected"], ' +
-    'text=/current plan|already subscribed|you.re subscribed|manage my plan|manage plan|cancel plan/i'
-  ).first().isVisible().catch(() => false);
+  // Check if already subscribed — RapidAPI shows "Current Plan", "Cancel Plan",
+  // or "Upgrade Plan" when the account is on an active subscription.
+  // Use a DOM text scan (not isVisible) — the ToS banner can obscure the buttons
+  // visually while they are still fully present in the DOM.
+  const alreadySub = await page.evaluate(() => {
+    const ALREADY_SUBS = ['cancel plan', 'current plan', 'upgrade plan', 'manage my plan', 'manage plan'];
+    const allBtns = [...document.querySelectorAll('button, a')];
+    return allBtns.some(el => {
+      const t = el.textContent.trim().toLowerCase();
+      return ALREADY_SUBS.some(phrase => t === phrase || t.startsWith(phrase));
+    });
+  }).catch(() => false);
   if (alreadySub) {
     console.log(`  ✅ Already subscribed to ${name}`);
     return true;
@@ -752,14 +754,14 @@ async function processAPI(context, apiRecord, loginId, doScrape = true) {
       }
       for (const ep of endpoints.slice(10)) enrichedEndpoints.push(ep);
 
-      // 5. Build Airtable payload
-      if (overview.about)       { updateFields['About']        = overview.about;       result.fieldsUpdated.push('About'); }
-      if (overview.category)    { updateFields['Category']     = overview.category;    result.fieldsUpdated.push('Category'); }
-      if (overview.provider)    { updateFields['Provider']     = overview.provider;    result.fieldsUpdated.push('Provider'); }
-      if (overview.mcpUrl)      { updateFields['MCP URL']      = overview.mcpUrl;      result.fieldsUpdated.push('MCP URL'); }
-      if (overview.pricingTier) { updateFields['Pricing Tier'] = overview.pricingTier; result.fieldsUpdated.push('Pricing Tier'); }
+      // 5. Build Airtable payload — use field IDs (not display names) to avoid
+      //    422 "field not found" errors when field names don't match exactly.
+      if (overview.about)    { updateFields['fld6t5xv5ejuni3pI'] = overview.about;    result.fieldsUpdated.push('About'); }
+      if (overview.provider) { updateFields['fldtr3JUxQpvkb4us'] = overview.provider; result.fieldsUpdated.push('Developer Name'); }
+      if (overview.mcpUrl)   { updateFields['fldhYHa6TpB57edaE'] = overview.mcpUrl;   result.fieldsUpdated.push('MCP Endpoint'); }
+      // 'Category' and 'Pricing Tier' have no matching field in the APIs table — omitted.
       if (enrichedEndpoints.length > 0) {
-        updateFields['Endpoints'] = JSON.stringify(enrichedEndpoints, null, 2).slice(0, 99000);
+        updateFields['flduRXxFwC4nVHO9D'] = JSON.stringify(enrichedEndpoints, null, 2).slice(0, 99000);
         result.fieldsUpdated.push(`Endpoints (${enrichedEndpoints.length})`);
       }
     }
