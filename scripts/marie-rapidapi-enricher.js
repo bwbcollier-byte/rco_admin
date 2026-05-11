@@ -738,47 +738,71 @@ async function scrapeEndpoints(page, baseUrl) {
   const resultSections = [];  // one per endpoint → goes into Test Results field
   let   firstApiHost   = apiHost;
 
-  // Helper: make one GET call, try all keys, auto-subscribe on 403
-  async function testEndpoint(testUrl, testHost) {
-    async function tryCall(key) {
-      const res = await axios.get(testUrl, {
-        headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': testHost },
-        timeout: 12000, validateStatus: null,
-      });
-      const body = typeof res.data === 'object'
-        ? JSON.stringify(res.data, null, 2).slice(0, 3000)
-        : String(res.data).slice(0, 3000);
-      return { status: res.status, body };
+  // ── Per-API subscription state ────────────────────────────────────────────
+  // Subscribe at most ONCE per API. Once done, all subsequent endpoints
+  // in this API reuse the session key without re-subscribing.
+  let subscribedThisAPI = false;
+
+  // Shared axios helper
+  async function tryCall(key, testUrl, testHost) {
+    const res = await axios.get(testUrl, {
+      headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': testHost },
+      timeout: 12000, validateStatus: null,
+    });
+    const body = typeof res.data === 'object'
+      ? JSON.stringify(res.data, null, 2).slice(0, 3000)
+      : String(res.data).slice(0, 3000);
+    return { status: res.status, body };
+  }
+
+  // Subscribe to the free plan for this API (called at most once per API).
+  // Logs in if not already logged in, grabs the session key, then clicks
+  // "Start Free Plan" on the pricing page.
+  async function ensureSubscribed() {
+    if (subscribedThisAPI) return true;  // already handled for this API
+
+    console.log(`      → 403 detected — subscribing to free plan before continuing…`);
+
+    if (!SESSION_LOGGED_IN) {
+      const login = await getFirstActiveLogin();
+      if (!login) {
+        console.warn(`      No RapidAPI login available — cannot auto-subscribe`);
+        return false;
+      }
+      try {
+        await loginToRapidAPI(page, login.email, login.password);
+        SESSION_LOGGED_IN = true;
+        const kp = await page.context().newPage();
+        const k  = await grabAPIKey(kp);
+        await kp.close().catch(() => {});
+        if (k) SESSION_API_KEY = k;
+      } catch (e) {
+        console.warn(`      Login failed: ${e.message.slice(0, 80)}`);
+        return false;
+      }
     }
 
-    // Pass 1: rotate all keys
+    await subscribeViaPlaywright(page, baseUrl);
+    subscribedThisAPI = true;
+    await page.waitForTimeout(2000);  // let subscription propagate before retry
+    return true;
+  }
+
+  // Test one endpoint URL: try all keys first, subscribe once on 403, then retry.
+  async function testEndpoint(testUrl, testHost) {
+    // Pass 1: rotate all available keys
     for (const key of ALL_RAPIDAPI_KEYS) {
       try {
-        const r = await tryCall(key);
+        const r = await tryCall(key, testUrl, testHost);
         if (r.status !== 403) return r;
       } catch {}
     }
 
-    // Pass 2: subscribe and retry
-    if (SESSION_LOGGED_IN) {
-      await subscribeViaPlaywright(page, baseUrl);
-    } else {
-      const login = await getFirstActiveLogin();
-      if (login) {
-        try {
-          await loginToRapidAPI(page, login.email, login.password);
-          SESSION_LOGGED_IN = true;
-          const kp = await page.context().newPage();
-          const k  = await grabAPIKey(kp);
-          await kp.close().catch(() => {});
-          if (k) SESSION_API_KEY = k;
-          await subscribeViaPlaywright(page, baseUrl);
-        } catch (e) {
-          console.warn(`      Login failed: ${e.message.slice(0, 60)}`);
-        }
-      }
-    }
-    try { return await tryCall(SESSION_API_KEY); } catch {}
+    // All keys returned 403 — subscribe (at most once per API) then retry
+    const ok = await ensureSubscribed();
+    if (!ok) return null;
+
+    try { return await tryCall(SESSION_API_KEY, testUrl, testHost); } catch {}
     return null;
   }
 
