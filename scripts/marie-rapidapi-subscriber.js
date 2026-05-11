@@ -37,6 +37,7 @@ const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
 const AIRTABLE_LOGINS  = process.env.AIRTABLE_LOGINS;
 const AIRTABLE_APIS    = process.env.AIRTABLE_APIS;
+const AIRTABLE_CREDS   = 'tblvBr6RIc7bcGXYJ';   // Credentials table (hardcoded — same for all scripts)
 
 const SLACK_BOT_TOKEN  = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL    = process.env.SLACK_CHANNEL_AI_ENGINEERING;
@@ -162,6 +163,182 @@ async function updateAPIRecord(recordId, data, loginId, subscribed = true) {
       }
     }
   }
+}
+
+// ─── API Key Capture ──────────────────────────────────────────────────────────
+
+/**
+ * Navigate to the RapidAPI developer apps page (logged-in session required)
+ * and extract the account's x-rapidapi-key value.
+ *
+ * The key is a long alphanumeric string shown on /developer/apps or in the
+ * security tab of the default application. It also appears in code snippet
+ * previews on any subscribed API page.
+ *
+ * Returns the key string, or null if it couldn't be found.
+ */
+/**
+ * Extract the x-rapidapi-key for the currently-logged-in account.
+ *
+ * Strategy order (falls through to next on failure):
+ *  1. /developer/apps  — list page, React SPA, needs extra settle time
+ *  2. First app's /security tab — shows the key directly in an input
+ *  3. Any subscribed API's playground — key appears in generated code examples
+ *
+ * The key is a 40-60 char alphanumeric string used as the x-rapidapi-key header.
+ */
+async function grabAPIKey(page, subscribedAPILink = null) {
+  // Helper: scan current page DOM for a value that looks like a RapidAPI key
+  async function scanPageForKey() {
+    return page.evaluate(() => {
+      // Input fields (sometimes shown/hidden with a toggle)
+      for (const input of document.querySelectorAll('input')) {
+        const val = (input.value || input.defaultValue || '').trim();
+        if (val.length >= 30 && /^[a-zA-Z0-9]+$/.test(val)) return val;
+      }
+      // "x-rapidapi-key: <key>" pattern in any visible text
+      const m = document.body.innerText.match(/x-rapidapi-key["'\s:]+([a-zA-Z0-9]{30,})/i);
+      if (m) return m[1];
+      // Long alphanumeric in <code> / <pre> blocks
+      for (const el of document.querySelectorAll('code, pre, [class*="code"], [class*="Code"]')) {
+        const cm = el.textContent.match(/[a-zA-Z0-9]{40,}/);
+        if (cm) return cm[0];
+      }
+      // localStorage — RapidAPI sometimes caches API key there
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const val = (localStorage.getItem(localStorage.key(i)) || '').trim();
+          if (val.length >= 30 && val.length <= 80 && /^[a-zA-Z0-9]+$/.test(val)) return val;
+        }
+      } catch {}
+      return null;
+    });
+  }
+
+  try {
+    // ── Strategy 1: /developer/apps → extract app name → /security tab ──────
+    // The Manage Apps page shows a table of apps. The first row is always
+    // "default-application_XXXXXXXX". We read its name and construct the
+    // security URL directly (table rows are text, not hrefs).
+    await page.goto('https://rapidapi.com/developer/apps', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    let appName = null;
+    try {
+      // Wait for the app table to render (replaces the spinner)
+      await page.waitForSelector('table tbody tr td', { timeout: 15000 });
+      appName = (await page.locator('table tbody tr td:first-child').first().textContent()).trim();
+    } catch {
+      // Also try the sidebar — app name appears as a dropdown item under "My Apps"
+      try {
+        appName = (await page.locator('[class*="MyApps"] [class*="item"], [class*="my-apps"] li').first().textContent()).trim();
+      } catch {}
+      await page.screenshot({ path: `/tmp/rapidapi-apikey-${Date.now()}.png` }).catch(() => {});
+    }
+
+    if (appName) {
+      console.log(`  Found app: ${appName}`);
+      const secUrl = `https://rapidapi.com/developer/apps/${encodeURIComponent(appName)}/security`;
+      await page.goto(secUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      await page.waitForTimeout(5000);
+      await page.screenshot({ path: `/tmp/rapidapi-apikey-sec-${Date.now()}.png` }).catch(() => {});
+
+      // Key may be in a masked input — click any reveal button first
+      try {
+        const showBtn = page.locator('button:has-text("Show"), button:has-text("Reveal"), [aria-label*="show"], [aria-label*="copy"]').first();
+        if (await showBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await showBtn.click();
+          await page.waitForTimeout(1500);
+        }
+      } catch {}
+
+      let key = await scanPageForKey();
+      if (key) { console.log(`  API key found on security tab`); return key; }
+    }
+
+    // ── Strategy 2: API playground — click "Open playground" then look for key ─
+    if (subscribedAPILink) {
+      const apiBase = subscribedAPILink.replace(/\/(pricing|endpoints)\/?$/, '').replace(/\/+$/, '');
+      await page.goto(apiBase, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(5000);
+
+      // Click "Open playground" sidebar link to expand the testing UI
+      // Retry up to 3 times in case it renders late
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const playBtn = page.locator('[href*="/playground"], a:has-text("Open playground"), a:has-text("playground")').first();
+          if (await playBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+            await playBtn.click();
+            await page.waitForTimeout(5000);
+            break;
+          }
+        } catch {}
+        await page.waitForTimeout(2000);
+      }
+
+      await page.screenshot({ path: `/tmp/rapidapi-apikey-playground-${Date.now()}.png` }).catch(() => {});
+      let key = await scanPageForKey();
+      if (key) { console.log(`  API key found in API playground`); return key; }
+    }
+
+    console.warn(`  ⚠️  Could not find API key on any page (apps/security, playground)`);
+    return null;
+  } catch (e) {
+    console.warn(`  ⚠️  Could not grab API key: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Upsert a RapidAPI API-Key credential in the Credentials table.
+ * If a record already exists for this login (matched by Name), updates the Value.
+ * Otherwise creates a new record.
+ */
+async function upsertAPIKeyCredential(apiKey, loginId, email) {
+  if (DRY_RUN) { console.log(`  [DRY RUN] Would save API key for ${email}`); return; }
+
+  const headers = { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' };
+  const credName = `RapidAPI Key — ${email}`;
+
+  // Check for an existing credential record for this login
+  try {
+    const existing = await axios.get(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}`,
+      {
+        params: { filterByFormula: `{Name}='${credName.replace(/'/g, "\\'")}'`, maxRecords: 1 },
+        headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+      }
+    );
+
+    if (existing.data.records?.length > 0) {
+      const credId = existing.data.records[0].id;
+      await axios.patch(
+        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}/${credId}`,
+        { fields: { fldGMbEDOCtLXqbLX: apiKey, fld4tDedZ5uGVy3gP: 'Active' } },
+        { headers }
+      );
+      console.log(`  ✅ API key updated in Credentials (${apiKey.slice(0, 8)}…)`);
+      return;
+    }
+  } catch {}
+
+  // Create new credential record
+  await axios.post(
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}`,
+    {
+      fields: {
+        fld2lJoFqSGAEK5tw: credName,                           // Name
+        flddhlUwVQW6vrY55: loginId ? [loginId] : [],           // Login (linked record)
+        fldSNad5zoyLbpebm: 'API Key',                          // Credential Type
+        fld4tDedZ5uGVy3gP: 'Active',                           // Status
+        fldXq9LKkrwecF5Fp: email,                              // Account / Owner
+        fldGMbEDOCtLXqbLX: apiKey,                             // Value ← the actual key
+        fldivTYDSK44aY26J: 'Airtable Credentials (auto-saved by Marie)', // Storage Location
+        fld5NI6ls6Qu16wnL: `x-rapidapi-key header. Auto-saved by Marie on ${new Date().toISOString().split('T')[0]}`,
+      },
+    },
+    { headers }
+  );
+  console.log(`  ✅ API key saved to Credentials (${apiKey.slice(0, 8)}…)`);
 }
 
 // ─── RapidAPI Login ───────────────────────────────────────────────────────────
@@ -681,6 +858,18 @@ async function main() {
       if (credentials.status === 'Unverified') {
         await updateLoginStatus(credentials.loginId, 'Active');
         console.log(`  ✅ Promoted ${credentials.email} from Unverified → Active`);
+      }
+
+      // ── Grab & save the x-rapidapi-key for this account ──────────────────
+      // Pass the first API link as a fallback playground URL in case the
+      // developer/apps page doesn't render in time.
+      const firstAPILink = apis[0]?.fields['Link'] || null;
+      console.log(`  Grabbing API key for ${credentials.email}…`);
+      const apiKey = await grabAPIKey(loginPage, firstAPILink);
+      if (apiKey) {
+        await upsertAPIKeyCredential(apiKey, credentials.loginId, credentials.email);
+      } else {
+        console.warn(`  ⚠️  No API key found for ${credentials.email} — check /tmp/rapidapi-apikey-*.png`);
       }
     } catch (loginErr) {
       console.error(`  ❌ Login failed for ${credentials.email}: ${loginErr.message}`);

@@ -331,24 +331,122 @@ async function saveLogin(email, password) {
   return loginId;
 }
 
-async function saveCredential(email, password, loginId) {
-  if (DRY_RUN) { console.log(`  [DRY RUN] Would save credential for ${email}`); return; }
+/**
+ * Save the RapidAPI API key (x-rapidapi-key) to the Credentials table.
+ * If a record for this email already exists it is updated; otherwise created.
+ *
+ * @param {string} apiKey   The actual x-rapidapi-key value
+ * @param {string} loginId  Airtable record ID of the linked Login
+ * @param {string} email    Account email (used as the human-readable name)
+ */
+async function saveCredential(apiKey, loginId, email) {
+  if (DRY_RUN) { console.log(`  [DRY RUN] Would save API key credential for ${email}`); return; }
+  const headers = { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' };
+  const credName = `RapidAPI Key — ${email}`;
+
+  // Check for an existing credential record for this login
+  try {
+    const existing = await axios.get(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}`,
+      {
+        params: { filterByFormula: `{Name}='${credName.replace(/'/g, "\\'")}'`, maxRecords: 1 },
+        headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+      }
+    );
+    if (existing.data.records?.length > 0) {
+      const credId = existing.data.records[0].id;
+      await axios.patch(
+        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}/${credId}`,
+        { fields: { fldGMbEDOCtLXqbLX: apiKey, fld4tDedZ5uGVy3gP: 'Active' } },
+        { headers }
+      );
+      console.log(`  ✅ API key credential updated (${apiKey.slice(0, 8)}…)`);
+      return;
+    }
+  } catch {}
+
   await axios.post(
     `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_CREDS}`,
     {
       fields: {
-        fld2lJoFqSGAEK5tw: `RapidAPI — ${email}`,
-        flddhlUwVQW6vrY55: loginId ? [loginId] : [],
-        fldSNad5zoyLbpebm: 'Other',
-        fld4tDedZ5uGVy3gP: 'Active',
-        fldXq9LKkrwecF5Fp: email,
-        fldGMbEDOCtLXqbLX: password,
-        fld5NI6ls6Qu16wnL: `Created by Marie on ${new Date().toISOString().split('T')[0]}`,
+        fld2lJoFqSGAEK5tw: credName,                                     // Name
+        flddhlUwVQW6vrY55: loginId ? [loginId] : [],                     // Login (linked record)
+        fldSNad5zoyLbpebm: 'API Key',                                    // Credential Type
+        fld4tDedZ5uGVy3gP: 'Active',                                     // Status
+        fldXq9LKkrwecF5Fp: email,                                        // Account / Owner
+        fldGMbEDOCtLXqbLX: apiKey,                                       // Value ← the actual key
+        fldivTYDSK44aY26J: 'Airtable Credentials (auto-saved by Marie)', // Storage Location
+        fld5NI6ls6Qu16wnL: `x-rapidapi-key header. Auto-saved by Marie on ${new Date().toISOString().split('T')[0]}`,
       },
     },
-    { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } }
+    { headers }
   );
-  console.log(`  ✅ Credential saved`);
+  console.log(`  ✅ API key credential saved (${apiKey.slice(0, 8)}…)`);
+}
+
+/**
+ * Navigate to the developer apps page (logged-in context required) and extract
+ * the account's x-rapidapi-key value.
+ */
+async function grabAPIKey(page, subscribedAPILink = null) {
+  async function scanPageForKey() {
+    return page.evaluate(() => {
+      for (const input of document.querySelectorAll('input')) {
+        const val = (input.value || input.defaultValue || '').trim();
+        if (val.length >= 30 && /^[a-zA-Z0-9]+$/.test(val)) return val;
+      }
+      const m = document.body.innerText.match(/x-rapidapi-key["'\s:]+([a-zA-Z0-9]{30,})/i);
+      if (m) return m[1];
+      for (const el of document.querySelectorAll('code, pre, [class*="code"], [class*="Code"]')) {
+        const cm = el.textContent.match(/[a-zA-Z0-9]{40,}/);
+        if (cm) return cm[0];
+      }
+      return null;
+    });
+  }
+
+  try {
+    // Strategy 1: /developer/apps → extract app name from table → /security tab
+    await page.goto('https://rapidapi.com/developer/apps', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    let appName = null;
+    try {
+      await page.waitForSelector('table tbody tr td', { timeout: 15000 });
+      appName = (await page.locator('table tbody tr td:first-child').first().textContent()).trim();
+    } catch {
+      await page.screenshot({ path: `/tmp/rapidapi-apikey-${Date.now()}.png` }).catch(() => {});
+    }
+
+    if (appName) {
+      await page.goto(`https://rapidapi.com/developer/apps/${encodeURIComponent(appName)}/security`, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      await page.waitForTimeout(4000);
+      try {
+        const showBtn = page.locator('button:has-text("Show"), button:has-text("Reveal"), button[aria-label*="show"]').first();
+        if (await showBtn.isVisible({ timeout: 3000 }).catch(() => false)) { await showBtn.click(); await page.waitForTimeout(1000); }
+      } catch {}
+      await page.screenshot({ path: `/tmp/rapidapi-apikey-sec-${Date.now()}.png` }).catch(() => {});
+      let key = await scanPageForKey();
+      if (key) return key;
+    }
+
+    // Strategy 2: subscribed API endpoint playground
+    if (subscribedAPILink) {
+      const apiBase = subscribedAPILink.replace(/\/(pricing|endpoints)\/?$/, '').replace(/\/+$/, '');
+      await page.goto(apiBase, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+      try {
+        const ep = page.locator('a[href*="/endpoints/"], [class*="endpoint"][class*="item"] a').first();
+        if (await ep.isVisible({ timeout: 5000 }).catch(() => false)) { await ep.click(); await page.waitForTimeout(4000); }
+      } catch {}
+      await page.screenshot({ path: `/tmp/rapidapi-apikey-playground-${Date.now()}.png` }).catch(() => {});
+      let key = await scanPageForKey();
+      if (key) return key;
+    }
+
+    return null;
+  } catch (e) {
+    console.warn(`  ⚠️  Could not grab API key: ${e.message}`);
+    return null;
+  }
 }
 
 async function markAPISubscribed(recordId, loginId) {
@@ -797,7 +895,15 @@ async function createOneAccount(browser, apis) {
     //    can log into the account by hand.
     console.log('\n── Phase 1c: Save Login + Credential to Airtable ────────');
     loginId = await saveLogin(email, actualPassword);
-    if (loginId) await saveCredential(email, actualPassword, loginId);
+
+    // Grab the x-rapidapi-key while we still have the authenticated browser open
+    console.log('  Grabbing x-rapidapi-key from developer apps…');
+    const apiKey = await grabAPIKey(verifyPage);
+    if (apiKey) {
+      if (loginId) await saveCredential(apiKey, loginId, email);
+    } else {
+      console.warn('  ⚠️  Could not extract API key — credential record skipped (check screenshot)');
+    }
 
     // 5. Subscribe to all APIs, flushing API-to-Login links in batches of 10
     //    so that a mid-run abort leaves a usable partial record.
