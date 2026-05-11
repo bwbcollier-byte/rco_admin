@@ -61,8 +61,9 @@ const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
 
 // Session state — set once after login, reused across all APIs in the run
-let SESSION_API_KEY = RAPIDAPI_KEY;
+let SESSION_API_KEY   = RAPIDAPI_KEY;
 let SESSION_LOGGED_IN = false;
+let SESSION_LOGIN_ID  = null;  // Airtable record ID of the logged-in Login record
 
 // Airtable field IDs (from tblMb9HFyKcnQ7aKb schema)
 const F = {
@@ -84,6 +85,8 @@ const F = {
   decision:          'fldbpVmC9myu1dk0T',
   dateFound:         'fldstJZi2oybRW4rj',
   lastScraped:       'fldMSrStzASLj05cc',
+  subscribed:        'fldFBb9KjAeY1XCsn',
+  subscribedAccounts:'fldC1SyTRoYmFLlRI',
   subscriptionNotes: 'fldOyYLNNC2EBKQQm',
   callsPerMonth:     'fldq9u4Y4xHjC0LJv',
   rateLimit:         'fldvyvWhQMmifwCI9',
@@ -261,7 +264,7 @@ async function getFirstActiveLogin() {
     const email    = r.fields['Login'];
     const password = r.fields['Password'];
     if (!email || !password) return null;
-    return { email, password };
+    return { id: r.id, email, password };
   } catch (e) {
     console.warn(`  ⚠️ Could not fetch login: ${e.message}`);
     return null;
@@ -650,7 +653,7 @@ async function scrapePricing(page, baseUrl) {
 
 // ─── Endpoints + Playground + Per-Endpoint Test Calls ────────────────────────
 
-async function scrapeEndpoints(page, baseUrl) {
+async function scrapeEndpoints(page, baseUrl, apiRecordId = null) {
   console.log(`    → Endpoints (all) + curl + test calls`);
 
   const NAV_NOISE = new Set([
@@ -772,6 +775,7 @@ async function scrapeEndpoints(page, baseUrl) {
       try {
         await loginToRapidAPI(page, login.email, login.password);
         SESSION_LOGGED_IN = true;
+        SESSION_LOGIN_ID  = login.id;
         const kp = await page.context().newPage();
         const k  = await grabAPIKey(kp);
         await kp.close().catch(() => {});
@@ -785,6 +789,27 @@ async function scrapeEndpoints(page, baseUrl) {
     await subscribeViaPlaywright(page, baseUrl);
     subscribedThisAPI = true;
     await page.waitForTimeout(2000);  // let subscription propagate before retry
+
+    // Update Airtable: mark Subscribed + link this Login to the API record
+    if (apiRecordId && SESSION_LOGIN_ID) {
+      try {
+        const url     = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_APIS}/${apiRecordId}`;
+        const headers = { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' };
+
+        // Set Subscribed checkbox
+        await axios.patch(url, { fields: { [F.subscribed]: true } }, { headers });
+
+        // Append this Login to Subscribed Accounts (linked records, no duplicates)
+        const current = await axios.get(url, { headers });
+        const existing = current.data.fields?.[F.subscribedAccounts] || [];
+        if (!existing.includes(SESSION_LOGIN_ID)) {
+          await axios.patch(url, { fields: { [F.subscribedAccounts]: [...existing, SESSION_LOGIN_ID] } }, { headers });
+        }
+        console.log(`      ✅ Airtable: Subscribed=true, linked Login ${SESSION_LOGIN_ID}`);
+      } catch (e) {
+        console.warn(`      ⚠️ Could not update Subscribed Accounts: ${e.message.slice(0, 80)}`);
+      }
+    }
     return true;
   }
 
@@ -960,12 +985,13 @@ async function main() {
     try {
       await loginToRapidAPI(page, login.email, login.password);
       SESSION_LOGGED_IN = true;
+      SESSION_LOGIN_ID  = login.id;
       const keyPage = await context.newPage();
       const key = await grabAPIKey(keyPage);
       await keyPage.close().catch(() => {});
       if (key) {
         SESSION_API_KEY = key;
-        console.log(`  Session key: ${key.slice(0, 8)}… (will use for all test calls)\n`);
+        console.log(`  Session key: ${key.slice(0, 8)}… | Login ID: ${login.id}\n`);
       }
     } catch (e) {
       console.warn(`  ⚠️ Login skipped: ${e.message.slice(0, 80)} — will still try key rotation\n`);
@@ -1018,7 +1044,7 @@ async function main() {
       }
 
       // 3. Endpoints
-      const eps = await scrapeEndpoints(page, baseUrl);
+      const eps = await scrapeEndpoints(page, baseUrl, api.id);
       if (eps) {
         if (eps.endpointList.length) {
           assembled[F.endpoints]    = eps.endpointList.join('\n');
