@@ -81,6 +81,8 @@ const F = {
   curlCommands:      'fldCIt3af3pDpFK6R',
   mcpEndpoint:       'fldhYHa6TpB57edaE',
   status:            'fldFSB4dK0bVRbt0R',
+  decision:          'fldbpVmC9myu1dk0T',
+  dateFound:         'fldstJZi2oybRW4rj',
   lastScraped:       'fldMSrStzASLj05cc',
   subscriptionNotes: 'fldOyYLNNC2EBKQQm',
   callsPerMonth:     'fldq9u4Y4xHjC0LJv',
@@ -99,7 +101,7 @@ async function getAllRapidAPIAPIs() {
     const params = {
       returnFieldsByFieldId: true,
       filterByFormula: `AND(SEARCH("rapidapi.com", {${F.link}}), {${F.status}}="Discovered")`,
-      fields: [F.name, F.link, F.lastScraped],
+      fields: [F.name, F.link, F.lastScraped, F.dateFound, F.decision],
       pageSize: 100,
     };
     if (offset) params.offset = offset;
@@ -115,6 +117,8 @@ async function getAllRapidAPIAPIs() {
         name:        r.fields[F.name] || '(unnamed)',
         link:        r.fields[F.link] || '',
         lastScraped: r.fields[F.lastScraped] || null,
+        dateFound:   r.fields[F.dateFound]   || null,
+        decision:    r.fields[F.decision]    || null,
       });
     }
     offset = res.data.offset || null;
@@ -742,8 +746,8 @@ async function scrapeEndpoints(page, baseUrl) {
         timeout: 12000, validateStatus: null,
       });
       const body = typeof res.data === 'object'
-        ? JSON.stringify(res.data).slice(0, 350)
-        : String(res.data).slice(0, 350);
+        ? JSON.stringify(res.data, null, 2).slice(0, 3000)
+        : String(res.data).slice(0, 3000);
       return { status: res.status, body };
     }
 
@@ -1002,9 +1006,19 @@ async function main() {
         if (eps.testResults)  assembled[F.testResults]  = eps.testResults;
       }
 
-      // Always stamp Last Scraped and set Status → Processing
+      // Always stamp Last Scraped
       assembled[F.lastScraped] = new Date().toISOString().split('T')[0];
-      assembled[F.status]      = 'Processing';
+
+      // Status: Error if any test returned 403 or timed out, otherwise Processing
+      const testText = assembled[F.testResults] || '';
+      const hasError = /HTTP 40[0-9]|ECONNABORTED|timeout of \d+ms exceeded/i.test(testText);
+      assembled[F.status] = hasError ? 'Error' : 'Processing';
+
+      // Date Found: default to today if not already set
+      if (!api.dateFound) assembled[F.dateFound] = new Date().toISOString().split('T')[0];
+
+      // Decision: default to Pending if not already set
+      if (!api.decision) assembled[F.decision] = 'Pending';
 
       const count = Object.keys(assembled).length;
       console.log(`  → Writing ${count} field(s) to Airtable`);
