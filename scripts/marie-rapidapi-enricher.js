@@ -68,6 +68,7 @@ const F = {
   testResults:       'fldGgAczdqxLJ6NsT',
   curlCommands:      'fldCIt3af3pDpFK6R',
   mcpEndpoint:       'fldhYHa6TpB57edaE',
+  status:            'fldFSB4dK0bVRbt0R',
   lastScraped:       'fldMSrStzASLj05cc',
   subscriptionNotes: 'fldOyYLNNC2EBKQQm',
   callsPerMonth:     'fldq9u4Y4xHjC0LJv',
@@ -757,8 +758,9 @@ async function main() {
         if (eps.testResults)  assembled[F.testResults]  = eps.testResults;
       }
 
-      // Always stamp Last Scraped
+      // Always stamp Last Scraped and set Status → Processing
       assembled[F.lastScraped] = new Date().toISOString().split('T')[0];
+      assembled[F.status]      = 'Processing';
 
       const count = Object.keys(assembled).length;
       console.log(`  → Writing ${count} field(s) to Airtable`);
