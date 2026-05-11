@@ -1933,13 +1933,35 @@ async function main() {
         continue;
       }
 
-      // All others: find and click verification/magic link
-      const linkMatch =
-        body.match(/https?:\/\/[^\s"'<>]+(?:verif|confirm|activate|validate|magic|token)[^\s"'<>]*/i) ||
-        body.match(/https?:\/\/[^\s"'<>]{50,}/);
+      // RapidAPI verification emails are a special case: the email contains
+      // multiple SendGrid /ls/click tracker URLs (header logo, Verify Email
+      // CTA, footer link). Picking the wrong one redirects to the public
+      // homepage and the account is never verified, even though landedUrl
+      // doesn't contain "error". So: parse anchor tags and prefer the one
+      // whose visible text says Verify/Confirm. After clicking, probe
+      // /developer/dashboard — if it bounces to /auth/, the session isn't
+      // really authenticated.
+      const isRapidAPIEmail = /rapidapi\.com|nokia\s+api/i.test(from + ' ' + subject);
+      let link = null;
 
-      if (linkMatch) {
-        const link = linkMatch[0].replace(/&amp;/g, '&');
+      if (isRapidAPIEmail) {
+        const anchors = [...body.matchAll(/<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
+        const candidates = anchors
+          .map(m => ({ href: m[1].replace(/&amp;/g, '&'), text: m[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() }))
+          .filter(a => /^https?:\/\/(?:[a-z0-9.-]*\.)?rapidapi\.com\//i.test(a.href));
+        const verifyAnchor = candidates.find(a => /verify|confirm|activate/i.test(a.text))
+                          || candidates.find(a => /(?:confirm|verify|magic|activate)/i.test(a.href));
+        if (verifyAnchor) link = verifyAnchor.href;
+      }
+
+      if (!link) {
+        const linkMatch =
+          body.match(/https?:\/\/[^\s"'<>]+(?:verif|confirm|activate|validate|magic|token)[^\s"'<>]*/i) ||
+          body.match(/https?:\/\/[^\s"'<>]{50,}/);
+        if (linkMatch) link = linkMatch[0].replace(/&amp;/g, '&');
+      }
+
+      if (link) {
         console.log(`  Clicking: ${link.slice(0, 100)}...`);
 
         // For Stytch magic links (Groq/xAI), navigate in a fresh page but first
@@ -1959,10 +1981,26 @@ async function main() {
           const landedUrl = verifyPage.url();
           console.log(`  Landed: ${landedUrl.slice(0, 80)}`);
           try { await verifyPage.screenshot({ path: `/tmp/marie-verify-${Date.now()}.png` }); } catch {}
-          if (landedUrl.includes('error') || landedUrl.includes('redirect-error')) {
-            console.warn(`  ⚠️ Verification failed — landed on error page: ${landedUrl.slice(0, 80)}`);
-          } else {
+
+          let verified = !(landedUrl.includes('error') || landedUrl.includes('redirect-error'));
+          // For RapidAPI: probe /developer/dashboard — public homepage isn't
+          // logged in even though it doesn't contain "error".
+          if (verified && isRapidAPIEmail) {
+            await verifyPage.goto('https://rapidapi.com/developer/dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await verifyPage.waitForTimeout(3000);
+            const dashUrl = verifyPage.url();
+            if (/\/auth\/(?:login|sign-in|sign-up)/i.test(dashUrl)) {
+              verified = false;
+              console.warn(`  ⚠️ RapidAPI magic link did NOT authenticate — dashboard bounced to ${dashUrl}`);
+            } else if (dashUrl.includes('/developer/')) {
+              console.log(`  Dashboard reachable: ${dashUrl.slice(0, 80)}`);
+            }
+          }
+
+          if (verified) {
             console.log(`  ✅ Verified (${landedUrl.slice(0, 80)})`);
+          } else if (!isRapidAPIEmail) {
+            console.warn(`  ⚠️ Verification failed — landed on error page: ${landedUrl.slice(0, 80)}`);
           }
         } catch (err) {
           console.warn(`  Verification nav failed: ${err.message}`);
