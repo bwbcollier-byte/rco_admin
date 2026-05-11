@@ -47,6 +47,7 @@ const DRY_RUN           = process.env.DRY_RUN === 'true';
 const HEADLESS          = process.env.HEADLESS !== 'false';
 const RESCRAPE_DAYS     = parseInt(process.env.RESCRAPE_DAYS || '7', 10);
 const MAX_PER_RUN       = parseInt(process.env.MAX_PER_RUN || '50', 10);
+const FORCE             = process.env.FORCE === 'true';  // skip lastScraped filter entirely
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY;   // used for live test calls
 const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL     = process.env.SLACK_CHANNEL_AI_ENGINEERING;
@@ -656,7 +657,7 @@ async function postSlack(text) {
 
 async function main() {
   console.log(`\n🔍 Marie — RapidAPI Enricher  ${DRY_RUN ? '[DRY RUN]' : ''}`);
-  console.log(`   Rescrape window: ${RESCRAPE_DAYS}d | Max per run: ${MAX_PER_RUN}\n`);
+  console.log(`   Rescrape window: ${FORCE ? 'FORCE (all)' : RESCRAPE_DAYS + 'd'} | Max per run: ${MAX_PER_RUN}\n`);
 
   // ── Fetch all RapidAPI APIs from Airtable ─────────────────────────────────
   console.log('Fetching APIs from Airtable…');
@@ -668,12 +669,21 @@ async function main() {
   cutoff.setDate(cutoff.getDate() - RESCRAPE_DAYS);
 
   const toProcess = apis
-    .filter(api => api.link && (!api.lastScraped || new Date(api.lastScraped) < cutoff))
+    .filter(api => {
+      if (!api.link) return false;
+      if (FORCE) return true;   // FORCE=true bypasses the date check entirely
+      return !api.lastScraped || new Date(api.lastScraped) < cutoff;
+    })
     .slice(0, MAX_PER_RUN);
 
   const skipped = apis.length - toProcess.length;
-  console.log(`  Skipping ${skipped} recently scraped (within ${RESCRAPE_DAYS}d)`);
-  console.log(`  Processing ${toProcess.length} APIs\n`);
+  if (FORCE) {
+    console.log(`  FORCE mode — processing all ${toProcess.length} APIs`);
+  } else {
+    console.log(`  Skipping ${skipped} recently scraped (within ${RESCRAPE_DAYS}d)`);
+    console.log(`  Processing ${toProcess.length} APIs`);
+  }
+  console.log();
 
   if (!toProcess.length) {
     console.log('Nothing to enrich — all APIs are up to date.');
