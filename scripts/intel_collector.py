@@ -1365,9 +1365,11 @@ def get_gemini_keys_from_airtable(at_key):
             keys.append(val)
             seen.add(val)
     env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if env_val and env_val not in seen:
-        keys.append(env_val)
-        seen.add(env_val)
+    for k in env_val.split():
+        k = k.strip()
+        if k.startswith("AIzaSy") and k not in seen:
+            keys.append(k)
+            seen.add(k)
     if keys:
         print(f"gemini keys: loaded {len(keys)} "
               f"(suffixes: {', '.join('...' + k[-4:] for k in keys)})")
