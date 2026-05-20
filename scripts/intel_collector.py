@@ -1358,16 +1358,23 @@ def get_gemini_keys_from_airtable(at_key):
     except Exception as e:
         print(f"WARN gemini key lookup: {e}", file=sys.stderr)
         rows = []
+    import re as _re
+    def _extract_keys(raw):
+        # Split on any whitespace, commas, semicolons, or literal \n / \r escape sequences.
+        for k in _re.split(r"[\s,;]+|\\n|\\r", raw or ""):
+            k = k.strip()
+            if k.startswith("AIzaSy"):
+                yield k
     for r in rows:
         f = r.get("fields", {}) or {}
         val = (f.get(F_CRED_VALUE) or "").strip()
-        if val.startswith("AIzaSy") and val not in seen:
-            keys.append(val)
-            seen.add(val)
+        for k in _extract_keys(val):
+            if k not in seen:
+                keys.append(k)
+                seen.add(k)
     env_val = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    for k in env_val.split():
-        k = k.strip()
-        if k.startswith("AIzaSy") and k not in seen:
+    for k in _extract_keys(env_val):
+        if k not in seen:
             keys.append(k)
             seen.add(k)
     if keys:
