@@ -1,0 +1,19 @@
+# Auto-merge policy for Dependabot PRs
+# Automatically merge passing Dependabot PRs to reduce manual overhead
+
+automerge:
+  # Dependabot version updates
+  - match:
+      dependency_type: all
+      update_types:
+        - minor
+        - patch
+    automerge:
+      enabled: true
+  # Dependabot security updates
+  - match:
+      dependency_type: all
+      update_types:
+        - security
+    automerge:
+      enabled: true
