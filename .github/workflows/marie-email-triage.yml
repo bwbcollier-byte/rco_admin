@@ -1,5 +1,7 @@
 name: Kondo — Email Triage
 
+permissions: {}
+
 on:
   schedule:
     # 8pm UTC Sunday–Thursday = 6am AEST Monday–Friday

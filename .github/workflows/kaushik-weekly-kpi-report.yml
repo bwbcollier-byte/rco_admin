@@ -1,5 +1,7 @@
 name: Kaushik — Weekly KPI Report
 
+permissions: {}
+
 on:
   schedule:
     # Sunday 9pm UTC = Monday 7am AEST (UTC+10)

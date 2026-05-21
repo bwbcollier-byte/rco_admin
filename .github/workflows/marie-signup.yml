@@ -1,5 +1,7 @@
 name: Kondo — Account Creator
 
+permissions: {}
+
 on:
   schedule:
     # 9am AEST daily (11pm UTC)

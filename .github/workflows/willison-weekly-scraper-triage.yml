@@ -1,5 +1,7 @@
 name: Willison — Weekly Scraper Triage
 
+permissions: {}
+
 on:
   schedule:
     # Tuesday 9:30pm UTC = Wednesday 7:30am AEST (UTC+10)

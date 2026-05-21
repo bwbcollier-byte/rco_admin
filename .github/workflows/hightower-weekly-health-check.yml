@@ -1,5 +1,7 @@
 name: Hightower — Weekly Infrastructure Health Check
 
+permissions: {}
+
 on:
   schedule:
     # Sunday 9:30pm UTC = Monday 7:30am AEST (UTC+10)

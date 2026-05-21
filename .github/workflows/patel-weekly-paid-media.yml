@@ -1,5 +1,7 @@
 name: Patel — Weekly Paid Media Report
 
+permissions: {}
+
 on:
   schedule:
     # Thursday 10pm UTC = Friday 8am AEST

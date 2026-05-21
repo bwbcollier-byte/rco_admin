@@ -1,5 +1,7 @@
 name: Handley — Weekly Content Brief
 
+permissions: {}
+
 on:
   schedule:
     # Thursday 9:30pm UTC = Friday 7:30am AEST
