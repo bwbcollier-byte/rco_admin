@@ -1,5 +1,7 @@
 name: Monthly All-Staff Synthesis
 
+permissions: {}
+
 on:
   schedule:
     # First Wednesday of each month, 7:00am AEST (Tuesday 9pm UTC)

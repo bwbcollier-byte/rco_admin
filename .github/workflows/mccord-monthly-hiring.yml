@@ -1,5 +1,7 @@
 name: McCord — Monthly Hiring Readiness Check
 
+permissions: {}
+
 on:
   schedule:
     # First Monday of each month, 7:00am AEST (Sunday 9pm UTC)

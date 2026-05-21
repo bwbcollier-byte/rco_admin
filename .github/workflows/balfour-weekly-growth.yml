@@ -1,5 +1,7 @@
 name: Balfour — Weekly Growth Brief
 
+permissions: {}
+
 on:
   schedule:
     # Thursday 9pm UTC = Friday 7am AEST — synthesises Kaushik (Mon) + Patil (Thu) data

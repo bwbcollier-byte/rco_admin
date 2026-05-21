@@ -1,5 +1,7 @@
 name: Patil — Weekly Data Quality Brief
 
+permissions: {}
+
 on:
   schedule:
     # Wednesday 9pm UTC = Thursday 7am AEST (UTC+10)

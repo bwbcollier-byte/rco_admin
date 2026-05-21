@@ -1,5 +1,7 @@
 name: Kondo — Daily Automation
 
+permissions: {}
+
 on:
   schedule:
     # Every hour — tasks decide internally whether to run

@@ -1,5 +1,7 @@
 name: Blake — Weekly YouTube Brief
 
+permissions: {}
+
 on:
   schedule:
     # Thursday 10:30pm UTC = Friday 8:30am AEST

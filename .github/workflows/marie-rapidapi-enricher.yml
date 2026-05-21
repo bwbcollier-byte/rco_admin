@@ -1,5 +1,7 @@
 name: Kondo — RapidAPI Enricher
 
+permissions: {}
+
 on:
   # Run every Tuesday at 9am AEST (11pm UTC Monday) — after the subscriber run
   schedule:

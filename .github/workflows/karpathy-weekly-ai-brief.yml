@@ -1,5 +1,7 @@
 name: Karpathy — Weekly AI/ML Brief
 
+permissions: {}
+
 on:
   schedule:
     # Tuesday 9pm UTC = Wednesday 7am AEST (UTC+10)
