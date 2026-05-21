@@ -20,6 +20,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
       - run: npm install @anthropic-ai/sdk @supabase/supabase-js airtable axios
       - name: Run weekly growth brief
         env:
