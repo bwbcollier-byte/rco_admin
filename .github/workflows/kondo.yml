@@ -40,14 +40,14 @@ jobs:
       - name: Download apartment state
         uses: actions/download-artifact@v4
         with:
-          name: marie-apartment-state
+          name: kondo-apartment-state
           path: /tmp/
         continue-on-error: true  # OK on first run
 
       - name: Download flight state
         uses: actions/download-artifact@v4
         with:
-          name: marie-flight-state
+          name: kondo-flight-state
           path: /tmp/
         continue-on-error: true  # OK on first run
 
@@ -71,16 +71,16 @@ jobs:
           TASK: ${{ github.event.inputs.task || 'auto' }}
         run: |
           if [ "$TASK" = "signup" ]; then
-            node scripts/marie-account-creator.js
+            node scripts/kondo-account-creator.js
           else
-            node scripts/marie.js
+            node scripts/kondo.js
           fi
 
       - name: Upload apartment state
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marie-apartment-state
+          name: kondo-apartment-state
           path: /tmp/social-apartment-state.json
           retention-days: 90
           overwrite: true
@@ -89,8 +89,8 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marie-flight-state
-          path: /tmp/marie-flight-state.json
+          name: kondo-flight-state
+          path: /tmp/kondo-flight-state.json
           retention-days: 90
           overwrite: true
 
@@ -98,7 +98,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marie-screenshots
-          path: /tmp/marie-*.png
+          name: kondo-screenshots
+          path: /tmp/kondo-*.png
           retention-days: 7
           overwrite: true

@@ -18,7 +18,7 @@
  *   MCP URL        (URL)
  *   Pricing Tier   (Single line text)
  *
- * Secrets required (same as marie-signup):
+ * Secrets required (same as kondo-signup):
  *   AIRTABLE_API_KEY
  *   SLACK_BOT_TOKEN, SLACK_CHANNEL_AI_ENGINEERING  (optional — for summary)
  */

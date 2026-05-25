@@ -50,13 +50,13 @@ jobs:
           GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           MAX_PER_RUN: ${{ github.event.inputs.max_per_run || vars.SIGNUP_MAX_PER_RUN || '20' }}
-        run: node scripts/marie-account-creator.js
+        run: node scripts/kondo-account-creator.js
 
       - name: Upload screenshots
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marie-signup-screenshots
-          path: /tmp/marie-signup-*.png
+          name: kondo-signup-screenshots
+          path: /tmp/kondo-signup-*.png
           retention-days: 7
           overwrite: true

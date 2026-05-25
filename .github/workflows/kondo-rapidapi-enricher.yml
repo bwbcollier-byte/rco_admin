@@ -52,7 +52,7 @@ jobs:
           DRY_RUN:          ${{ github.event.inputs.dry_run || 'false' }}
           MAX_PER_RUN:      ${{ github.event.inputs.max_per_run || vars.ENRICH_MAX_PER_RUN || '50' }}
           RESCRAPE_DAYS:    ${{ github.event.inputs.rescrape_days || vars.ENRICH_RESCRAPE_DAYS || '7' }}
-        run: node scripts/marie-rapidapi-enricher.js
+        run: node scripts/kondo-rapidapi-enricher.js
 
       - name: Upload debug screenshots
         uses: actions/upload-artifact@v4

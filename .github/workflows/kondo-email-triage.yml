@@ -51,4 +51,4 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           INITIAL_CLEANUP: ${{ github.event.inputs.initial_cleanup || 'false' }}
           MAX_INITIAL: ${{ github.event.inputs.max_initial || '500' }}
-        run: node scripts/marie-email-triage.js
+        run: node scripts/kondo-email-triage.js

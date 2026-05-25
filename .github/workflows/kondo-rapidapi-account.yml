@@ -53,7 +53,7 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_AI_ENGINEERING: ${{ secrets.SLACK_CHANNEL_AI_ENGINEERING }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-        run: node scripts/marie-rapidapi-account.js
+        run: node scripts/kondo-rapidapi-account.js
 
       - name: Upload debug screenshots
         uses: actions/upload-artifact@v4
